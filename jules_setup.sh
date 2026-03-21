@@ -93,6 +93,8 @@ git submodule update --init --recursive
 # Jules: Disable platform entropy sources as PSP is not a supported platform for auto-detection
 sed -i 's/\/\/#define MBEDTLS_NO_PLATFORM_ENTROPY/#define MBEDTLS_NO_PLATFORM_ENTROPY/' include/mbedtls/mbedtls_config.h
 sed -i 's/\/\/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/' include/mbedtls/mbedtls_config.h
+# Jules: Provide mbedtls_ms_time implementation for PSP
+sed -i 's/#error "No mbedtls_ms_time available"/#elif defined(__psp__)\n#include <pspthreadman.h>\nmbedtls_ms_time_t mbedtls_ms_time(void)\n{\n    return (mbedtls_ms_time_t)(sceKernelGetSystemTimeWide() \/ 1000);\n}\n#else\n#error "No mbedtls_ms_time available"/' library/platform_util.c
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
     -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
