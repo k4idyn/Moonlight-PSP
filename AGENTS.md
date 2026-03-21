@@ -1,6 +1,6 @@
 # AGENTS.md - Repository Governance for Moonlight PSP
 
-## Role: GitHub Architect
+## Project Architecture
 This repository follows a strict **MIPS-PSP Monorepo Architecture**. All contributors MUST adhere to these guidelines to maintain parallel reliability and cadence across the project.
 
 ## Core Architectural Rules
@@ -28,4 +28,4 @@ This repository follows a strict **MIPS-PSP Monorepo Architecture**. All contrib
 - Migrate from direct struct member access to public accessor APIs for all third-party libraries (e.g., Mini-XML).
 
 ---
-*Maintained by the GitHub Architect.*
+*Architectural guidelines for Moonlight PSP.*
