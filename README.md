@@ -9,9 +9,10 @@
 
 </div>
 
-## Development Status: Active Debugging & Porting
+## Latest Release: [v0.1.0.1-alpha](https://github.com/k4idyn/Moonlight-PSP/releases/tag/v0.1.0.1-alpha)
+**Status**: Active / Experimental Alpha
 
-**Current Focus**: Stabilizing the ENet control stream and optimizing the `moonlight-common-c` integration for the PSP's MIPS architecture.
+**Release Highlight**: This is the first official release featuring a **Standalone Build Architecture**. All core dependencies are now bundled, allowing for a seamless "out of the box" compilation experience on both Windows and Linux.
 
 **⚠️ CURRENT KNOWN PERSISTENT ERROR ⚠️**
 The client is currently experiencing a persistent connection error during the GameStream initialization sequence:
