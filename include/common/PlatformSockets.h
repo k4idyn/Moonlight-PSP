@@ -26,6 +26,7 @@ extern in_port_t n3ds_udp_port;
 #ifdef AF_INET6
 #undef AF_INET6
 #endif
+#include <poll.h>
 #define ioctl sceNetInetIoctl
 
 // Explicitly declare sceNetInetIoctl if it's missing from headers
