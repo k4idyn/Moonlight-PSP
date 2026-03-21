@@ -100,6 +100,7 @@ printf "\n#if defined(__psp__)\n#include <pspthreadman.h>\nmbedtls_ms_time_t mbe
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
     -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+    -DMBEDTLS_FATAL_WARNINGS=OFF \
     -DGEN_FILES=OFF
 make -j$(nproc)
 make install
