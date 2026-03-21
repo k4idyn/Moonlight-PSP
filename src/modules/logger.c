@@ -8,6 +8,7 @@
 
 static SceUID logMutex = -1;
 static int logInitialized = 0;
+static FILE* g_logFile = NULL;
 
 const char* LogComponentToString(LogComponent comp) {
     switch (comp) {
@@ -23,19 +24,32 @@ const char* LogComponentToString(LogComponent comp) {
 void logger_init() {
     if (!logInitialized) {
         logMutex = sceKernelCreateSema("MoonlightLogMutex", 0, 1, 1, NULL);
-        logInitialized = 1;
         
+<<<<<<< HEAD
         FILE* f = fopen("moonlight_debug.log", "w");
         if (f) {
             fprintf(f, "--- Moonlight Log Started ---\n");
             fclose(f);
         }
+=======
+        g_logFile = fopen("moonlight_debug.log", "w");
+        if (g_logFile) {
+            fprintf(g_logFile, "--- Moonlight Log Started ---\n");
+            fflush(g_logFile);
+        }
+        logInitialized = 1;
+>>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
     }
 }
 
 void logger_shutdown() {
     if (logInitialized) {
         if (logMutex >= 0) {
+            sceKernelWaitSema(logMutex, 1, NULL);
+            if (g_logFile) {
+                fclose(g_logFile);
+                g_logFile = NULL;
+            }
             sceKernelDeleteSema(logMutex);
             logMutex = -1;
         }
@@ -74,11 +88,17 @@ void moonlight_log(const char* level, const char* component_str, const char* for
 
     // File I/O (must be protected by mutex)
     if (locked) {
+<<<<<<< HEAD
         FILE* f = fopen("moonlight_debug.log", "a");
         if (f) {
             fprintf(f, "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
             fflush(f);
             fclose(f);
+=======
+        if (g_logFile) {
+            fprintf(g_logFile, "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
+            fflush(g_logFile);
+>>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
         }
     }
 

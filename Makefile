@@ -38,6 +38,7 @@ OBJS = \
     src/common/VideoStream.o \
     src/common/rswrapper.o
 
+<<<<<<< HEAD
 INCDIR = include include/libgamestream include/modules include/common include/ark4
 CFLAGS = -O2 -g -G0 -Wall -Wextra -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99 -I$(shell psp-config --pspdev-path)/psp/include
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
@@ -46,6 +47,16 @@ ASFLAGS = $(CFLAGS)
 LIBDIR = lib
 LDFLAGS = 
 LIBS = -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread-psp -lmxml -lz -lm -lpspvfpu
+=======
+INCDIR = include include/libgamestream include/modules ../moonlight-common-c/src ../PSP-Archive-Resources/ARK-4/common/include
+CFLAGS = -O2 -g -G0 -Wall -Wextra -Werror -D_PSP -D__psp__ -std=gnu99
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+ASFLAGS = $(CFLAGS)
+
+LIBDIR = ../moonlight-common-c/build-psp
+LDFLAGS =
+LIBS = -lmoonlight-common-c -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread-psp -lmxml -lz -lm -lpspvfpu
+>>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
 LIBS += -lpspaudio -lpspmpeg -lpspgum -lpspgu -lpsprtc -lpspwlan -lpsppower -lpspdebug -lpspdisplay -lpspge -lpspctrl -lc -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver -lpsputility -lpspsdk -lpspuser
 
 BUILD_PRX = 1

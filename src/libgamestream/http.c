@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pspkernel.h>
+#include <pspiofilemgr.h>
+#include <pspiofilemgr_fcntl.h>
 #include <pspnet_resolver.h>
 #include <pspnet_apctl.h>
 #include <netinet/tcp.h>
@@ -208,7 +210,7 @@ static SOCKET open_tcp(const char *host, int port) {
     LOGF("Connecting TCP to %s:%d (blocking, timeout=%ds)...", host, port, HTTP_CONNECT_TIMEOUT_S);
     if (connect(s, (struct sockaddr*)&addr, addrLen) < 0) {
         LOGF("connect() FAILED errno=%d", (int)LastSocketError());
-        close(s);
+        closeSocket(s);
         gs_error = "TCP connect failed (check server IP/port and firewall)";
         return -1;
     }
@@ -230,7 +232,7 @@ static int http_raw_request(const char *host, int port, const char *path,
     /* Build GET request – must be large enough for pairing URLs with cert hex */
     int req_size = strlen(path) + 256;
     char *req = malloc(req_size);
-    if (!req) { close(s); return GS_OUT_OF_MEMORY; }
+    if (!req) { closeSocket(s); return GS_OUT_OF_MEMORY; }
     int reqlen = snprintf(req, req_size,
         "GET /%s HTTP/1.0\r\n"
         "Host: %s:%d\r\n"
@@ -251,7 +253,7 @@ static int http_raw_request(const char *host, int port, const char *path,
             }
             LOGF("send() FAILED errno=%d", err);
             free(req);
-            close(s);
+            closeSocket(s);
             gs_error = "HTTP send failed";
             return GS_FAILED;
         }
@@ -272,7 +274,7 @@ static int http_raw_request(const char *host, int port, const char *path,
         if (n > 0) {
             buf[n] = '\0';
             if (append_data(data, buf, n) < 0) {
-                close(s);
+                closeSocket(s);
                 return GS_OUT_OF_MEMORY;
             }
             received += n;
@@ -288,7 +290,7 @@ static int http_raw_request(const char *host, int port, const char *path,
             break;
         }
     }
-    close(s);
+    closeSocket(s);
 
     LOGF("HTTP response received: %d bytes total", data->size);
 
@@ -336,7 +338,7 @@ static int https_tls_request(const char *host, int port, const char *path,
         LOGF("malloc failed for MbedTLS structures");
         free(entropy); free(ctr_drbg); free(ssl);
         free(conf); free(clicert); free(pkey);
-        close(s);
+        closeSocket(s);
         gs_error = "Out of memory for SSL";
         return GS_OUT_OF_MEMORY;
     }
@@ -357,7 +359,7 @@ static int https_tls_request(const char *host, int port, const char *path,
     if (conf) { mbedtls_ssl_config_free(conf); free(conf); conf = NULL; } \
     if (ctr_drbg) { mbedtls_ctr_drbg_free(ctr_drbg); free(ctr_drbg); ctr_drbg = NULL; } \
     if (entropy) { mbedtls_entropy_free(entropy); free(entropy); entropy = NULL; } \
-    close(s); \
+    closeSocket(s); \
 } while(0)
 
     if ((ret = mbedtls_ctr_drbg_seed(ctr_drbg, dummy_entropy, entropy, NULL, 0)) != 0) {
@@ -367,18 +369,92 @@ static int https_tls_request(const char *host, int port, const char *path,
         return GS_FAILED;
     }
 
-    if ((ret = mbedtls_x509_crt_parse_file(clicert, g_certPath)) != 0) {
-        LOGF("x509_crt_parse_file failed '%s': -0x%x", g_certPath, -ret);
-        TLS_CLEANUP();
-        gs_error = "Failed to load client certificate";
-        return GS_FAILED;
+    /* PSP FIX: fopen() is broken for ms0: paths on real PSP hardware.
+     * Use sceIoOpen to read cert/key files into buffers, then parse from buffer.
+     * This matches how load_cert() in client.c already works correctly. */
+    {
+        /* Load client certificate via sceIoOpen */
+        char* cert_buf = (char*)malloc(8192);
+        if (!cert_buf) {
+            TLS_CLEANUP();
+            gs_error = "Out of memory for cert_buf";
+            return GS_FAILED;
+        }
+        memset(cert_buf, 0, 8192);
+        
+        SceUID cert_fd = sceIoOpen(g_certPath, PSP_O_RDONLY, 0);
+        if (cert_fd < 0) {
+            LOGF("sceIoOpen cert failed '%s': 0x%08x", g_certPath, cert_fd);
+            free(cert_buf);
+            TLS_CLEANUP();
+            static char io_err[128];
+            snprintf(io_err, sizeof(io_err), "sceIoOpen cert failed: 0x%08x (%s)", cert_fd, g_certPath);
+            gs_error = io_err;
+            return GS_FAILED;
+        }
+        int cert_read = sceIoRead(cert_fd, cert_buf, 8191);
+        sceIoClose(cert_fd);
+        if (cert_read <= 0) {
+            LOGF("sceIoRead cert failed: %d", cert_read);
+            free(cert_buf);
+            TLS_CLEANUP();
+            gs_error = "Failed to read client certificate";
+            return GS_FAILED;
+        }
+        cert_buf[cert_read] = '\0';
+        /* mbedtls_x509_crt_parse needs null terminator included in len for PEM */
+        ret = mbedtls_x509_crt_parse(clicert, (unsigned char*)cert_buf, cert_read + 1);
+        free(cert_buf); /* Free it immediately after parse */
+        
+        if (ret != 0) {
+            LOGF("x509_crt_parse (buffer) failed '%s': -0x%x", g_certPath, -ret);
+            TLS_CLEANUP();
+            gs_error = "Failed to parse client certificate";
+            return GS_FAILED;
+        }
+        LOGF("Client certificate loaded from sceIo buffer (%d bytes)", cert_read);
     }
-
-    if ((ret = mbedtls_pk_parse_keyfile(pkey, g_keyPath, NULL, mbedtls_ctr_drbg_random, ctr_drbg)) != 0) {
-        LOGF("pk_parse_keyfile failed '%s': -0x%x", g_keyPath, -ret);
-        TLS_CLEANUP();
-        gs_error = "Failed to load private key";
-        return GS_FAILED;
+    {
+        /* Load private key via sceIoOpen */
+        char* key_buf = (char*)malloc(8192);
+        if (!key_buf) {
+            TLS_CLEANUP();
+            gs_error = "Out of memory for key_buf";
+            return GS_FAILED;
+        }
+        memset(key_buf, 0, 8192);
+        
+        SceUID key_fd = sceIoOpen(g_keyPath, PSP_O_RDONLY, 0);
+        if (key_fd < 0) {
+            LOGF("sceIoOpen key failed '%s': 0x%08x", g_keyPath, key_fd);
+            free(key_buf);
+            TLS_CLEANUP();
+            static char io_err2[128];
+            snprintf(io_err2, sizeof(io_err2), "sceIoOpen key failed: 0x%08x (%s)", key_fd, g_keyPath);
+            gs_error = io_err2;
+            return GS_FAILED;
+        }
+        int key_read = sceIoRead(key_fd, key_buf, 8191);
+        sceIoClose(key_fd);
+        if (key_read <= 0) {
+            LOGF("sceIoRead key failed: %d", key_read);
+            free(key_buf);
+            TLS_CLEANUP();
+            gs_error = "Failed to read private key";
+            return GS_FAILED;
+        }
+        /* mbedtls_pk_parse_key needs null terminator included in len for PEM */
+        ret = mbedtls_pk_parse_key(pkey, (unsigned char*)key_buf, key_read + 1,
+                                   NULL, 0, mbedtls_ctr_drbg_random, ctr_drbg);
+        free(key_buf); /* Free it immediately after parse */
+        
+        if (ret != 0) {
+            LOGF("pk_parse_key (buffer) failed '%s': -0x%x", g_keyPath, -ret);
+            TLS_CLEANUP();
+            gs_error = "Failed to parse private key";
+            return GS_FAILED;
+        }
+        LOGF("Private key loaded from sceIo buffer (%d bytes)", key_read);
     }
 
     mbedtls_ssl_config_defaults(conf,

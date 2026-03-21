@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
 
 # Moonlight PSP Core
@@ -117,3 +118,20 @@ To deploy the client on authentic hardware or an emulator (PPSSPP):
 The `moonlight-psp-core` client is distributed under the **GNU General Public License v3.0**. Please refer to the [LICENSE](LICENSE) file located in the root directory for standard distribution semantics.
 
 Moonlight is a free, open-source project. Portions of the codebase, explicitly network transport and protocol logic, may be adapted from the core `moonlight-common-c` library authored by Cameron Gutman and original Moonlight contributors. External dependencies such as ENET and mbedTLS are covered under their respective MIT and Apache 2.0 open-source agreements.
+=======
+# Moonlight PSP Core (Monorepo)
+Version: v0.1.0.2-alpha
+
+## Build Status
+- [x] v0.1.0.1-alpha: Initial boot
+- [/] v0.1.0.2-alpha: **MFILE & SOCKET STABILIZATION**
+
+## Recent Fixes
+- Resolved `0x80020320` kernel file descriptor exhaustion.
+- Fixed socket leak in `http.c` via platform-native `closeSocket()`.
+- Optimized `logger.c` with a persistent file handle to bypass FAT driver asynchronicity bottleneck.
+
+## Roadmap & Current State
+Currently debugging **Error 0x80** (ENOTCONN) during control stream establishment.
+See [RELEASE_NOTES.md](file:///C:/Users/beelink/Desktop/moonlight-psp-core/RELEASE_NOTES.md) for full technical breakdown.
+>>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
