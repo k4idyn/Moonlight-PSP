@@ -1138,10 +1138,10 @@ index 41e7dd8..3007b5e 100644
  #elif defined(LC_POSIX) && !defined(LC_CHROME)
      // Disable SIGPIPE signals to avoid us getting
 diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
-index 1ab0ee9..4a7f0a5 100644
+index 1ab0ee9..ea4cc9d 100644
 --- a/src/PlatformSockets.h
 +++ b/src/PlatformSockets.h
-@@ -12,10 +12,74 @@
+@@ -12,10 +12,77 @@
  extern in_port_t n3ds_udp_port;
  #endif
  
@@ -1161,6 +1161,9 @@ index 1ab0ee9..4a7f0a5 100644
 +#undef AF_INET6
 +#endif
 +#define ioctl sceNetInetIoctl
++
++// Explicitly declare sceNetInetIoctl if it's missing from headers
++extern int sceNetInetIoctl(int s, unsigned long cmd, void *arg);
 +
 +#ifndef FIONBIO
 +#define FIONBIO 0x8004667e
@@ -1217,7 +1220,7 @@ index 1ab0ee9..4a7f0a5 100644
  #endif
  
  #ifdef _WIN32
-@@ -68,11 +132,18 @@ typedef int SOCKADDR_LEN;
+@@ -68,11 +135,18 @@ typedef int SOCKADDR_LEN;
  #include <netdb.h>
  #include <errno.h>
  #include <signal.h>
@@ -1236,7 +1239,7 @@ index 1ab0ee9..4a7f0a5 100644
  #define INVALID_SOCKET -1
  #define SOCKET_ERROR -1
  
-@@ -81,6 +152,14 @@ typedef ssize_t SOCK_RET;
+@@ -81,6 +155,14 @@ typedef ssize_t SOCK_RET;
  typedef socklen_t SOCKADDR_LEN;
  #endif
  
@@ -1251,7 +1254,7 @@ index 1ab0ee9..4a7f0a5 100644
  #ifdef AF_INET6
  typedef struct sockaddr_in6 LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
-@@ -90,6 +169,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
+@@ -90,6 +172,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
  #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
  #endif
