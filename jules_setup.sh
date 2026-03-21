@@ -90,19 +90,20 @@ make install
 echo "Building mbedTLS..."
 find_or_clone "mbedtls-3.6.2" "https://github.com/Mbed-TLS/mbedtls.git" "mbedtls-3.6.2"
 git submodule update --init --recursive
-# Jules: Disable platform entropy sources as PSP is not a supported platform for auto-detection
+# Jules: Disable platform entropy and timing as they are not supported on PSP
 sed -i 's/\/\/#define MBEDTLS_NO_PLATFORM_ENTROPY/#define MBEDTLS_NO_PLATFORM_ENTROPY/' include/mbedtls/mbedtls_config.h
 sed -i 's/\/\/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/' include/mbedtls/mbedtls_config.h
-# Jules: Enable platform millisecond time alternative
+printf "\n#undef MBEDTLS_TIMING_C\n" >> include/mbedtls/mbedtls_config.h
+# Jules: Enable platform millisecond time alternative and provide implementation
 sed -i 's/\/\/#define MBEDTLS_PLATFORM_MS_TIME_ALT/#define MBEDTLS_PLATFORM_MS_TIME_ALT/' include/mbedtls/mbedtls_config.h
-# Jules: Provide mbedtls_ms_time implementation for PSP
 printf "\n#if defined(__psp__)\n#include <pspthreadman.h>\nmbedtls_ms_time_t mbedtls_ms_time(void)\n{\n    return (mbedtls_ms_time_t)(sceKernelGetSystemTimeWide() / 1000);\n}\n#endif\n" >> library/platform_util.c
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
     -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
-    -DMBEDTLS_TEST_NULL_ENTROPY=ON -DMBEDTLS_NO_DEFAULT_ENTROPY_SOURCES=ON
+    -DGEN_FILES=OFF
 make -j$(nproc)
 make install
+cd "$ROOT_DIR"
 
 echo "Building Moonlight Common C..."
 find_or_clone "moonlight-common-c" "https://github.com/moonlight-stream/moonlight-common-c.git" "master"
