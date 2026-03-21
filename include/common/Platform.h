@@ -45,13 +45,12 @@
 #include <3ds.h>
 #include <fcntl.h>
 #elif defined(_PSP)
-#include <pspkernel.h>
-#include <pspnet.h>
-#include <pspnet_inet.h>
-#include <pspnet_resolver.h>
-#include <pspnet_apctl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
+#include <malloc.h>
+#include <pspkernel.h>
 #include <fcntl.h>
 #else
 #include <unistd.h>
@@ -83,6 +82,11 @@
 # define LC_WINDOWS_DESKTOP
 #endif
 
+#endif
+
+#ifdef _PSP
+// strtok_r is often missing from PSPSDK headers even if in libc
+extern char *strtok_r(char *, const char *, char **);
 #endif
 
 #include <stdio.h>

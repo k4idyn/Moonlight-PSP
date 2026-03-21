@@ -21,18 +21,29 @@ extern in_port_t n3ds_udp_port;
 #include <pspnet_resolver.h>
 #include <pspnet_apctl.h>
 #include <psputility_netparam.h>
+#include <pspthreadman.h>
+#include <psprtc.h>
 #ifdef AF_INET6
 #undef AF_INET6
 #endif
 #define ioctl sceNetInetIoctl
 
+// Explicitly declare sceNetInetIoctl if it's missing from headers
+extern int sceNetInetIoctl(int s, unsigned long cmd, void *arg);
+
+#ifndef FIONBIO
+#define FIONBIO 0x8004667e
+#endif
+
 #ifndef _SOCKADDR_STORAGE
 #define _SOCKADDR_STORAGE
+#ifndef HAS_SOCKADDR_STORAGE
 struct sockaddr_storage {
     unsigned char ss_len;
     unsigned char ss_family;
     char __ss_padding[128 - 2];
 };
+#endif
 #endif
 
 #include <netinet/in.h>
@@ -40,7 +51,45 @@ struct sockaddr_storage {
 #include <sys/select.h>
 #include <sys/time.h>
 #include <netdb.h>
-#include <poll.h>
+
+#ifndef AI_PASSIVE
+struct addrinfo {
+    int ai_flags;
+    int ai_family;
+    int ai_socktype;
+    int ai_protocol;
+    socklen_t ai_addrlen;
+    char *ai_canonname;
+    struct sockaddr *ai_addr;
+    struct addrinfo *ai_next;
+};
+#define AI_PASSIVE 1
+#define AI_CANONNAME 2
+#define AI_NUMERICHOST 4
+#endif
+
+#ifndef AI_ADDRCONFIG
+#define AI_ADDRCONFIG 32
+#endif
+
+// Map to sceNetInet versions if they exist, or just declare them
+extern int getaddrinfo(const char *node, const char *service,
+                       const struct addrinfo *hints,
+                       struct addrinfo **res);
+extern void freeaddrinfo(struct addrinfo *res);
+
+struct pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+#define POLLIN 0x0001
+#define POLLOUT 0x0004
+#define POLLERR 0x0008
+#define POLLHUP 0x0010
+#define POLLNVAL 0x0020
+#define POLLRDNORM POLLIN
+#define POLLWRNORM POLLOUT
 
 #define select sceNetInetSelect
 #define getsockopt sceNetInetGetsockopt

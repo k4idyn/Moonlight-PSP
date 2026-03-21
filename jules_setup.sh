@@ -4,6 +4,13 @@ set -e
 
 echo "--- Starting Moonlight PSP Environment Setup ---"
 
+# 0. Sync and reset the current repository to ensure a clean state
+if [ -d ".git" ]; then
+    echo "Resetting repository to clean state..."
+    git pull
+    git reset --hard HEAD
+fi
+
 # 1. Install System Dependencies
 sudo apt-get update
 sudo apt-get install -y \

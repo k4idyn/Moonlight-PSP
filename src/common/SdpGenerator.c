@@ -269,7 +269,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
-        snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
+        snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
@@ -288,7 +288,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             EncryptionFeaturesEnabled |= SS_ENC_AUDIO;
         }
 
-        snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
+        snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
         // Enable YUV444 if requested
@@ -356,7 +356,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
         // Send the configured bitrate to Sunshine hosts, so they can adjust for dynamic FEC percentage
         if (IS_SUNSHINE()) {
-            snprintf(payloadStr, sizeof(payloadStr), "%u", StreamConfig.bitrate);
+            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)StreamConfig.bitrate);
             err |= addAttributeString(&optionHead, "x-ml-video.configuredBitrateKbps", payloadStr);
         }
     }
