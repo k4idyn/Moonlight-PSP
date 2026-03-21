@@ -108,9 +108,15 @@ cd "$ROOT_DIR"
 
 echo "Building Moonlight Common C..."
 find_or_clone "moonlight-common-c" "https://github.com/moonlight-stream/moonlight-common-c.git" "master"
+# Moonlight-common-c now includes PSP support in master. 
+# We only apply the patch if it hasn't been applied yet (though usually it is already there).
 if [ -f "$ROOT_DIR/patches/common_c_psp.patch" ]; then
-    echo "Applying Common C PSP patches..."
-    git apply --ignore-whitespace "$ROOT_DIR/patches/common_c_psp.patch"
+    if grep -q "_PSP" src/PlatformSockets.h; then
+        echo "Moonlight Common C already contains PSP support. Skipping patch."
+    else
+        echo "Applying Common C PSP patches..."
+        git apply --ignore-whitespace "$ROOT_DIR/patches/common_c_psp.patch"
+    fi
 fi
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" -DUSE_MBEDTLS=ON
