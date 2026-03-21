@@ -44,7 +44,7 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
 LIBDIR = lib
-LDFLAGS = -L$(PSPDEV)/psp/lib
+LDFLAGS = -L$(LIBDIR) -L$(PSPDEV)/psp/lib
 LIBS = -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread-psp -lmxml -lz -lm -lpspvfpu
 LIBS += -lpspaudio -lpspmpeg -lpspgum -lpspgu -lpsprtc -lpspwlan -lpsppower -lpspdebug -lpspdisplay -lpspge -lpspctrl -lc -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver -lpsputility -lpspsdk -lpspuser
 

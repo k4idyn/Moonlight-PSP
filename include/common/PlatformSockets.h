@@ -78,6 +78,7 @@ extern int getaddrinfo(const char *node, const char *service,
                        struct addrinfo **res);
 extern void freeaddrinfo(struct addrinfo *res);
 
+#if !defined(POLLIN) && !defined(_PSP_POLL_H)
 struct pollfd {
     int fd;
     short events;
@@ -90,6 +91,7 @@ struct pollfd {
 #define POLLNVAL 0x0020
 #define POLLRDNORM POLLIN
 #define POLLWRNORM POLLOUT
+#endif
 
 #define select sceNetInetSelect
 #define getsockopt sceNetInetGetsockopt

@@ -24,7 +24,8 @@
 # Compiled Static libraries
 *.lai
 *.la
-*.a
+# Allow pre-compiled PSP libraries in lib/
+!lib/*.a
 *.lib
 
 # Executables
@@ -47,11 +48,3 @@ Thumbs.db
 build/
 bin/
 obj/
-
-# Dependencies cloned by setup script
-enet-cgutman/
-mbedtls-3.6.2/
-moonlight-common-c/
-mxml-4.0.4/
-opus-1.5.2/
-pspdev.tar.gz
