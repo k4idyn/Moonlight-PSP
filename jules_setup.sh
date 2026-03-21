@@ -7,8 +7,9 @@ echo "--- Starting Moonlight PSP Environment Setup ---"
 # 0. Sync and reset the current repository to ensure a clean state
 if [ -d ".git" ]; then
     echo "Resetting repository to clean state..."
-    git pull
-    git reset --hard HEAD
+    git fetch origin
+    git reset --hard origin/main
+    git clean -fd
 fi
 
 # 1. Install System Dependencies
