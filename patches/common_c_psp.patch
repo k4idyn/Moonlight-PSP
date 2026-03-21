@@ -1,5 +1,5 @@
 ﻿diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 31d666b..07fc037 100644
+index 31d666b..ca93637 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -10,11 +10,17 @@ option(CODE_ANALYSIS "Run code analysis during compilation" OFF)
@@ -95,7 +95,7 @@ index 31d666b..07fc037 100644
  
  target_include_directories(moonlight-common-c SYSTEM PUBLIC src)
  
-@@ -111,7 +94,10 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
+@@ -111,7 +94,11 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
  )
  
@@ -104,9 +104,23 @@ index 31d666b..07fc037 100644
 +if(HAS_SOCKADDR_STORAGE)
 +  target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKADDR_STORAGE=1)
 +endif()
++
  
  # nanors
  if (MSVC)
+@@ -122,3 +109,12 @@ else()
+         DIRECTORY "${CMAKE_SOURCE_DIR}"
+         PROPERTIES COMPILE_FLAGS "-ftree-vectorize -funroll-loops")
+ endif()
++
++# Installation
++install(TARGETS moonlight-common-c
++        ARCHIVE DESTINATION lib
++        LIBRARY DESTINATION lib
++        RUNTIME DESTINATION bin)
++
++file(GLOB HEADERS src/*.h)
++install(FILES ${HEADERS} DESTINATION include/moonlight-common-c)
 diff --git a/nanors/deps/obl/oblas_lite.c b/nanors/deps/obl/oblas_lite.c
 index 64cc8d8..f122a18 100644
 --- a/nanors/deps/obl/oblas_lite.c
