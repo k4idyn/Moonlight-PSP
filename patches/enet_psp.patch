@@ -60,10 +60,10 @@ index b55be33..cebfc55 100644
  #define ENET_BUFFER_MAXIMUM MSG_MAXIOVLEN
  #endif
 diff --git a/unix.c b/unix.c
-index 251e144..5c6db34 100644
+index 251e144..f7411de 100644
 --- a/unix.c
 +++ b/unix.c
-@@ -50,17 +50,21 @@
+@@ -50,17 +50,22 @@
  #ifndef HAS_SOCKLEN_T
  #define HAS_SOCKLEN_T 1
  #endif
@@ -77,6 +77,7 @@ index 251e144..5c6db34 100644
 -#elif defined(__vita__)
 -// PS Vita: No support for ancillary data or advanced message control
 +#elif defined(__vita__) || defined(_PSP) || defined(__psp__)
++#include <pspthreadman.h>
 +// PS Vita / PSP: No support for ancillary data or advanced message control
  #ifndef NO_MSGAPI
  #define NO_MSGAPI 1
@@ -87,7 +88,7 @@ index 251e144..5c6db34 100644
  #ifndef HAS_INET_PTON
  #define HAS_INET_PTON 1
  #endif
-@@ -71,11 +75,16 @@
+@@ -71,11 +76,16 @@
  #define HAS_SOCKLEN_T 1
  #endif
  #ifndef HAS_GETADDRINFO
@@ -106,7 +107,7 @@ index 251e144..5c6db34 100644
  #elif defined(__WIIU__)
  #ifndef HAS_POLL
  #define HAS_POLL 1
-@@ -148,6 +157,13 @@
+@@ -148,6 +158,13 @@
  #endif
  #endif
  
@@ -120,7 +121,7 @@ index 251e144..5c6db34 100644
  #ifdef HAS_FCNTL
  #include <fcntl.h>
  #endif
-@@ -188,31 +204,43 @@ enet_deinitialize (void)
+@@ -188,31 +205,43 @@ enet_deinitialize (void)
  enet_uint32
  enet_host_random_seed (void)
  {
@@ -164,7 +165,7 @@ index 251e144..5c6db34 100644
  }
  
  #ifdef __APPLE__
-@@ -327,6 +355,26 @@ enet_address_set_address (ENetAddress * address, struct sockaddr * addr, socklen
+@@ -327,6 +356,26 @@ enet_address_set_address (ENetAddress * address, struct sockaddr * addr, socklen
      return 0;
  }
  
@@ -191,7 +192,7 @@ index 251e144..5c6db34 100644
  int
  enet_address_set_host (ENetAddress * address, const char * name)
  {
-@@ -354,13 +402,27 @@ enet_address_set_host (ENetAddress * address, const char * name)
+@@ -354,13 +403,27 @@ enet_address_set_host (ENetAddress * address, const char * name)
  
      return -1;
  }
@@ -219,7 +220,7 @@ index 251e144..5c6db34 100644
  }
  
  int
-@@ -437,7 +499,9 @@ enet_socket_set_option (ENetSocket socket, ENetSocketOption option, int value)
+@@ -437,7 +500,9 @@ enet_socket_set_option (ENetSocket socket, ENetSocketOption option, int value)
      switch (option)
      {
          case ENET_SOCKOPT_NONBLOCK:
@@ -230,7 +231,7 @@ index 251e144..5c6db34 100644
              result = fcntl (socket, F_SETFL, (value ? O_NONBLOCK : 0) | (fcntl (socket, F_GETFL) & ~O_NONBLOCK));
  #else
  #ifdef HAS_IOCTL
-@@ -623,8 +687,15 @@ enet_socket_send (ENetSocket socket,
+@@ -623,8 +688,15 @@ enet_socket_send (ENetSocket socket,
          sendLength = buffers[0].dataLength;
      }
  
@@ -247,7 +248,7 @@ index 251e144..5c6db34 100644
  
      if (bufferCount > 1)
        free(sendBuffer);
-@@ -697,6 +768,12 @@ enet_socket_send (ENetSocket socket,
+@@ -697,6 +769,12 @@ enet_socket_send (ENetSocket socket,
   #endif
      }
  
@@ -260,7 +261,7 @@ index 251e144..5c6db34 100644
      sentLength = sendmsg (socket, & msgHdr, MSG_NOSIGNAL);
  #endif
  
-@@ -745,7 +822,7 @@ enet_socket_receive (ENetSocket socket,
+@@ -745,7 +823,7 @@ enet_socket_receive (ENetSocket socket,
  
      if (recvLength == -1)
      {
