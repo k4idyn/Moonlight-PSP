@@ -1,20 +1,20 @@
 # Moonlight PSP Core Monorepo: Developer Instructions
 
 ## Overview
-This repository contains the structured monorepo for the `moonlight-psp-core` project. It is designed to act as a proper C/C++ PSP SDK standard project structure for the Antigravity engine port of Moonlight.
+This repository contains the structured monorepo for the `moonlight-psp-core` project. It is designed to act as a proper C/C++ PSP SDK standard project structure for the specialized port of Moonlight.
 
 ## Directory Structure
-- `moonlight-psp-core/src/`: Contains the Antigravity engine port logic and source files.
+- `moonlight-psp-core/src/`: Contains the core engine logic and source files.
 - `moonlight-psp-core/include/`: Contains Moonlight, Sunshine, and local header files.
 - `moonlight-psp-core/assets/`: Contains PSP-specific UI resources (8-bit and 4-bit BMP images).
 - `moonlight-psp-core/Makefile`: The primary Makefile configured for the PSP toolchain (MIPS).
 
 ## Environment Setup
 
-### 1. Developer Environment (Ubuntu Linux / Jules VM)
-For agents to operate, a MIPS toolchain (PSPSDK) and several compiled dependencies are required.
+### 1. Developer Environment (Ubuntu Linux / Standard VM)
+For developers to operate, a MIPS toolchain (PSPSDK) and several compiled dependencies are required.
 
-- **Automated Setup**: Run the included `jules_setup.sh` script in the `moonlight-psp-core/` directory. This script:
+- **Automated Setup**: Run the included `setup_linux.sh` script in the `moonlight-psp-core/` directory. This script:
   - Installs system dependencies (`build-essential`, `cmake`, etc.).
   - Downloads and installs the MIPS toolchain to `/usr/local/pspdev`.
   - Clones and builds **ENet**, **mbedTLS**, **Opus**, and **Mini-XML** for PSP.

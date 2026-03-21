@@ -39,12 +39,12 @@ OBJS = \
     src/common/rswrapper.o
 
 INCDIR = include include/libgamestream include/modules include/common include/ark4
-CFLAGS = -O2 -g -G0 -Wall -Wextra -Werror -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99
+CFLAGS = -O2 -g -G0 -Wall -Wextra -Werror -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99 -I$(PSPDEV)/psp/include
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
 LIBDIR = lib
-LDFLAGS =
+LDFLAGS = -L$(PSPDEV)/psp/lib
 LIBS = -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread-psp -lmxml -lz -lm -lpspvfpu
 LIBS += -lpspaudio -lpspmpeg -lpspgum -lpspgu -lpsprtc -lpspwlan -lpsppower -lpspdebug -lpspdisplay -lpspge -lpspctrl -lc -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver -lpsputility -lpspsdk -lpspuser
 

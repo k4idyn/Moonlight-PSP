@@ -39,6 +39,7 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
     SOCKET sock;
 #ifndef _PSP
     struct addrinfo* stunAddrs;
+    struct addrinfo* current;
     struct addrinfo hints;
 #else
     struct hostent* he;
