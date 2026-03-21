@@ -222,22 +222,25 @@ index 2b5182e..2eaefee 100644
      else {
          // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
 diff --git a/src/Platform.h b/src/Platform.h
-index 302d52a..96eaeed 100644
+index 302d52a..1de1e90 100644
 --- a/src/Platform.h
 +++ b/src/Platform.h
-@@ -44,6 +44,11 @@
+@@ -44,6 +44,14 @@
  #elif defined(__3DS__)
  #include <3ds.h>
  #include <fcntl.h>
 +#elif defined(_PSP)
 +#include <unistd.h>
++#include <pthread.h>
 +#include <sys/time.h>
++#include <sys/ioctl.h>
 +#include <malloc.h>
 +#include <pspkernel.h>
++#include <fcntl.h>
  #else
  #include <unistd.h>
  #include <pthread.h>
-@@ -76,6 +81,11 @@
+@@ -76,6 +84,11 @@
  
  #endif
  
@@ -249,13 +252,13 @@ index 302d52a..96eaeed 100644
  #include <stdio.h>
  #include "Limelight.h"
  
-@@ -162,4 +172,3 @@ void PltTicksInit(void);
+@@ -162,4 +175,3 @@ void PltTicksInit(void);
  uint64_t PltGetMicroseconds(void);
  
  uint64_t PltGetMillis(void);
 -
 diff --git a/src/PlatformSockets.c b/src/PlatformSockets.c
-index 41e7dd8..793371a 100644
+index 41e7dd8..3007b5e 100644
 --- a/src/PlatformSockets.c
 +++ b/src/PlatformSockets.c
 @@ -1,5 +1,11 @@
@@ -350,16 +353,10 @@ index 41e7dd8..793371a 100644
 -    // Calling shutdown() prior to close wakes up callers
 -    // blocked in connect(), recv(), and friends.
 -    shutdown(s, SHUT_RDWR);
-+void closeSocket(SOCKET s) {
-+#if defined(LC_WINDOWS)
-+    closesocket(s);
-+#else
-+    close(s);
-+#endif
- }
- 
+-}
+-
 -int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
-+int setSocketNonBlocking(SOCKET s, bool enabled) {
++void closeSocket(SOCKET s) {
  #if defined(LC_WINDOWS)
 -    // Windows says that SO_RCVTIMEO puts the socket into an indeterminate state
 -    // when a timeout occurs. MSDN doesn't go into it any more than that, but it
@@ -372,15 +369,22 @@ index 41e7dd8..793371a 100644
 -#elif defined(__WIIU__) || defined(__3DS__)
 -    // timeouts aren't supported on Wii U or 3DS
 -    return -1;
-+    u_long mode = enabled ? 1 : 0;
-+    return ioctlsocket(s, FIONBIO, &mode);
++    closesocket(s);
  #else
 -    struct timeval val;
 -
 -    val.tv_sec = 0;
 -    val.tv_usec = timeoutMs * 1000;
--
++    close(s);
++#endif
++}
+ 
 -    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&val, sizeof(val));
++int setSocketNonBlocking(SOCKET s, bool enabled) {
++#if defined(LC_WINDOWS) || defined(_PSP)
++    u_long mode = enabled ? 1 : 0;
++    return ioctlsocket(s, FIONBIO, &mode);
++#else
 +    int flags = fcntl(s, F_GETFL, 0);
 +    if (flags == -1) {
 +        return LastSocketError();
@@ -476,9 +480,7 @@ index 41e7dd8..793371a 100644
 +        psp_tv.tv_usec = (timeoutMs % 1000) * 1000;
 +        p_tv = (timeoutMs < 0) ? NULL : &psp_tv;
 +#endif
- 
--        if (FD_ISSET(pollFds[i].fd, &writeFds)) {
--            pollFds[i].revents |= POLLWRNORM;
++
 +#ifdef _PSP
 +        err = sceNetInetSelect(nfds, &readFds, &writeFds, &exceptFds, (struct SceNetInetTimeval*)p_tv);
 +#else
@@ -506,7 +508,9 @@ index 41e7dd8..793371a 100644
 +                continue;
 +            }
 +#endif
-+
+ 
+-        if (FD_ISSET(pollFds[i].fd, &writeFds)) {
+-            pollFds[i].revents |= POLLWRNORM;
 +            return SOCKET_ERROR;
          }
  
@@ -1134,10 +1138,10 @@ index 41e7dd8..793371a 100644
  #elif defined(LC_POSIX) && !defined(LC_CHROME)
      // Disable SIGPIPE signals to avoid us getting
 diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
-index 1ab0ee9..5bac757 100644
+index 1ab0ee9..4a7f0a5 100644
 --- a/src/PlatformSockets.h
 +++ b/src/PlatformSockets.h
-@@ -12,10 +12,70 @@
+@@ -12,10 +12,74 @@
  extern in_port_t n3ds_udp_port;
  #endif
  
@@ -1157,6 +1161,10 @@ index 1ab0ee9..5bac757 100644
 +#undef AF_INET6
 +#endif
 +#define ioctl sceNetInetIoctl
++
++#ifndef FIONBIO
++#define FIONBIO 0x8004667e
++#endif
 +
 +#ifndef _SOCKADDR_STORAGE
 +#define _SOCKADDR_STORAGE
@@ -1209,7 +1217,7 @@ index 1ab0ee9..5bac757 100644
  #endif
  
  #ifdef _WIN32
-@@ -68,11 +128,18 @@ typedef int SOCKADDR_LEN;
+@@ -68,11 +132,18 @@ typedef int SOCKADDR_LEN;
  #include <netdb.h>
  #include <errno.h>
  #include <signal.h>
@@ -1228,7 +1236,7 @@ index 1ab0ee9..5bac757 100644
  #define INVALID_SOCKET -1
  #define SOCKET_ERROR -1
  
-@@ -81,6 +148,14 @@ typedef ssize_t SOCK_RET;
+@@ -81,6 +152,14 @@ typedef ssize_t SOCK_RET;
  typedef socklen_t SOCKADDR_LEN;
  #endif
  
@@ -1243,16 +1251,14 @@ index 1ab0ee9..5bac757 100644
  #ifdef AF_INET6
  typedef struct sockaddr_in6 LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
-@@ -88,7 +163,8 @@ typedef struct sockaddr_in6 LC_SOCKADDR;
- #else
- typedef struct sockaddr_in LC_SOCKADDR;
+@@ -90,6 +169,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
--#define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
-+#define SET_PORT(addr, port) ((addr)->sin6_port = htons(port))
-+#endif
+ #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
  #endif
++#endif
  
  #define LastSocketFail() ((LastSocketError() != 0) ? LastSocketError() : -1)
+ 
 diff --git a/src/RtspConnection.c b/src/RtspConnection.c
 index 52ce2b1..3b67e0c 100644
 --- a/src/RtspConnection.c
