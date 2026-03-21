@@ -669,10 +669,10 @@ index 41e7dd8..68b4e6b 100644
  #elif defined(LC_POSIX) && !defined(LC_CHROME)
      // Disable SIGPIPE signals to avoid us getting
 diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
-index 1ab0ee9..4ce2d2b 100644
+index 1ab0ee9..26a6d4b 100644
 --- a/src/PlatformSockets.h
 +++ b/src/PlatformSockets.h
-@@ -12,10 +12,53 @@
+@@ -12,10 +12,63 @@
  extern in_port_t n3ds_udp_port;
  #endif
  
@@ -707,7 +707,17 @@ index 1ab0ee9..4ce2d2b 100644
 +#include <sys/select.h>
 +#include <sys/time.h>
 +#include <netdb.h>
-+#include <poll.h>
++
++struct pollfd {
++    int fd;
++    short events;
++    short revents;
++};
++#define POLLIN 0x0001
++#define POLLOUT 0x0004
++#define POLLERR 0x0008
++#define POLLHUP 0x0010
++#define POLLNVAL 0x0020
 +
 +#define select sceNetInetSelect
 +#define getsockopt sceNetInetGetsockopt
@@ -727,8 +737,13 @@ index 1ab0ee9..4ce2d2b 100644
  #endif
  
  #ifdef _WIN32
-@@ -71,8 +114,13 @@ typedef int SOCKADDR_LEN;
+@@ -68,11 +121,18 @@ typedef int SOCKADDR_LEN;
+ #include <netdb.h>
+ #include <errno.h>
+ #include <signal.h>
++#ifndef _PSP
  #include <poll.h>
++#endif
  
  #define ioctlsocket ioctl
 +#ifdef _PSP
@@ -741,7 +756,7 @@ index 1ab0ee9..4ce2d2b 100644
  #define INVALID_SOCKET -1
  #define SOCKET_ERROR -1
  
-@@ -81,6 +129,14 @@ typedef ssize_t SOCK_RET;
+@@ -81,6 +141,14 @@ typedef ssize_t SOCK_RET;
  typedef socklen_t SOCKADDR_LEN;
  #endif
  
@@ -756,7 +771,7 @@ index 1ab0ee9..4ce2d2b 100644
  #ifdef AF_INET6
  typedef struct sockaddr_in6 LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
-@@ -90,6 +146,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
+@@ -90,6 +158,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
  #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
  #endif
