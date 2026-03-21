@@ -61,10 +61,8 @@ The project has been standardized into a monorepo format strictly compatible wit
 ```text
 moonlight-psp-core/
 ├── assets/          # 8-bit and 4-bit BMP GUI resources (VRAM-optimized)
-├── docs/            # Technical documentation, research notes, and architectural maps
-├── include/         # Unified headers for Moonlight, Sunshine, and local definitions
-├── lib/             # Pre-compiled static libraries for PSP MIPS cross-compilation
-├── licenses/        # Open-source dependency licenses (GPLv3, MIT, Apache 2.0, etc.)
+├── include/         # Unified headers (mbedTLS, ENet, Opus, MXML, etc.)
+├── lib/             # Pre-compiled static libraries for PSP MIPS
 ├── src/             # Source files for network, video, audio, and control streams
 └── Makefile         # Primary configuration for the PSPSDK build environment
 ```
@@ -80,9 +78,11 @@ Use the automated setup script to install the PSPSDK and all necessary dependenc
 ```bash
 cd moonlight-psp-core
 chmod +x setup_linux.sh
-./setup_linux.sh
+./setup_linux.sh  # Installs PSPSDK and system deps
 make -j$(nproc)
 ```
+> [!NOTE]
+> All core dependencies (`mbedtls`, `enet`, etc.) are pre-bundled in the `lib/` folder. No manual compilation of external libraries is required.
 
 ### Quick Start (Windows)
 

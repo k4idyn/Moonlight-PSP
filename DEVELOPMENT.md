@@ -17,8 +17,7 @@ For developers to operate, a MIPS toolchain (PSPSDK) and several compiled depend
 - **Automated Setup**: Run the included `setup_linux.sh` script in the `moonlight-psp-core/` directory. This script:
   - Installs system dependencies (`build-essential`, `cmake`, etc.).
   - Downloads and installs the MIPS toolchain to `/usr/local/pspdev`.
-  - Clones and builds **ENet**, **mbedTLS**, **Opus**, and **Mini-XML** for PSP.
-  - Resets the repository to a clean state (`git reset --hard origin/main`) and cleans untracked files (`git clean -fd`).
+  - **Note**: This repository includes all necessary pre-compiled dependencies (`lib/`) and headers (`include/`) out-of-the-box. No additional builds are required for core development.
 - **Environment Variables**:
   ```bash
   export PSPDEV=/usr/local/pspdev

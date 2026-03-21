@@ -47,89 +47,12 @@ export PSPDEV=/usr/local/pspdev
 export PATH=$PATH:$PSPDEV/bin
 export ROOT_DIR=$(pwd)
 
-# Helper function to find or clone a dependency
-# Usage: find_or_clone <dir_name> <git_url> <branch/tag>
-find_or_clone() {
-    if [ -d "$ROOT_DIR/$1" ]; then
-        echo "Found local dependency: $1"
-        cd "$ROOT_DIR/$1"
-    elif [ -d "$ROOT_DIR/../$1" ]; then
-         echo "Found parent-level dependency: $1"
-         cd "$ROOT_DIR/../$1"
-    else
-        echo "Cloning dependency: $1 from $2..."
-        git clone --depth 1 -b "$3" "$2" "$ROOT_DIR/$1"
-        cd "$ROOT_DIR/$1"
-    fi
-}
-
-# 3. Build & Install Project Dependencies
-# We install to $PSPDEV/psp to match the toolchain's search paths
-
-echo "Building ENet..."
-# Clone the 'moonlight' branch which has the initial PSP support
-find_or_clone "enet-cgutman" "https://github.com/cgutman/enet.git" "moonlight"
-# Apply our custom Error 116 timeout fixes
-if [ -f "$ROOT_DIR/patches/enet_psp.patch" ]; then
-    echo "Applying ENet PSP patches..."
-    git apply --ignore-whitespace "$ROOT_DIR/patches/enet_psp.patch"
-fi
-rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
-cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" -G "Unix Makefiles"
-make -j$(nproc)
-make install
-
-echo "Building Mini-XML (mxml)..."
-find_or_clone "mxml-4.0.4" "https://github.com/michaelrsweet/mxml.git" "v4.0.4"
-CC=psp-gcc ./configure --host=mipsel-pspe-elf --prefix="$PSPDEV/psp" --disable-shared
-make -j$(nproc)
-make install
-
-echo "Building Opus..."
-find_or_clone "opus-1.5.2" "https://github.com/xiph/opus.git" "v1.5.2"
-rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
-cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
-    -DOPUS_FIXED_POINT=ON -DOPUS_ENABLE_FLOAT_API=OFF -DOPUS_ASSERTIONS=OFF \
-    -DOPUS_CUSTOM_MODES=OFF -DOPUS_INSTALL_PKG_CONFIG_MODULE=OFF \
-    -DOPUS_INSTALL_CMAKE_CONFIG_MODULE=OFF
-make -j$(nproc)
-make install
-
-echo "Building mbedTLS..."
-find_or_clone "mbedtls-3.6.2" "https://github.com/Mbed-TLS/mbedtls.git" "mbedtls-3.6.2"
-git submodule update --init --recursive
-# Disable platform entropy and timing as they are not supported on PSP
-sed -i 's/\/\/#define MBEDTLS_NO_PLATFORM_ENTROPY/#define MBEDTLS_NO_PLATFORM_ENTROPY/' include/mbedtls/mbedtls_config.h
-sed -i 's/\/\/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/' include/mbedtls/mbedtls_config.h
-printf "\n#undef MBEDTLS_TIMING_C\n#undef MBEDTLS_NET_C\n" >> include/mbedtls/mbedtls_config.h
-# Enable platform millisecond time alternative and provide implementation
-sed -i 's/\/\/#define MBEDTLS_PLATFORM_MS_TIME_ALT/#define MBEDTLS_PLATFORM_MS_TIME_ALT/' include/mbedtls/mbedtls_config.h
-printf "\n#if defined(__psp__)\n#include <pspthreadman.h>\nmbedtls_ms_time_t mbedtls_ms_time(void)\n{\n    return (mbedtls_ms_time_t)(sceKernelGetSystemTimeWide() / 1000);\n}\n#endif\n" >> library/platform_util.c
-rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
-cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
-    -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
-    -DMBEDTLS_FATAL_WARNINGS=OFF \
-    -DGEN_FILES=OFF
-make -j$(nproc)
-make install
-cd "$ROOT_DIR"
-
-echo "Building Moonlight Common C..."
-find_or_clone "moonlight-common-c" "https://github.com/moonlight-stream/moonlight-common-c.git" "master"
-# Moonlight-common-c now includes PSP support in master. 
-# We only apply the patch if it hasn't been applied yet (though usually it is already there).
-if [ -f "$ROOT_DIR/patches/common_c_psp.patch" ]; then
-    if grep -q "_PSP" src/PlatformSockets.h; then
-        echo "Moonlight Common C already contains PSP support. Skipping patch."
-    else
-        echo "Applying Common C PSP patches..."
-        git apply --ignore-whitespace "$ROOT_DIR/patches/common_c_psp.patch"
-    fi
-fi
-rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
-cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" -DUSE_MBEDTLS=ON
-make -j$(nproc)
-make install
-
+# 3. Environment Summary
 echo "--- Setup Complete! ---"
+echo "PSPSDK is installed at /usr/local/pspdev"
+echo "Add these to your .bashrc or .zshrc:"
+echo "  export PSPDEV=/usr/local/pspdev"
+echo "  export PATH=\$PATH:\$PSPDEV/bin"
+echo ""
+echo "This repository includes all necessary pre-compiled dependencies in the 'lib/' directory."
 echo "You can now run 'make' inside the root directory!"
