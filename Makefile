@@ -53,7 +53,8 @@ USE_USER_LIBS = 1
 PRX_EXPORTS = exports.exp
 
 EXTRA_TARGETS = EBOOT.PBP
-PSP_EBOOT_TITLE = Moonlight PSP
+PSP_EBOOT_TITLE = Moonlight PSP v0.1.0.1-alpha
+PSP_EBOOT_VERSION = 0.1.01
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak

@@ -31,7 +31,7 @@
 #include "modules/logger.h"
 
 
-PSP_MODULE_INFO("PSPMoonlight", 0, 1, 1);
+PSP_MODULE_INFO("PSPMoonlight", 0, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 
 /* PRX Export Hooks */
