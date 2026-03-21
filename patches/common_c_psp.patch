@@ -1,4 +1,4 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
+﻿diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 31d666b..07fc037 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
@@ -221,386 +221,842 @@ index 2b5182e..2eaefee 100644
      }
      else {
          // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
+diff --git a/src/Platform.h b/src/Platform.h
+index 302d52a..96eaeed 100644
+--- a/src/Platform.h
++++ b/src/Platform.h
+@@ -44,6 +44,11 @@
+ #elif defined(__3DS__)
+ #include <3ds.h>
+ #include <fcntl.h>
++#elif defined(_PSP)
++#include <unistd.h>
++#include <sys/time.h>
++#include <malloc.h>
++#include <pspkernel.h>
+ #else
+ #include <unistd.h>
+ #include <pthread.h>
+@@ -76,6 +81,11 @@
+ 
+ #endif
+ 
++#ifdef _PSP
++// strtok_r is often missing from PSPSDK headers even if in libc
++extern char *strtok_r(char *, const char *, char **);
++#endif
++
+ #include <stdio.h>
+ #include "Limelight.h"
+ 
+@@ -162,4 +172,3 @@ void PltTicksInit(void);
+ uint64_t PltGetMicroseconds(void);
+ 
+ uint64_t PltGetMillis(void);
+-
 diff --git a/src/PlatformSockets.c b/src/PlatformSockets.c
-index 41e7dd8..68b4e6b 100644
+index 41e7dd8..793371a 100644
 --- a/src/PlatformSockets.c
 +++ b/src/PlatformSockets.c
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,11 @@
  #include "Limelight-internal.h"
 +#ifdef _PSP
 +extern char g_local_ip[16];
++uint16_t AudioLocalPort = 0;
++uint16_t VideoLocalPort = 0;
 +#endif
  
 +#include <arpa/inet.h>
  #define TEST_PORT_TIMEOUT_SEC 3
  
  #define RCV_BUFFER_SIZE_MIN  32767
-@@ -70,6 +74,7 @@ void shutdownTcpSocket(SOCKET s) {
+@@ -14,86 +20,77 @@
+ 
+ #if defined(LC_WINDOWS)
+ 
+-#ifndef SIO_UDP_CONNRESET
+-#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+-#endif
++#include <wlanapi.h>
+ 
+-static HMODULE WlanApiLibraryHandle;
+ static HANDLE WlanHandle;
++static HMODULE WlanApiLibraryHandle;
+ 
+-#if defined(LC_WINDOWS_DESKTOP)
+-DWORD (WINAPI *pfnWlanOpenHandle)(DWORD dwClientVersion, PVOID pReserved, PDWORD pdwNegotiatedVersion, PHANDLE phClientHandle);
+-DWORD (WINAPI *pfnWlanCloseHandle)(HANDLE hClientHandle, PVOID pReserved);
+-DWORD (WINAPI *pfnWlanEnumInterfaces)(HANDLE hClientHandle, PVOID pReserved, PWLAN_INTERFACE_INFO_LIST *ppInterfaceList);
+-VOID (WINAPI *pfnWlanFreeMemory)(PVOID pMemory);
+-DWORD (WINAPI *pfnWlanSetInterface)(HANDLE hClientHandle, CONST GUID *pInterfaceGuid, WLAN_INTF_OPCODE OpCode, DWORD dwDataSize, CONST PVOID pData, PVOID pReserved);
+-#endif
+-
+-#ifndef WLAN_API_MAKE_VERSION
+-#define WLAN_API_MAKE_VERSION(_major, _minor)   (((DWORD)(_minor)) << 16 | (_major))
+-#endif
++typedef DWORD(WINAPI* PFN_WLANOPENHANDLE)(DWORD, PVOID, PDWORD, PHANDLE);
++typedef DWORD(WINAPI* PFN_WLANCLOSEHANDLE)(HANDLE, PVOID);
++typedef VOID(WINAPI* PFN_WLANFREEMEMORY)(PVOID);
++typedef DWORD(WINAPI* PFN_WLANENUMINTERFACES)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST*);
++typedef DWORD(WINAPI* PFN_WLANSETINTERFACE)(HANDLE, const GUID*, WLAN_INTF_OPCODE, DWORD, LPCVOID, PVOID);
+ 
+-#endif
++static PFN_WLANOPENHANDLE pfnWlanOpenHandle;
++static PFN_WLANCLOSEHANDLE pfnWlanCloseHandle;
++static PFN_WLANFREEMEMORY pfnWlanFreeMemory;
++static PFN_WLANENUMINTERFACES pfnWlanEnumInterfaces;
++static PFN_WLANSETINTERFACE pfnWlanSetInterface;
+ 
+-#ifdef __3DS__
+-in_port_t n3ds_udp_port = 47998;
+-static const int n3ds_max_buf_size = 0x20000;
+ #endif
+ 
+-void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t stringLength)
+-{
+-    char addrstr[URLSAFESTRING_LEN];
+-
+-#ifdef AF_INET6
+-    if (addr->ss_family == AF_INET6) {
+-        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)addr;
+-        inet_ntop(addr->ss_family, &sin6->sin6_addr, addrstr, sizeof(addrstr));
++SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking) {
++    SOCKET s = socket(addressFamily, socketType, protocol);
++    if (s != INVALID_SOCKET) {
++        if (nonBlocking) {
++            setSocketNonBlocking(s, true);
++        }
+ 
+-        // IPv6 addresses need to be enclosed in brackets for URLs
+-        snprintf(string, stringLength, "[%s]", addrstr);
+-    }
+-    else
++#ifdef TCP_NODELAY
++        if (socketType == SOCK_STREAM) {
++            enableNoDelay(s);
++        }
+ #endif
+-    {
+-        struct sockaddr_in* sin = (struct sockaddr_in*)addr;
+-        inet_ntop(addr->ss_family, &sin->sin_addr, addrstr, sizeof(addrstr));
+-
+-        // IPv4 addresses are returned without changes
+-        snprintf(string, stringLength, "%s", addrstr);
+     }
++    return s;
  }
  
- int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
-+    Limelog("[DEBUG] setNonFatalRecvTimeoutMs: ENTER (timeout=%dms)\n", timeoutMs);
+-void shutdownTcpSocket(SOCKET s) {
+-    // Calling shutdown() prior to close wakes up callers
+-    // blocked in connect(), recv(), and friends.
+-    shutdown(s, SHUT_RDWR);
++void closeSocket(SOCKET s) {
++#if defined(LC_WINDOWS)
++    closesocket(s);
++#else
++    close(s);
++#endif
+ }
+ 
+-int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
++int setSocketNonBlocking(SOCKET s, bool enabled) {
  #if defined(LC_WINDOWS)
-     // Windows says that SO_RCVTIMEO puts the socket into an indeterminate state
-     // when a timeout occurs. MSDN doesn't go into it any more than that, but it
-@@ -79,8 +84,8 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
-     // losing some data in a very rare case is fine, especially because we get to
-     // halve the number of syscalls per packet by avoiding select().
-     return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutMs, sizeof(timeoutMs));
+-    // Windows says that SO_RCVTIMEO puts the socket into an indeterminate state
+-    // when a timeout occurs. MSDN doesn't go into it any more than that, but it
+-    // seems likely that they are referring to the inability to know whether a
+-    // cancelled request consumed some data or not (very relevant for stream-based
+-    // protocols like TCP). Since our sockets are UDP which is already unreliable,
+-    // losing some data in a very rare case is fine, especially because we get to
+-    // halve the number of syscalls per packet by avoiding select().
+-    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutMs, sizeof(timeoutMs));
 -#elif defined(__WIIU__) || defined(__3DS__)
 -    // timeouts aren't supported on Wii U or 3DS
-+#elif defined(__WIIU__) || defined(__3DS__) || defined(_PSP)
-+    // timeouts aren't supported on Wii U or 3DS (and flaky on PSP)
-     return -1;
+-    return -1;
++    u_long mode = enabled ? 1 : 0;
++    return ioctlsocket(s, FIONBIO, &mode);
  #else
-     struct timeval val;
-@@ -93,7 +98,7 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
+-    struct timeval val;
+-
+-    val.tv_sec = 0;
+-    val.tv_usec = timeoutMs * 1000;
+-
+-    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&val, sizeof(val));
++    int flags = fcntl(s, F_GETFL, 0);
++    if (flags == -1) {
++        return LastSocketError();
++    }
++    if (enabled) {
++        flags |= O_NONBLOCK;
++    }
++    else {
++        flags &= ~O_NONBLOCK;
++    }
++    if (fcntl(s, F_SETFL, flags) == -1) {
++        return LastSocketError();
++    }
++    return 0;
+ #endif
  }
  
++void shutdownTcpSocket(SOCKET s) {
++    shutdown(s, SHUT_RDWR);
++}
++
  int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
 -#if defined(LC_WINDOWS)
 +#if defined(LC_WINDOWS) || defined(__vita__) || defined(__WIIU__) || defined(_PSP)
      // We could have used WSAPoll() but it has some nasty bugs
      // https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
      //
-@@ -122,12 +127,95 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
-             // while Linux signals them as writeable.
-             FD_SET(pollFds[i].fd, &exceptFds);
-         }
-+
-+        if (pollFds[i].fd >= nfds) {
-+            nfds = pollFds[i].fd + 1;
+@@ -101,7 +98,9 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
+     // of fd_set does not have the same stack corruption hazards that UNIX does.
+     fd_set readFds, writeFds, exceptFds;
+     int i, err, nfds;
++#ifndef _PSP
+     struct timeval tv;
++#endif
+ 
+     FD_ZERO(&readFds);
+     FD_ZERO(&writeFds);
+@@ -109,464 +108,259 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
+ 
+     nfds = 0;
+     for (i = 0; i < pollFdsCount; i++) {
+-        // Clear revents on input like poll() does
+         pollFds[i].revents = 0;
+ 
++        if (pollFds[i].fd == INVALID_SOCKET) {
++            continue;
 +        }
++
+         if (pollFds[i].events & POLLIN) {
+             FD_SET(pollFds[i].fd, &readFds);
+         }
+         if (pollFds[i].events & POLLOUT) {
+             FD_SET(pollFds[i].fd, &writeFds);
++        }
++        FD_SET(pollFds[i].fd, &exceptFds);
+ 
+-            // Windows signals failed connections as an exception,
+-            // while Linux signals them as writeable.
+-            FD_SET(pollFds[i].fd, &exceptFds);
++        if ((int)pollFds[i].fd >= nfds) {
++            nfds = (int)pollFds[i].fd + 1;
+         }
      }
  
-     tv.tv_sec = timeoutMs / 1000;
-     tv.tv_usec = (timeoutMs % 1000) * 1000;
+-    tv.tv_sec = timeoutMs / 1000;
+-    tv.tv_usec = (timeoutMs % 1000) * 1000;
+-
+-    err = select(nfds, &readFds, &writeFds, &exceptFds, timeoutMs >= 0 ? &tv : NULL);
+-    if (err <= 0) {
+-        // Error or timeout
+-        return err;
++    if (nfds == 0) {
++        // Nothing to poll
++        return 0;
+     }
  
+-    for (i = 0; i < pollFdsCount; i++) {
+-        if (FD_ISSET(pollFds[i].fd, &readFds)) {
+-            pollFds[i].revents |= POLLRDNORM;
+-        }
 +#ifdef _PSP
 +    uint64_t start_time = sceKernelGetSystemTimeWide();
-+    uint64_t timeout_us = (timeoutMs >= 0) ? (uint64_t)timeoutMs * 1000 : 0;
-+    int retries = 10000; // Large retry count for premature select returns
++#endif
++    for (;;) {
++        void* p_tv;
++#ifndef _PSP
++        tv.tv_sec = timeoutMs / 1000;
++        tv.tv_usec = (timeoutMs % 1000) * 1000;
++        p_tv = (timeoutMs < 0) ? NULL : &tv;
++#else
++        struct SceNetInetTimeval psp_tv;
++        psp_tv.tv_sec = timeoutMs / 1000;
++        psp_tv.tv_usec = (timeoutMs % 1000) * 1000;
++        p_tv = (timeoutMs < 0) ? NULL : &psp_tv;
++#endif
+ 
+-        if (FD_ISSET(pollFds[i].fd, &writeFds)) {
+-            pollFds[i].revents |= POLLWRNORM;
++#ifdef _PSP
++        err = sceNetInetSelect(nfds, &readFds, &writeFds, &exceptFds, (struct SceNetInetTimeval*)p_tv);
++#else
++        err = select(nfds, &readFds, &writeFds, &exceptFds, (struct timeval*)p_tv);
++#endif
++        if (err == SOCKET_ERROR) {
++            int lastError = LastSocketError();
++#if defined(LC_WINDOWS)
++            if (lastError == WSAEINTR) {
++                continue;
++            }
++#else
++            if (lastError == EINTR) {
++                continue;
++            }
++#endif
 +
-+    do {
-+        FD_ZERO(&readFds);
-+        FD_ZERO(&writeFds);
-+        FD_ZERO(&exceptFds);
++#ifdef _PSP
++            if (lastError == 0) {
++                // sceNetInetSelect() can return SOCKET_ERROR with 0 error code on timeout?
++                // No, it should return 0. But let's be safe.
++                if (timeoutMs >= 0 && (int64_t)(sceKernelGetSystemTimeWide() - start_time) >= (int64_t)timeoutMs * 1000) {
++                    return 0;
++                }
++                continue;
++            }
++#endif
 +
-+        nfds = 0;
++            return SOCKET_ERROR;
+         }
+ 
+-        if (FD_ISSET(pollFds[i].fd, &exceptFds)) {
+-            pollFds[i].revents |= POLLERR;
++        if (err == 0) {
++            return 0;
+         }
+-    }
+ 
+-    return err;
+-#elif defined(__3DS__)
+-    int err;
+-    u64 poll_start = osGetTime();
+-    for (u64 i = poll_start; (i - poll_start) < timeoutMs; i = osGetTime()) {
+-        err = poll(pollFds, pollFdsCount, 0); // This is running for 14ms
+-        if (err) {
+-            break;
 +        for (i = 0; i < pollFdsCount; i++) {
-+            pollFds[i].revents = 0;
-+
 +            if (pollFds[i].fd == INVALID_SOCKET) {
 +                continue;
 +            }
 +
-+            if (pollFds[i].events & POLLIN) {
-+                FD_SET(pollFds[i].fd, &readFds);
++            if (FD_ISSET(pollFds[i].fd, &readFds)) {
++                pollFds[i].revents |= POLLIN;
 +            }
-+            if (pollFds[i].events & POLLOUT) {
-+                FD_SET(pollFds[i].fd, &writeFds);
++            if (FD_ISSET(pollFds[i].fd, &writeFds)) {
++                pollFds[i].revents |= POLLOUT;
 +            }
-+            FD_SET(pollFds[i].fd, &exceptFds);
-+
-+            if (pollFds[i].fd >= nfds) {
-+                nfds = pollFds[i].fd + 1;
++            if (FD_ISSET(pollFds[i].fd, &exceptFds)) {
++                pollFds[i].revents |= POLLERR;
 +            }
-+        }
-+
-+        // Adjust timeout for this iteration
-+        struct timeval iter_tv;
-+        struct timeval* p_tv = NULL;
-+        if (timeoutMs >= 0) {
-+            uint64_t now = sceKernelGetSystemTimeWide();
-+            uint64_t elapsed_us = now - start_time;
-+            if (elapsed_us >= timeout_us) {
-+                err = 0; // Real timeout
-+                break;
-+            }
-+            uint64_t remain_us = timeout_us - elapsed_us;
-+            iter_tv.tv_sec = (long)(remain_us / 1000000);
-+            iter_tv.tv_usec = (long)(remain_us % 1000000);
-+            p_tv = &iter_tv;
-+        }
-+
-+        err = sceNetInetSelect(nfds, &readFds, &writeFds, &exceptFds, p_tv);
-+        
-+        if (err > 0) break; // Success
-+        
-+        if (err == 0) {
-+            // Premature timeout check
-+            uint64_t now = sceKernelGetSystemTimeWide();
-+            uint64_t elapsed_us = now - start_time;
-+            if (timeoutMs >= 1 && elapsed_us < timeout_us) {
-+                // If it returned 0 but we have significant time left, it's premature
-+                // Sleep a tiny bit to avoid busy looping on premature returns
-+                sceKernelDelayThread(1000); // 1ms
-+                retries--;
-+                continue;
-+            }
-+            break; // Real timeout
-+        }
-+
-+        if (err < 0) {
-+            int errno_val = (int)sceNetInetGetErrno();
-+            if (errno_val == 11 || errno_val == 4) { // EAGAIN or EINTR
-+                sceKernelDelayThread(1000);
-+                retries--;
-+                continue;
-+            }
-+            // Real error
-+            Limelog("[ERROR] pollSockets FAIL: err=%d errno=%d\n", err, errno_val);
-+            break;
-+        }
-+    } while (retries > 0);
-+#else
-     err = select(nfds, &readFds, &writeFds, &exceptFds, timeoutMs >= 0 ? &tv : NULL);
-+#endif
-     if (err <= 0) {
-         // Error or timeout
-         return err;
-@@ -152,15 +240,21 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
-     int err;
-     u64 poll_start = osGetTime();
-     for (u64 i = poll_start; (i - poll_start) < timeoutMs; i = osGetTime()) {
-+#ifndef _PSP
-         err = poll(pollFds, pollFdsCount, 0); // This is running for 14ms
-+#else
-+        err = -1;
-+#endif
-         if (err) {
-             break;
          }
-         svcSleepThread(1000);
+-        svcSleepThread(1000);
++
++        return err;
      }
-     return err;
--#else
-+#elif !defined(_PSP)
+-    return err;
+ #else
      return poll(pollFds, pollFdsCount, timeoutMs);
-+#else
-+    return -1; // Should not reach here if _PSP is handled in the first block
  #endif
  }
  
-@@ -195,13 +289,31 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
-             }
+ bool isSocketReadable(SOCKET s) {
+-    struct pollfd pfd;
+-    int err;
+-
+-    pfd.fd = s;
+-    pfd.events = POLLIN;
+-    err = pollSockets(&pfd, 1, 0);
+-    if (err <= 0) {
+-        return false;
++    struct pollfd fd;
++    fd.fd = s;
++    fd.events = POLLIN;
++    fd.revents = 0;
++    if (pollSockets(&fd, 1, 0) > 0) {
++        return (fd.revents & POLLIN) != 0;
+     }
+-
+-    return true;
++    return false;
+ }
  
-             // This won't block since the socket is readable
-+#ifdef _PSP
-+            struct sockaddr_in from;
-+            SOCKADDR_LEN fromlen = sizeof(from);
-+            err = (int)recvfrom(s, buffer, size, 0, (struct sockaddr*)&from, &fromlen);
-+            if (err < 0 && LastSocketError() == 14) {
-+                Limelog("recvUdpSocket: recvfrom(select) EFAULT! buf=%p size=%d s=%d\n", buffer, size, (int)s);
-+            }
-+#else
-             err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
-+#endif
-         }
-         else {
-             // The caller has already configured a timeout on this
-             // socket via SO_RCVTIMEO, so we can avoid a syscall
-             // for each packet.
-+#ifdef _PSP
-+            struct sockaddr_in from;
-+            SOCKADDR_LEN fromlen = sizeof(from);
-+            err = (int)recvfrom(s, buffer, size, 0, (struct sockaddr*)&from, &fromlen);
-+            if (err < 0 && LastSocketError() == 14) {
-+                Limelog("recvUdpSocket: recvfrom(timeout) EFAULT! buf=%p size=%d s=%d\n", buffer, size, (int)s);
-+            }
-+#else
-             err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
-+#endif
-             if (err < 0 &&
-                     (LastSocketError() == EWOULDBLOCK ||
-                      LastSocketError() == EINTR ||
-@@ -297,16 +409,45 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
+-int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
++SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
++    SOCKET s;
+     int err;
++    LC_SOCKADDR connectAddr;
+ 
+-    do {
+-        if (useSelect) {
+-            struct pollfd pfd;
+-
+-            // Wait up to 100 ms for the socket to be readable
+-            pfd.fd = s;
+-            pfd.events = POLLIN;
+-            err = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+-            if (err <= 0) {
+-                // Return if an error or timeout occurs
+-                return err;
+-            }
++    s = createSocket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP, true);
++    if (s == INVALID_SOCKET) {
++        return INVALID_SOCKET;
++    }
+ 
+-            // This won't block since the socket is readable
+-            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+-        }
+-        else {
+-            // The caller has already configured a timeout on this
+-            // socket via SO_RCVTIMEO, so we can avoid a syscall
+-            // for each packet.
+-            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+-            if (err < 0 &&
+-                    (LastSocketError() == EWOULDBLOCK ||
+-                     LastSocketError() == EINTR ||
+-                     LastSocketError() == EAGAIN ||
+-         #if defined(LC_WINDOWS)
+-                     // This error is specific to overlapped I/O which isn't even
+-                     // possible to perform with recvfrom(). It seems to randomly
+-                     // be returned instead of WSAETIMEDOUT on certain systems.
+-                     LastSocketError() == WSA_IO_PENDING ||
+-         #endif
+-                     LastSocketError() == ETIMEDOUT)) {
+-                // Return 0 for timeout
+-                return 0;
+-            }
+-        }
++    memcpy(&connectAddr, dstaddr, addrlen);
++    SET_PORT(&connectAddr, port);
+ 
+-    // We may receive an error due to a previous ICMP Port Unreachable error received
+-    // by this socket. We want to ignore those and continue reading. If the remote party
+-    // is really dead, ENet or TCP connection failures will trigger connection teardown.
+-#if defined(LC_WINDOWS)
+-    } while (err < 0 && LastSocketError() == WSAECONNRESET);
+-#else
+-    } while (err < 0 && LastSocketError() == ECONNREFUSED);
+-#endif
++    err = connect(s, (struct sockaddr*)&connectAddr, addrlen);
++    if (err == SOCKET_ERROR) {
++        int lastError = LastSocketError();
++        if (lastError != EINPROGRESS && lastError != EWOULDBLOCK) {
++            closeSocket(s);
++            return INVALID_SOCKET;
++        }
+ 
+-    return err;
+-}
++        struct pollfd pollFd;
++        pollFd.fd = s;
++        pollFd.events = POLLOUT;
++        pollFd.revents = 0;
+ 
+-void closeSocket(SOCKET s) {
+-#if defined(LC_WINDOWS)
+-    closesocket(s);
+-#else
+-    close(s);
+-#endif
+-}
+-
+-// These set "safe" host or link-local QoS options that we can unconditionally
+-// set without having to worry about routers blockholing the traffic.
+-static void setSocketQos(SOCKET s, int socketQosType) {
+-#ifdef SO_NET_SERVICE_TYPE
+-    int value;
+-    switch (socketQosType) {
+-    case SOCK_QOS_TYPE_BEST_EFFORT:
+-        value = NET_SERVICE_TYPE_BE;
+-        break;
+-    case SOCK_QOS_TYPE_AUDIO:
+-        value = NET_SERVICE_TYPE_VO;
+-        break;
+-    case SOCK_QOS_TYPE_VIDEO:
+-        value = NET_SERVICE_TYPE_VI;
+-        break;
+-    default:
+-        Limelog("Unknown QoS type: %d\n", socketQosType);
+-        return;
+-    }
++        err = pollSockets(&pollFd, 1, timeoutSec * 1000);
++        if (err <= 0) {
++            closeSocket(s);
++            return INVALID_SOCKET;
++        }
+ 
+-    // iOS/macOS
+-    if (setsockopt(s, SOL_SOCKET, SO_NET_SERVICE_TYPE, (char*)&value, sizeof(value)) < 0) {
+-        Limelog("setsockopt(SO_NET_SERVICE_TYPE, %d) failed: %d\n", value, (int)LastSocketError());
+-    }
+-#endif
+-#ifdef SO_PRIORITY
+-    int value;
+-    switch (socketQosType) {
+-    case SOCK_QOS_TYPE_BEST_EFFORT:
+-        value = 0;
+-        break;
+-    case SOCK_QOS_TYPE_AUDIO:
+-        value = 6;
+-        break;
+-    case SOCK_QOS_TYPE_VIDEO:
+-        value = 5;
+-        break;
+-    default:
+-        Limelog("Unknown QoS type: %d\n", socketQosType);
+-        return;
++        if (pollFd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
++            closeSocket(s);
++            return INVALID_SOCKET;
++        }
+     }
+ 
+-    // Linux
+-    if (setsockopt(s, SOL_SOCKET, SO_PRIORITY, (char*)&value, sizeof(value)) < 0) {
+-        Limelog("setsockopt(SO_PRIORITY, %d) failed: %d\n", value, (int)LastSocketError());
+-    }
+-#endif
++    return s;
+ }
+ 
+ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCKADDR_LEN addrLen, int bufferSize, int socketQosType) {
+     SOCKET s;
+-    LC_SOCKADDR bindAddr;
+     int err;
+ 
+-    s = createSocket(addressFamily, SOCK_DGRAM, IPPROTO_UDP, false);
++    s = createSocket(addressFamily, SOCK_DGRAM, IPPROTO_UDP, true);
+     if (s == INVALID_SOCKET) {
          return INVALID_SOCKET;
      }
  
 -    // Use localAddr to bind if it was provided
-+#ifdef _PSP
-+    int requestedPort = 0;
-+#endif
-+
-     if (localAddr && localAddr->ss_family != 0) {
-+        if (localAddr->ss_family == AF_INET) {
-+#ifdef _PSP
-+            requestedPort = BE16(((struct sockaddr_in*)localAddr)->sin_port);
-+#endif
-+        }
-+
-+#ifdef _PSP
-+        {
-+            // Force INADDR_ANY and port 0 to avoid EACCES and conflicts
-+            struct sockaddr_in* sin = (struct sockaddr_in*)&bindAddr;
-+            memset(sin, 0, sizeof(*sin));
-+            sin->sin_family = AF_INET;
-+            sin->sin_addr.s_addr = INADDR_ANY;
-+            sin->sin_port = 0;
-+            addrLen = sizeof(*sin);
-+        }
-+        
-+        // Explicitly allow address reuse to avoid EADDRINUSE after crashes
-+        {
-+            int opt = 1;
-+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-+        }
-+#else
-         memcpy(&bindAddr, localAddr, addrLen);
-         SET_PORT(&bindAddr, 0);
-+#endif
-     }
-     else {
-         // Otherwise wildcard bind to the specified address family
-         memset(&bindAddr, 0, sizeof(bindAddr));
-         SET_FAMILY(&bindAddr, addressFamily);
- 
-+        SET_PORT(&bindAddr, 0);
-+
- #ifdef AF_INET6
-         LC_ASSERT(addressFamily == AF_INET || addressFamily == AF_INET6);
-         addrLen = (addressFamily == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
-@@ -316,19 +457,46 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
- #endif
-     }
- 
-+
- #ifdef __3DS__
-     // binding to wildcard port is broken on the 3DS, so we need to define a port manually
-     struct sockaddr_in *n3ds_addr = &bindAddr;
-     n3ds_addr->sin_port = htons(n3ds_udp_port++);
- #endif
-+
-+#ifdef _PSP
-+    Limelog("bindUDP: qos=%d port=%d family=%d len=%d sa_len=%d\n", 
-+           socketQosType, ntohs(bindAddr.sin_port), bindAddr.sin_family, (int)addrLen, (int)bindAddr.sin_len);
-+#endif
-+
-     if (bind(s, (struct sockaddr*) &bindAddr, addrLen) == SOCKET_ERROR) {
-         err = LastSocketError();
-+#ifdef _PSP
-+        Limelog("bind() failed: %d (requested port was %d)\n", err, requestedPort);
-+#else
-         Limelog("bind() failed: %d\n", err);
-+#endif
-         closeSocket(s);
-         SetLastSocketError(err);
-         return INVALID_SOCKET;
-     }
- 
-+#ifdef _PSP
-+    {
-+        struct sockaddr_in sin;
-+        SOCKADDR_LEN len = sizeof(sin);
-+        if (getsockname(s, (struct sockaddr*)&sin, &len) == 0) {
-+            uint16_t assignedPort = BE16(sin.sin_port);
-+            Limelog("bindUDP: assigned local port %d for QOS %d\n", assignedPort, socketQosType);
-+            if (socketQosType == SOCK_QOS_TYPE_AUDIO) {
-+                AudioLocalPort = assignedPort;
-+            } else if (socketQosType == SOCK_QOS_TYPE_VIDEO) {
-+                VideoLocalPort = assignedPort;
-+            }
-+        }
-+    }
-+#endif
-+
- #if defined(LC_DARWIN)
-     {
-         // Disable SIGPIPE on iOS
-@@ -450,9 +618,74 @@ SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlo
- SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
-     SOCKET s;
-     LC_SOCKADDR addr;
--    struct pollfd pfd;
-     int err;
-+
-+#if defined(_PSP) || defined(__psp__)
-+    // Use non-blocking connect to support timeouts and prevent hangs
-+    s = createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, true);
-+    if (s == INVALID_SOCKET) {
-+        Limelog("connectTcpSocket: createSocket failed\n");
-+        return INVALID_SOCKET;
-+    }
-+
-+    // Build sockaddr_in fresh
-+    struct sockaddr_in* sin4 = (struct sockaddr_in*)&addr;
-+    memset(sin4, 0, sizeof(struct sockaddr_in));
-+    sin4->sin_family = AF_INET;
-+    sin4->sin_port = htons(port);
-+    memcpy(&sin4->sin_addr, &((struct sockaddr_in*)dstaddr)->sin_addr, sizeof(sin4->sin_addr));
-+#ifdef sin_len
-+    sin4->sin_len = sizeof(struct sockaddr_in);
-+#endif
-+
-+    Limelog("Connecting TCP to %s:%u (family %d, non-blocking)...\n", inet_ntoa(sin4->sin_addr), port, sin4->sin_family);
-+
-+    err = connect(s, (struct sockaddr*)sin4, sizeof(struct sockaddr_in));
-+    if (err < 0) {
-+        err = (int)LastSocketError();
-+        if (err != EWOULDBLOCK && err != EAGAIN && err != EINPROGRESS) {
-+            Limelog("connectTcpSocket: connect() failed immediately: %d\n", err);
+-    if (localAddr && localAddr->ss_family != 0) {
+-        memcpy(&bindAddr, localAddr, addrLen);
+-        SET_PORT(&bindAddr, 0);
+-    }
+-    else {
+-        // Otherwise wildcard bind to the specified address family
+-        memset(&bindAddr, 0, sizeof(bindAddr));
+-        SET_FAMILY(&bindAddr, addressFamily);
+-
+-#ifdef AF_INET6
+-        LC_ASSERT(addressFamily == AF_INET || addressFamily == AF_INET6);
+-        addrLen = (addressFamily == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+-#else
+-        LC_ASSERT(addressFamily == AF_INET);
+-        addrLen = sizeof(struct sockaddr_in);
+-#endif
+-    }
+-
+-#ifdef __3DS__
+-    // binding to wildcard port is broken on the 3DS, so we need to define a port manually
+-    struct sockaddr_in *n3ds_addr = &bindAddr;
+-    n3ds_addr->sin_port = htons(n3ds_udp_port++);
+-#endif
+-    if (bind(s, (struct sockaddr*) &bindAddr, addrLen) == SOCKET_ERROR) {
+-        err = LastSocketError();
+-        Limelog("bind() failed: %d\n", err);
+-        closeSocket(s);
+-        SetLastSocketError(err);
+-        return INVALID_SOCKET;
+-    }
+-
+-#if defined(LC_DARWIN)
+-    {
+-        // Disable SIGPIPE on iOS
+-        int val = 1;
+-        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
+-    }
+-#elif defined(LC_WINDOWS)
+-    {
+-        // Disable WSAECONNRESET for UDP sockets on Windows
+-        BOOL val = FALSE;
+-        DWORD bytesReturned = 0;
+-        if (WSAIoctl(s, SIO_UDP_CONNRESET, &val, sizeof(val), NULL, 0, &bytesReturned, NULL, NULL) != 0) {
+-            Limelog("WSAIoctl(SIO_UDP_CONNRESET) failed: %d\n", LastSocketError());
++    if (localAddr != NULL) {
++        err = bind(s, (struct sockaddr*)localAddr, addrLen);
++        if (err == SOCKET_ERROR) {
 +            closeSocket(s);
 +            return INVALID_SOCKET;
-+        }
-+    }
-+
-+    // Wait for connection
-+    struct pollfd pfd;
-+    pfd.fd = s;
-+    pfd.events = POLLOUT;
-+    err = pollSockets(&pfd, 1, timeoutSec * 1000);
-+    if (err <= 0) {
-+        if (err == 0) {
-+            Limelog("connectTcpSocket: connection TIMED OUT\n");
-+            SetLastSocketError(ETIMEDOUT);
-+        } else {
-+            Limelog("connectTcpSocket: pollSockets FAILED: %d\n", (int)LastSocketError());
-+        }
-+        closeSocket(s);
-+        return INVALID_SOCKET;
-+    }
-+
-+    // Check for socket error
-+    int sock_err = 0;
-+    SOCKADDR_LEN optlen = sizeof(sock_err);
-+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&sock_err, &optlen) == 0 && sock_err != 0) {
-+        Limelog("connectTcpSocket: Delayed connect error: %d\n", sock_err);
-+        closeSocket(s);
-+        SetLastSocketError(sock_err);
-+        return INVALID_SOCKET;
-+    }
-+
-+    // Success - back to blocking mode for simple send/recv
-+    setSocketNonBlocking(s, false);
-+    Limelog("connectTcpSocket: connect() succeeded!\n");
-+    return s;
-+
-+#else
-+    struct pollfd pfd;
-+#if defined(LC_WINDOWS) || defined(TCP_NOOPT) || (defined(TCP_MAXSEG) && !defined(_PSP))
-     int val;
-+#endif
- 
-     // Create a non-blocking TCP socket
-     s = createSocket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP, true);
-@@ -505,6 +738,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen,
-     // Start connection
-     memcpy(&addr, dstaddr, addrlen);
-     SET_PORT(&addr, port);
-+    Limelog("Connecting TCP to %s:%u (family %d)...\n", inet_ntoa(((struct sockaddr_in*)dstaddr)->sin_addr), port, dstaddr->ss_family);
-     err = connect(s, (struct sockaddr*) &addr, addrlen);
-     if (err < 0) {
-         err = (int)LastSocketError();
-@@ -566,6 +800,7 @@ Exit:
+         }
      }
+-#elif defined(__WIIU__)
+-    {
+-        // Enable usage of userbuffers on Wii U
+-        int val = 1;
+-        setsockopt(s, SOL_SOCKET, SO_RUSRBUF, &val, sizeof(val));
+-    }
+-#endif
+-
+-    // Enable QOS for the socket (best effort)
+-    if (socketQosType != SOCK_QOS_TYPE_BEST_EFFORT) {
+-        setSocketQos(s, socketQosType);
+-    }
+ 
+-#ifdef __3DS__
+-    if (bufferSize == 0 || bufferSize > n3ds_max_buf_size)
+-        bufferSize = n3ds_max_buf_size;
+-#endif
+     if (bufferSize != 0) {
+-        // We start at the requested recv buffer value and step down until we find
+-        // a value that the OS will accept.
+-        for (;;) {
++        // Try to set the requested buffer size, but if it fails, try to set a smaller one
++        while (bufferSize >= RCV_BUFFER_SIZE_MIN) {
+             err = setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, sizeof(bufferSize));
+-            if (err == 0) {
+-                // Successfully set a buffer size
++            if (err != SOCKET_ERROR) {
+                 break;
+             }
+-            else if (bufferSize <= RCV_BUFFER_SIZE_MIN) {
+-                // Failed to set a buffer size within the allowable range
+-                Limelog("Set rcv buffer size failed: %d\n", LastSocketError());
+-                break;
+-            }
+-            else if (bufferSize - RCV_BUFFER_SIZE_STEP <= RCV_BUFFER_SIZE_MIN) {
+-                // Last shot - we're trying the minimum
+-                bufferSize = RCV_BUFFER_SIZE_MIN;
+-            }
+-            else {
+-                // Lower the requested size by another step
+-                bufferSize -= RCV_BUFFER_SIZE_STEP;
+-            }
++            bufferSize -= RCV_BUFFER_SIZE_STEP;
+         }
++    }
+ 
+-#if defined(LC_DEBUG)
+-        if (err == 0) {
+-            Limelog("Selected receive buffer size: %d\n", bufferSize);
++#if defined(LC_WINDOWS)
++    if (socketQosType != SOCK_QOS_TYPE_BEST_EFFORT) {
++        // TODO: Implement QoS on Windows
++    }
++#elif defined(LC_POSIX) && !defined(__vita__) && !defined(__WIIU__) && !defined(__3DS__) && !defined(_PSP)
++    if (socketQosType != SOCK_QOS_TYPE_BEST_EFFORT) {
++        int tos;
++        if (socketQosType == SOCK_QOS_TYPE_AUDIO) {
++            tos = 0xC0; // CS6
+         }
+         else {
+-            Limelog("Unable to set receive buffer size: %d\n", LastSocketError());
+-        }
+-
+-        {
+-            SOCKADDR_LEN len = sizeof(bufferSize);
+-            if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, &len) == 0) {
+-                Limelog("Actual receive buffer size: %d\n", bufferSize);
+-            }
++            tos = 0x80; // CS4
+         }
+-#endif
++        setsockopt(s, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
+     }
++#endif
  
      return s;
-+#endif
  }
  
+-int setSocketNonBlocking(SOCKET s, bool enabled) {
+-#if defined(__vita__) || defined(__HAIKU__)
+-    int val = enabled ? 1 : 0;
+-    return setsockopt(s, SOL_SOCKET, SO_NONBLOCK, (char*)&val, sizeof(val));
+-#elif defined(O_NONBLOCK)
+-    return fcntl(s, F_SETFL, (enabled ? O_NONBLOCK : 0) | (fcntl(s, F_GETFL) & ~O_NONBLOCK));
+-#elif defined(FIONBIO)
+-#ifdef LC_WINDOWS
+-    u_long val = enabled ? 1 : 0;
+-#else
+-    int val = enabled ? 1 : 0;
+-#endif
+-    return ioctlsocket(s, FIONBIO, &val);
+-#else
+-#error Please define your platform non-blocking sockets API!
+-#endif
+-}
+-
+-SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking) {
+-    SOCKET s;
+-
+-    s = socket(addressFamily, socketType, protocol);
+-    if (s == INVALID_SOCKET) {
+-        Limelog("socket() failed: %d\n", (int)LastSocketError());
+-        return INVALID_SOCKET;
+-    }
+-
+-#ifdef LC_DARWIN
+-    {
+-        // Disable SIGPIPE on iOS
+-        int val = 1;
+-        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
++int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
++    if (useSelect) {
++        struct pollfd fd;
++        fd.fd = s;
++        fd.events = POLLIN;
++        fd.revents = 0;
++        if (pollSockets(&fd, 1, 0) <= 0) {
++            return 0;
++        }
+     }
+-#endif
+ 
+-    if (nonBlocking) {
+-        setSocketNonBlocking(s, true);
++    SOCK_RET ret = recv(s, buffer, size, 0);
++    if (ret == SOCKET_ERROR) {
++        int err = LastSocketError();
++        if (err == EWOULDBLOCK || err == EAGAIN) {
++            return 0;
++        }
++        return SOCKET_ERROR;
+     }
+ 
+-    return s;
++    return (int)ret;
+ }
+ 
+-SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
+-    SOCKET s;
+-    LC_SOCKADDR addr;
+-    struct pollfd pfd;
+-    int err;
+-    int val;
+-
+-    // Create a non-blocking TCP socket
+-    s = createSocket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP, true);
+-    if (s == INVALID_SOCKET) {
+-        return INVALID_SOCKET;
+-    }
+-
+-    // Some broken routers/firewalls (or routes with multiple broken routers) may result in TCP packets
+-    // being dropped without without us receiving an ICMP Fragmentation Needed packet. For example,
+-    // a router can elect to drop rather than fragment even without DF set. A misconfigured firewall
+-    // or router on the path back to us may block the ICMP Fragmentation Needed packet required for
+-    // PMTUD to work and thus we end up with a black hole route. Some OSes recover from this better
+-    // than others, but we can avoid the issue altogether by capping our MSS to the value mandated
+-    // by RFC 879 and RFC 2460.
+-    //
+-    // Note: This only changes the max packet size we can *receive* from the host PC.
+-    // We still must split our own sends into smaller chunks with TCP_NODELAY enabled to
+-    // avoid MTU issues on the way out to to the target.
++int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
+ #if defined(LC_WINDOWS)
+-    // Windows doesn't support setting TCP_MAXSEG but IP_PMTUDISC_DONT forces the MSS to the protocol
+-    // minimum which is what we want here. Linux doesn't do this (disabling PMTUD just avoids setting DF).
+-    if (dstaddr->ss_family == AF_INET) {
+-        val = IP_PMTUDISC_DONT;
+-        if (setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, (char*)&val, sizeof(val)) < 0) {
+-            Limelog("setsockopt(IP_MTU_DISCOVER, IP_PMTUDISC_DONT) failed: %d\n", val, (int)LastSocketError());
+-        }
+-    }
+-    else {
+-        val = IP_PMTUDISC_DONT;
+-        if (setsockopt(s, IPPROTO_IPV6, IPV6_MTU_DISCOVER, (char*)&val, sizeof(val)) < 0) {
+-            Limelog("setsockopt(IPV6_MTU_DISCOVER, IP_PMTUDISC_DONT) failed: %d\n", val, (int)LastSocketError());
+-        }
+-    }
+-#elif defined(TCP_NOOPT)
+-    // On BSD-based OSes (including macOS/iOS), TCP_NOOPT seems to be the only way to
+-    // restrict MSS to the minimum. It strips all options out of the SYN packet which
+-    // forces the remote party to fall back to the minimum MSS. TCP_MAXSEG doesn't seem
+-    // to work correctly for outbound connections on macOS/iOS.
+-    val = 1;
+-    if (setsockopt(s, IPPROTO_TCP, TCP_NOOPT, (char*)&val, sizeof(val)) < 0) {
+-        Limelog("setsockopt(TCP_NOOPT, %d) failed: %d\n", val, (int)LastSocketError());
+-    }
+-#elif defined(TCP_MAXSEG)
+-    val = dstaddr->ss_family == AF_INET ? TCPv4_MSS : TCPv6_MSS;
+-    if (setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, (char*)&val, sizeof(val)) < 0) {
+-        Limelog("setsockopt(TCP_MAXSEG, %d) failed: %d\n", val, (int)LastSocketError());
+-    }
++    DWORD timeout = (DWORD)timeoutMs;
++    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
++#else
++    struct timeval tv;
++    tv.tv_sec = timeoutMs / 1000;
++    tv.tv_usec = (timeoutMs % 1000) * 1000;
++    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+ #endif
++}
+ 
+-    // Start connection
+-    memcpy(&addr, dstaddr, addrlen);
+-    SET_PORT(&addr, port);
+-    err = connect(s, (struct sockaddr*) &addr, addrlen);
+-    if (err < 0) {
+-        err = (int)LastSocketError();
+-        if (err != EWOULDBLOCK && err != EAGAIN && err != EINPROGRESS) {
+-            goto Exit;
++#ifdef AF_INET6
++void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t stringLength) {
++    if (addr->ss_family == AF_INET6) {
++        string[0] = '[';
++        inet_ntop(AF_INET6, &((struct sockaddr_in6*)addr)->sin6_addr, &string[1], stringLength - 1);
++        size_t len = strlen(string);
++        if (len + 1 < stringLength) {
++            string[len] = ']';
++            string[len + 1] = '\0';
+         }
+     }
+-
+-    // Wait for the connection to complete or the timeout to elapse
+-    pfd.fd = s;
+-    pfd.events = POLLOUT;
+-    err = pollSockets(&pfd, 1, timeoutSec * 1000);
+-    if (err < 0) {
+-        // pollSockets() failed
+-        err = LastSocketError();
+-        Limelog("pollSockets() failed: %d\n", err);
+-        closeSocket(s);
+-        SetLastSocketError(err);
+-        return INVALID_SOCKET;
+-    }
+-    else if (err == 0) {
+-        // pollSockets() timed out
+-        Limelog("Connection timed out after %d seconds (TCP port %u)\n", timeoutSec, port);
+-        closeSocket(s);
+-        SetLastSocketError(ETIMEDOUT);
+-        return INVALID_SOCKET;
+-    }
+-#ifdef __3DS__ //SO_ERROR is unreliable on 3DS
+     else {
+-        char test_buffer[1];
+-        err = (int)recv(s, test_buffer, 1, MSG_PEEK);
+-        if (err < 0 &&
+-            (LastSocketError() == EWOULDBLOCK ||
+-            LastSocketError() == EAGAIN)) {
+-            err = 0;
+-        }
++        inet_ntop(AF_INET, &((struct sockaddr_in*)addr)->sin_addr, string, stringLength);
+     }
++}
+ #else
+-    else {
+-        // The socket was signalled
+-        SOCKADDR_LEN len = sizeof(err);
+-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+-        if (err != 0 || (pfd.revents & POLLERR)) {
+-            // Get the error code
+-            err = (err != 0) ? err : LastSocketFail();
+-        }
+-    }
+-#endif
+-
+-    // Disable non-blocking I/O now that the connection is established
+-    setSocketNonBlocking(s, false);
+-
+-Exit:
+-    if (err != 0) {
+-        Limelog("connect() failed: %d\n", err);
+-        closeSocket(s);
+-        SetLastSocketError(err);
+-        return INVALID_SOCKET;
+-    }
+-
+-    return s;
++void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t stringLength) {
++    inet_ntop(AF_INET, &((struct sockaddr_in*)addr)->sin_addr, string, stringLength);
+ }
++#endif
+ 
  int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKADDR_LEN targetAddrLen, unsigned short targetPort,
-@@ -583,6 +818,18 @@ int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKA
+                                 struct sockaddr_storage* localAddr, SOCKADDR_LEN* localAddrLen) {
+@@ -583,6 +377,18 @@ int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKA
      memcpy(&connAddr, targetAddr, targetAddrLen);
      SET_PORT(&connAddr, RtspPortNumber);
  
@@ -619,7 +1075,16 @@ index 41e7dd8..68b4e6b 100644
      if (connect(udpSocket, (struct sockaddr*)&connAddr, targetAddrLen) < 0) {
          int err = LastSocketError();
          Limelog("UDP connect() failed: %d\n", err);
-@@ -666,6 +913,31 @@ static bool isPrivateNetworkAddressV4(struct sockaddr_in* address, bool matchCGN
+@@ -611,7 +417,7 @@ int sendMtuSafe(SOCKET s, char* buffer, int size) {
+         int bytesToSend = size - bytesSent > TCPv4_MSS ?
+                           TCPv4_MSS : size - bytesSent;
+ 
+-        if (send(s, &buffer[bytesSent], bytesToSend, 0) < 0) {
++        if ((int)send(s, &buffer[bytesSent], bytesToSend, 0) < 0) {
+             return -1;
+         }
+ 
+@@ -666,6 +472,31 @@ static bool isPrivateNetworkAddressV4(struct sockaddr_in* address, bool matchCGN
      }
  }
  
@@ -651,7 +1116,7 @@ index 41e7dd8..68b4e6b 100644
  int resolveHostName(const char* host, int family, int tcpTestPort, struct sockaddr_storage* addr, SOCKADDR_LEN* addrLen)
  {
      struct addrinfo hints, *res, *currentAddr;
-@@ -744,6 +1016,7 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
+@@ -744,6 +575,7 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
          return -1;
      }
  }
@@ -659,7 +1124,7 @@ index 41e7dd8..68b4e6b 100644
  
  #ifdef AF_INET6
  bool isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLength) {
-@@ -1007,7 +1280,7 @@ int initializePlatformSockets(void) {
+@@ -1007,7 +839,7 @@ int initializePlatformSockets(void) {
  #if defined(LC_WINDOWS)
      WSADATA data;
      return WSAStartup(MAKEWORD(2, 0), &data);
@@ -669,10 +1134,10 @@ index 41e7dd8..68b4e6b 100644
  #elif defined(LC_POSIX) && !defined(LC_CHROME)
      // Disable SIGPIPE signals to avoid us getting
 diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
-index 1ab0ee9..26a6d4b 100644
+index 1ab0ee9..5bac757 100644
 --- a/src/PlatformSockets.h
 +++ b/src/PlatformSockets.h
-@@ -12,10 +12,63 @@
+@@ -12,10 +12,70 @@
  extern in_port_t n3ds_udp_port;
  #endif
  
@@ -686,6 +1151,8 @@ index 1ab0ee9..26a6d4b 100644
 +#include <pspnet_resolver.h>
 +#include <pspnet_apctl.h>
 +#include <psputility_netparam.h>
++#include <pspthreadman.h>
++#include <psprtc.h>
 +#ifdef AF_INET6
 +#undef AF_INET6
 +#endif
@@ -718,6 +1185,8 @@ index 1ab0ee9..26a6d4b 100644
 +#define POLLERR 0x0008
 +#define POLLHUP 0x0010
 +#define POLLNVAL 0x0020
++#define POLLRDNORM POLLIN
++#define POLLWRNORM POLLOUT
 +
 +#define select sceNetInetSelect
 +#define getsockopt sceNetInetGetsockopt
@@ -734,10 +1203,13 @@ index 1ab0ee9..26a6d4b 100644
 +#define sendto sceNetInetSendto
 +#define recv sceNetInetRecv
 +#define recvfrom sceNetInetRecvfrom
++
++extern uint16_t AudioLocalPort;
++extern uint16_t VideoLocalPort;
  #endif
  
  #ifdef _WIN32
-@@ -68,11 +121,18 @@ typedef int SOCKADDR_LEN;
+@@ -68,11 +128,18 @@ typedef int SOCKADDR_LEN;
  #include <netdb.h>
  #include <errno.h>
  #include <signal.h>
@@ -756,7 +1228,7 @@ index 1ab0ee9..26a6d4b 100644
  #define INVALID_SOCKET -1
  #define SOCKET_ERROR -1
  
-@@ -81,6 +141,14 @@ typedef ssize_t SOCK_RET;
+@@ -81,6 +148,14 @@ typedef ssize_t SOCK_RET;
  typedef socklen_t SOCKADDR_LEN;
  #endif
  
@@ -771,11 +1243,36 @@ index 1ab0ee9..26a6d4b 100644
  #ifdef AF_INET6
  typedef struct sockaddr_in6 LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
-@@ -90,6 +158,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
+@@ -88,7 +163,8 @@ typedef struct sockaddr_in6 LC_SOCKADDR;
+ #else
+ typedef struct sockaddr_in LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
- #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
- #endif
+-#define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
++#define SET_PORT(addr, port) ((addr)->sin6_port = htons(port))
 +#endif
+ #endif
  
  #define LastSocketFail() ((LastSocketError() != 0) ? LastSocketError() : -1)
+diff --git a/src/RtspConnection.c b/src/RtspConnection.c
+index 52ce2b1..3b67e0c 100644
+--- a/src/RtspConnection.c
++++ b/src/RtspConnection.c
+@@ -1116,15 +1116,15 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
+         }
  
+         // Look for the Sunshine feature flags in the SDP attributes
+-        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {
++        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", (unsigned int*)&SunshineFeatureFlags)) {
+             SunshineFeatureFlags = 0;
+         }
+ 
+         // Look for the Sunshine encryption flags in the SDP attributes
+-        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
++        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", (unsigned int*)&EncryptionFeaturesSupported)) {
+             EncryptionFeaturesSupported = 0;
+         }
+-        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionRequested", &EncryptionFeaturesRequested)) {
++        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionRequested", (unsigned int*)&EncryptionFeaturesRequested)) {
+             EncryptionFeaturesRequested = 0;
+         }
+         EncryptionFeaturesEnabled = 0;
