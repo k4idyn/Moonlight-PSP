@@ -90,6 +90,9 @@ make install
 echo "Building mbedTLS..."
 find_or_clone "mbedtls-3.6.2" "https://github.com/Mbed-TLS/mbedtls.git" "mbedtls-3.6.2"
 git submodule update --init --recursive
+# Jules: Disable platform entropy sources as PSP is not a supported platform for auto-detection
+sed -i 's/\/\/#define MBEDTLS_NO_PLATFORM_ENTROPY/#define MBEDTLS_NO_PLATFORM_ENTROPY/' include/mbedtls/mbedtls_config.h
+sed -i 's/\/\/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/' include/mbedtls/mbedtls_config.h
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" \
     -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
