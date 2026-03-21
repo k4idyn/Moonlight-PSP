@@ -93,7 +93,7 @@ git submodule update --init --recursive
 # Jules: Disable platform entropy and timing as they are not supported on PSP
 sed -i 's/\/\/#define MBEDTLS_NO_PLATFORM_ENTROPY/#define MBEDTLS_NO_PLATFORM_ENTROPY/' include/mbedtls/mbedtls_config.h
 sed -i 's/\/\/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/#define MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES/' include/mbedtls/mbedtls_config.h
-printf "\n#undef MBEDTLS_TIMING_C\n" >> include/mbedtls/mbedtls_config.h
+printf "\n#undef MBEDTLS_TIMING_C\n#undef MBEDTLS_NET_C\n" >> include/mbedtls/mbedtls_config.h
 # Jules: Enable platform millisecond time alternative and provide implementation
 sed -i 's/\/\/#define MBEDTLS_PLATFORM_MS_TIME_ALT/#define MBEDTLS_PLATFORM_MS_TIME_ALT/' include/mbedtls/mbedtls_config.h
 printf "\n#if defined(__psp__)\n#include <pspthreadman.h>\nmbedtls_ms_time_t mbedtls_ms_time(void)\n{\n    return (mbedtls_ms_time_t)(sceKernelGetSystemTimeWide() / 1000);\n}\n#endif\n" >> library/platform_util.c
