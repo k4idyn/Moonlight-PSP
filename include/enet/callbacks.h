@@ -2,8 +2,8 @@
  @file  callbacks.h
  @brief ENet callbacks
 */
-#ifndef __ENET_CALLBACKS_H__
-#define __ENET_CALLBACKS_H__
+#ifndef MOONLIGHT_ENET_CALLBACKS_H
+#define MOONLIGHT_ENET_CALLBACKS_H
 
 #include <stdlib.h>
 
@@ -23,5 +23,5 @@ extern void   enet_free (void *);
 
 /** @} */
 
-#endif /* __ENET_CALLBACKS_H__ */
+#endif /* MOONLIGHT_ENET_CALLBACKS_H */
 

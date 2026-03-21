@@ -1,5 +1,5 @@
-#ifndef __PSPUSBDEVICE_H__
-#define __PSPUSBDEVICE_H__
+#ifndef MOONLIGHT_PSPUSBDEVICE_H
+#define MOONLIGHT_PSPUSBDEVICE_H
 
 /**
  * This functions require flash0:/kd/_usbdevice.prx to be loaded/started first.

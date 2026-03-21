@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _SYSTEMCTRL_H_
-#define _SYSTEMCTRL_H_
+#ifndef MOONLIGHT_SYSTEMCTRL_H
+#define MOONLIGHT_SYSTEMCTRL_H
 
 #ifdef __cplusplus
 extern "C"{

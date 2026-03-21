@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _REBOOTCONFIG_H_
-#define _REBOOTCONFIG_H_
+#ifndef MOONLIGHT_REBOOTCONFIG_H
+#define MOONLIGHT_REBOOTCONFIG_H
 
 #include <pspsdk.h>
 #include <macros.h>

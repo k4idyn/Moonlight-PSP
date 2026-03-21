@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _MODULE2_H_
-#define _MODULE2_H_
+#ifndef MOONLIGHT_MODULE2_H
+#define MOONLIGHT_MODULE2_H
 
 // Taken from M33 SDK
 #ifndef SceModule2_DEFINED

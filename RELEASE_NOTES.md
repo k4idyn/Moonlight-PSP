@@ -1,15 +1,22 @@
-# Release Notes v0.1.0.2-alpha
+# Release Notes v0.1.0.3-alpha (Cleanup)
 
 ## Overview
-This alpha release identifies and resolves the primary driver of the `0x80020320` (too many open files) error during the pairing and certificate loading process. 
+This release focuses on architectural cleanup, toolchain stabilization, and ABI safety. It resolves critical build environment issues that prevented consistent compilation on standard PSP toolchains.
 
 ## Technical Findings
-1. **Socket Descriptor Leak**: The `libgamestream` HTTP implementation used standard POSIX `close()` for sockets. On the PSP, network sockets are managed by the `pspnet_inet` stack and require `closeSocket()` (mapped to `sceNetInetClose`) to be properly released to the system pool.
-2. **FAT Driver Asynchronicity**: The PSP's Memory Stick driver (FAT/sceIo) handles file closures asynchronously. High-frequency logging (opening/writing/closing 50+ times per second) during the pairing handshake overwhelmed the system, leaking effective handles until the system reached the hard kernel limit.
+1. **Toolchain Incompatibility**: The original PSP SDK paths contained characters (like `$`) that caused recursive `make` failures and character encoding errors in PowerShell/CMD environments.
+2. **Include Guard Collision**: Multiple headers used reserved leading underscores (e.g., `_mxml_h_`) or inconsistent naming patterns, potentially leading to collision or IDE indexing issues.
+3. **ABI Fragility**: The XML parsing layer relied on direct access to internal `mxml_node_s` fields, which is incompatible with updated Mini-XML versions and violates typical library encapsulation.
 
 ## Fixes
-- **MFILE Protection**: Rewrote `logger.c` to use a global persistent file handle initialized at boot. This bypasses the asynchronous close queue and significantly improves I/O performance.
-- **Socket Integrity**: Patched `http.c` and associated TLS cleanup macros to use `closeSocket()`.
+- **Toolchain Normalization**: Flattened and renamed the PSP SDK root to `C:\bin_root\psp_sdk_root`. Created a `build_psp.bat` automated wrapper that handles environment variables and provides a `psp-gcc.exe` alias for versioned compilers.
+- **Header Guard Standardization**: Applied the `MOONLIGHT_*_H` convention to all project headers, including `mxml.h`, `enet.h`, and the `ark4` subsystem.
+- **MXML Compatibility Layer**: Implemented Mini-XML 3.x accessor macros in `xml.c` to allow the codebase to function with both legacy (v2.x) and modern (v3.x+) libraries.
+- **Link Order Optimization**: Reorganized the `LIBS` sequence in the `Makefile` to satisfy `psp-fixup-imports` requirements, ensuring SDK libraries are linked in the correct order relative to user dependencies.
+
+## Verification
+- **Pairing Consistency**: Verified that the new build successfully initializes the network stack and generates a pairing PIN (e.g., PIN 3967), maintaining functional parity with v0.1.0.2.
+- **Build Reproducibility**: Successfully generated a standard `EBOOT.PBP` (1,794,994 bytes) using the new automated build pipeline.
 
 ## Known Issues
-- **0x80 (ENOTCONN)**: Connection to the host's control stream ends prematurely with error code 128 (ENOTCONN). This is currently being investigated as a possible ENet protocol handshake failure or Sunshine server-side rejection.
+- **0x80 (ENOTCONN)**: Investigation continues into the ENet control stream disconnect error.

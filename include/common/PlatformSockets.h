@@ -26,7 +26,6 @@ extern in_port_t n3ds_udp_port;
 #ifdef AF_INET6
 #undef AF_INET6
 #endif
-#include <poll.h>
 #define ioctl sceNetInetIoctl
 
 // Explicitly declare sceNetInetIoctl if it's missing from headers
@@ -161,7 +160,9 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
+#if !defined(_PSP)
 #include <poll.h>
+#endif
 
 #define ioctlsocket ioctl
 #ifdef _PSP

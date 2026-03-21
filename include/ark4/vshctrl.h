@@ -1,5 +1,5 @@
-#ifndef __VSHCTRL_H__
-#define __VSHCTRL_H__
+#ifndef MOONLIGHT_VSHCTRL_H
+#define MOONLIGHT_VSHCTRL_H
 
 /**
  * This api is for vsh menu, xmb control or any other vsh/xmb plugin.

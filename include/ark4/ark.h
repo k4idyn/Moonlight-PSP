@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _ARK_H_
-#define _ARK_H_
+#ifndef MOONLIGHT_ARK_H
+#define MOONLIGHT_ARK_H
 
 #include <pspsdk.h>
 

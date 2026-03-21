@@ -2,8 +2,8 @@
  @file  enet.h
  @brief ENet public header file
 */
-#ifndef __ENET_ENET_H__
-#define __ENET_ENET_H__
+#ifndef MOONLIGHT_ENET_H
+#define MOONLIGHT_ENET_H
 
 #ifdef __cplusplus
 extern "C"
@@ -585,5 +585,5 @@ extern size_t enet_protocol_command_size (enet_uint8);
 }
 #endif
 
-#endif /* __ENET_ENET_H__ */
+#endif /* MOONLIGHT_ENET_H */
 

@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _GAME_FUNCTIONS_H_
-#define _GAME_FUNCTIONS_H_
+#ifndef MOONLIGHT_GAME_FUNCTIONS_H
+#define MOONLIGHT_GAME_FUNCTIONS_H
 
 #include <sdk.h>
 #include <psploadexec_kernel.h>

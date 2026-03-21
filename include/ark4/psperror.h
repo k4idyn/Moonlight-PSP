@@ -1,5 +1,5 @@
-#ifndef __PSPERROR_H__
-#define __PSPERROR_H__
+#ifndef MOONLIGHT_PSPERROR_H
+#define MOONLIGHT_PSPERROR_H
 
 #define SCE_ERROR_ERRNO_ENOENT            0x80010002
 #define SCE_ERROR_ERRNO_EIO            	0x80010005

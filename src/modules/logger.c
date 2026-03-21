@@ -2,7 +2,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-#include <pspkernel.h>
+#include <psptypes.h>
+#include <pspthreadman.h>
 #include <pspiofilemgr.h>
 #include <pspdebug.h>
 
@@ -10,6 +11,9 @@ static SceUID logMutex = -1;
 static int logInitialized = 0;
 static FILE* g_logFile = NULL;
 
+/**
+ * Helper function to convert LogComponent enum to a string.
+ */
 const char* LogComponentToString(LogComponent comp) {
     switch (comp) {
         case COMPONENT_MAIN:      return "MAIN";
@@ -21,27 +25,25 @@ const char* LogComponentToString(LogComponent comp) {
     }
 }
 
+/**
+ * Initializes the logging subsystem.
+ */
 void logger_init() {
     if (!logInitialized) {
         logMutex = sceKernelCreateSema("MoonlightLogMutex", 0, 1, 1, NULL);
         
-<<<<<<< HEAD
-        FILE* f = fopen("moonlight_debug.log", "w");
-        if (f) {
-            fprintf(f, "--- Moonlight Log Started ---\n");
-            fclose(f);
-        }
-=======
         g_logFile = fopen("moonlight_debug.log", "w");
         if (g_logFile) {
             fprintf(g_logFile, "--- Moonlight Log Started ---\n");
             fflush(g_logFile);
         }
         logInitialized = 1;
->>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
     }
 }
 
+/**
+ * Shuts down the logging subsystem.
+ */
 void logger_shutdown() {
     if (logInitialized) {
         if (logMutex >= 0) {
@@ -57,6 +59,9 @@ void logger_shutdown() {
     }
 }
 
+/**
+ * Main logging function with thread safety and file output.
+ */
 void moonlight_log(const char* level, const char* component_str, const char* format, ...) {
     va_list args;
     char buffer[4096];
@@ -88,17 +93,9 @@ void moonlight_log(const char* level, const char* component_str, const char* for
 
     // File I/O (must be protected by mutex)
     if (locked) {
-<<<<<<< HEAD
-        FILE* f = fopen("moonlight_debug.log", "a");
-        if (f) {
-            fprintf(f, "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
-            fflush(f);
-            fclose(f);
-=======
         if (g_logFile) {
             fprintf(g_logFile, "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
             fflush(g_logFile);
->>>>>>> 07d781f (v0.1.0.2-alpha: Fix socket and file handle leaks (0x80020320))
         }
     }
 

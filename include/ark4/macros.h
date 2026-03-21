@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _MACROS_H_
-#define _MACROS_H_
+#ifndef MOONLIGHT_MACROS_H
+#define MOONLIGHT_MACROS_H
 
 // Kernelify Address
 #define KERNELIFY(f) (0x80000000 | ((unsigned int)(f)))

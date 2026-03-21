@@ -34,6 +34,9 @@ typedef struct tagTHREADNAME_INFO
 
 typedef HRESULT (WINAPI *SetThreadDescription_t)(HANDLE, PCWSTR);
 
+/**
+ * Sets the thread name on Windows.
+ */
 void setThreadNameWin32(const char* name) {
     SetThreadDescription_t setThreadDescriptionFunc;
 
@@ -66,6 +69,9 @@ void setThreadNameWin32(const char* name) {
 #endif
 }
 
+/**
+ * Generic thread entry point wrapper that handles platform-specific startup.
+ */
 DWORD WINAPI ThreadProc(LPVOID lpParameter) {
     struct thread_context* ctx = (struct thread_context*)lpParameter;
 #elif defined(__WIIU__)
@@ -99,6 +105,9 @@ void* ThreadProc(void* context) {
 #endif
 }
 
+/**
+ * Sleeps for the specified number of milliseconds.
+ */
 void PltSleepMs(int ms) {
 #if defined(LC_WINDOWS)
     SleepEx(ms, FALSE);
@@ -113,6 +122,9 @@ void PltSleepMs(int ms) {
 #endif
 }
 
+/**
+ * Sleeps for the specified number of milliseconds unless the thread is interrupted.
+ */
 void PltSleepMsInterruptible(PLT_THREAD* thread, int ms) {
     while (ms > 0 && !PltIsThreadInterrupted(thread)) {
         int msToSleep = ms < INTERRUPT_PERIOD_MS ? ms : INTERRUPT_PERIOD_MS;
@@ -121,6 +133,9 @@ void PltSleepMsInterruptible(PLT_THREAD* thread, int ms) {
     }
 }
 
+/**
+ * Creates a platform-specific mutex.
+ */
 int PltCreateMutex(PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     InitializeSRWLock(mutex);
@@ -143,6 +158,9 @@ int PltCreateMutex(PLT_MUTEX* mutex) {
     return 0;
 }
 
+/**
+ * Deletes a platform-specific mutex.
+ */
 void PltDeleteMutex(PLT_MUTEX* mutex) {
     LC_ASSERT(activeMutexes > 0);
     activeMutexes--;
@@ -157,6 +175,9 @@ void PltDeleteMutex(PLT_MUTEX* mutex) {
 #endif
 }
 
+/**
+ * Locks a platform-specific mutex.
+ */
 void PltLockMutex(PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     AcquireSRWLockExclusive(mutex);
@@ -171,6 +192,9 @@ void PltLockMutex(PLT_MUTEX* mutex) {
 #endif
 }
 
+/**
+ * Unlocks a platform-specific mutex.
+ */
 void PltUnlockMutex(PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     ReleaseSRWLockExclusive(mutex);

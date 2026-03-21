@@ -1,5 +1,5 @@
-#ifndef __SCTRLLIBRARY_SE_H__
-#define __SCTRLLIBRARY_SE_H__
+#ifndef MOONLIGHT_SCTRLLIBRARY_SE_H
+#define MOONLIGHT_SCTRLLIBRARY_SE_H
 
 #include <psptypes.h>
 

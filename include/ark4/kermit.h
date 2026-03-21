@@ -1,5 +1,5 @@
-#ifndef __KERMIT_H__
-#define __KERMIT_H__
+#ifndef MOONLIGHT_KERMIT_H
+#define MOONLIGHT_KERMIT_H
 
 typedef struct KermitPacket_
 {

@@ -15,8 +15,8 @@
  * along with PRO CFW. If not, see <http://www.gnu.org/licenses/ .
  */
 
-#ifndef _ANSI_C_STRHEX32_H_
-#define _ANSI_C_STRHEX32_H_
+#ifndef MOONLIGHT_ANSI_C_STRHEX32_H
+#define MOONLIGHT_ANSI_C_STRHEX32_H
 
 /*
  * The ANSI-C Headers are ment for a ONE-TIME-INCLUSION into a lowlevel

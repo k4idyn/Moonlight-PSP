@@ -46,7 +46,6 @@
 #include <fcntl.h>
 #elif defined(_PSP)
 #include <unistd.h>
-#include <pthread.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <malloc.h>
@@ -178,13 +177,40 @@ extern char *strtok_r(char *, const char *, char **);
 #define IS_LITTLE_ENDIAN() (true)
 #endif
 
+/**
+ * @brief Initializes the platform abstraction layer.
+ * @return 0 on success, negative error code on failure.
+ */
 int initializePlatform(void);
+
+/**
+ * @brief Cleans up the platform abstraction layer and releases resources.
+ */
 void cleanupPlatform(void);
+
+/**
+ * @brief Safely copies a string with buffer overflow protection.
+ * @param dest Destination buffer.
+ * @param dest_size Size of the destination buffer.
+ * @param src Source string to copy.
+ * @return true on success, false if truncation occurred or parameters was invalid.
+ */
 bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src);
 
+/**
+ * @brief Initializes the platform-specific high-resolution timer.
+ */
 void PltTicksInit(void);
 
+/**
+ * @brief Gets the number of microseconds since an arbitrary start time.
+ * @return Microseconds.
+ */
 uint64_t PltGetMicroseconds(void);
 
+/**
+ * @brief Gets the number of milliseconds since an arbitrary start time.
+ * @return Milliseconds.
+ */
 uint64_t PltGetMillis(void);
 

@@ -2,8 +2,8 @@
  @file  time.h
  @brief ENet time constants and macros
 */
-#ifndef __ENET_TIME_H__
-#define __ENET_TIME_H__
+#ifndef MOONLIGHT_ENET_TIME_H
+#define MOONLIGHT_ENET_TIME_H
 
 #define ENET_TIME_OVERFLOW 86400000
 
@@ -14,5 +14,5 @@
 
 #define ENET_TIME_DIFFERENCE(a, b) ((a) - (b) >= ENET_TIME_OVERFLOW ? (b) - (a) : (a) - (b))
 
-#endif /* __ENET_TIME_H__ */
+#endif /* MOONLIGHT_ENET_TIME_H */
 
