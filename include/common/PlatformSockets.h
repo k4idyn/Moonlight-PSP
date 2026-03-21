@@ -26,7 +26,7 @@ extern in_port_t n3ds_udp_port;
 #ifdef AF_INET6
 #undef AF_INET6
 #endif
-#include <poll.h>
+
 #define ioctl sceNetInetIoctl
 
 // Explicitly declare sceNetInetIoctl if it's missing from headers
@@ -36,7 +36,7 @@ extern int sceNetInetIoctl(int s, unsigned long cmd, void *arg);
 #define FIONBIO 0x8004667e
 #endif
 
-#ifndef _SOCKADDR_STORAGE
+#if 0
 #define _SOCKADDR_STORAGE
 #ifndef HAS_SOCKADDR_STORAGE
 struct sockaddr_storage {
@@ -161,7 +161,7 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
-#include <poll.h>
+
 
 #define ioctlsocket ioctl
 #ifdef _PSP

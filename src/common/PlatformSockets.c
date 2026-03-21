@@ -169,8 +169,8 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         }
 
         // Adjust timeout for this iteration
-        struct timeval iter_tv;
-        struct timeval* p_tv = NULL;
+        struct SceNetInetTimeval iter_tv;
+        struct SceNetInetTimeval* p_tv = NULL;
         if (timeoutMs >= 0) {
             uint64_t now = sceKernelGetSystemTimeWide();
             uint64_t elapsed_us = now - start_time;

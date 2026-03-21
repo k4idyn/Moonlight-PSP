@@ -45,7 +45,7 @@ ASFLAGS = $(CFLAGS)
 
 LIBDIR = lib
 LDFLAGS = 
-LIBS = -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread-psp -lmxml -lz -lm -lpspvfpu
+LIBS = -lenet -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lopus -lpthread -lmxml -lz -lm -lpspvfpu
 LIBS += -lpspaudio -lpspmpeg -lpspgum -lpspgu -lpsprtc -lpspwlan -lpsppower -lpspdebug -lpspdisplay -lpspge -lpspctrl -lc -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver -lpsputility -lpspsdk -lpspuser
 
 BUILD_PRX = 1

@@ -722,4 +722,4 @@ int main(int argc, char *argv[]) {
   logger_shutdown();
   sceKernelExitGame();
   return 0;
-}
+}const unsigned char* __ctype_ptr__ = NULL;

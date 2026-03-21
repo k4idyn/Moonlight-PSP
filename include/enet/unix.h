@@ -14,7 +14,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
-#if defined(_PSP) || defined(__psp__)
+#if 0
 #ifndef _SOCKADDR_STORAGE
 #define _SOCKADDR_STORAGE
 struct sockaddr_storage {
