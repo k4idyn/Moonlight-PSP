@@ -14,12 +14,6 @@
 
 **Release Highlight**: **Architectural Cleanup & CodeRabbit Response**. This release focuses on project-wide header guard standardization, Mini-XML 3.x API compatibility for improved ABI safety, and build toolchain stabilization.
 
-**⚠️ CURRENT KNOWN PERSISTENT ERROR ⚠️**
-The client is currently experiencing a connection error during the GameStream initialization sequence:
-`Status: FAILED: control stream establishment (0x00000074)`
-
-This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We have verified functional parity with previous builds via emulator verification and are investigating the ENet handshake failure.
-
 ---
 
 ## Repository Structure
@@ -32,22 +26,17 @@ moonlight-psp-core/
 ├── docs/            # Architectural documentation and research
 ├── include/         # Unified headers (mbedTLS, ENet, Opus, MXML, etc.)
 ├── lib/             # Pre-compiled static libraries for PSP MIPS
-├── scripts/         # Verification and testing automation
 ├── src/             # Source files for network, video, audio, and controls
 └── Makefile         # Primary configuration for the PSPSDK build environment
 ```
 
-## Build Instructions (Windows)
+## Build Instructions
 
-We provide an automated build script for Windows environments:
+Compile using the standard PSPSDK toolchain:
 
-```batch
-.\build_psp.bat
-```
-
-To verify the build in PPSSPP:
-```powershell
-.\verify_build.ps1
+```bash
+make clean
+make
 ```
 
 ## Licensing Information

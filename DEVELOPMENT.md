@@ -11,23 +11,23 @@ This repository contains the structured monorepo for the `moonlight-psp-core` pr
 
 ## Environment Setup
 
-### 1. Developer Environment (Ubuntu Linux / Standard VM)
-For developers to operate, a MIPS toolchain (PSPSDK) and several compiled dependencies are required.
+### 1. Developer Environment
+For developers to operate, a standard MIPS toolchain (PSPSDK) and several compiled dependencies alongside `make` are required.
 
-- **Automated Setup**: Run the included `setup_linux.sh` script in the `moonlight-psp-core/` directory. This script:
-  - Installs system dependencies (`build-essential`, `cmake`, etc.).
-  - Downloads and installs the MIPS toolchain to `/usr/local/pspdev`.
-  - **Note**: This repository includes all necessary pre-compiled dependencies (`lib/`) and headers (`include/`) out-of-the-box. No additional builds are required for core development.
-- **Environment Variables**:
+- **Note**: This repository includes all necessary pre-compiled dependencies (`lib/`) and headers (`include/`) out-of-the-box. No additional dependency configuration is required for core development.
+
+- **Environment Setup**: Ensure your PSPSDK is initialized in your PATH. The `Makefile` relies on `psp-config --pspsdk-path` to dynamically link the SDK.
   ```bash
-  export PSPDEV=/usr/local/pspdev
-  export PATH=$PATH:$PSPDEV/bin
+  export PATH=$PATH:/path/to/pspsdk/bin
   ```
 
-### 2. Manual Host Setup (Windows)
-The host PC uses a local PSPSDK installation. Use the provided batch scripts for building:
-- `build_psp.bat`: Main application build.
-- `build_common.bat`: Common-C library build (if necessary).
+### 2. Building
+Since the project relies solely on standard PSPSDK functionality, building is executed generically on any host environment (Linux/Windows/macOS):
+
+```bash
+make clean
+make
+```
 
 ---
 

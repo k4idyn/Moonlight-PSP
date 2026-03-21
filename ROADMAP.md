@@ -7,10 +7,8 @@ This document outlines the development phases, current status, and future goals 
 - **Major Achievement**: Unified build system with automated dependency management (Ubuntu/VM).
 - **Core Engine**: Moonlight-common-c protocol logic synchronized for MIPS.
 - **Hardware Integration**: AVC hardware decoding partially mapped.
-- **Persistent Bug**: ENet control stream timeout (Error 0x74 / ETIMEDOUT).
 
 ## Phase 1: Stability (In Progress)
-- [ ] Fix ENet `ETIMEDOUT` / Error 116 on PSP socket layer.
 - [ ] Stabilize RTSP handshake across both real hardware and PPSSPP.
 - [ ] Verify A/V sync over a steady 3-minute stream session.
 
