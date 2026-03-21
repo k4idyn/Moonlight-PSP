@@ -38,11 +38,13 @@ extern int sceNetInetIoctl(int s, unsigned long cmd, void *arg);
 #ifndef _SOCKADDR_STORAGE
 #define _SOCKADDR_STORAGE
 #ifndef HAS_SOCKADDR_STORAGE
+#if !defined(_SYS_SOCKET_H_) && !defined(_PSP_SDK_SYS_SOCKET_H) && !defined(_SYS_SOCKET_H)
 struct sockaddr_storage {
     unsigned char ss_len;
     unsigned char ss_family;
     char __ss_padding[128 - 2];
 };
+#endif
 #endif
 #endif
 

@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
 #include <pspiofilemgr_fcntl.h>
@@ -826,7 +827,7 @@ static int init_psp_networking(void) {
             netData data;
             if (sceUtilityGetNetParam(i, PSP_NETPARAM_SSID, &data) == 0) {
                 profiles[num_profiles].index = i;
-                strncpy(profiles[num_profiles].ssid, data.asString, 127);
+                strncpy(profiles[num_profiles].ssid, (char*)data.asString, 126); profiles[num_profiles].ssid[127] = 0;
                 profiles[num_profiles].ssid[127] = '\0';
                 num_profiles++;
             }
@@ -956,7 +957,7 @@ static int init_psp_networking(void) {
         const uint64_t TIMEOUT = 15ULL * 1000000ULL; /* 15s per attempt */
         int last_state = -1;
         int max_state = -1;
-        int timed_out = 0;
+        int timed_out = 0; (void)timed_out;
         while (1) {
           err = sceNetApctlGetState(&state);
           if (err != 0 && err != (int)0x8002013A) {

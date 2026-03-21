@@ -1922,7 +1922,8 @@ int startControlStream(void) {
 #elif defined(_PSP)
         // PSP-1000: Use a longer timeout (30s) and more conservative backoff (4x RTT max).
         // The PSP network stack is slower to ACK and more sensitive to timeout conditions.
-        enet_peer_timeout(peer, 4, 30000, 30000);
+        // SHIM: Drastically increasing timeout to diagnose if it is a transient handshake issue.
+        enet_peer_timeout(peer, 8, 60000, 60000);
 #else
         // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
         enet_peer_timeout(peer, 2, 10000, 10000);

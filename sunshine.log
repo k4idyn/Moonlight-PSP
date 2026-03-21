@@ -1,0 +1,82 @@
+[2026-03-21 21:46:33.694540] [0x00007f2b4ecfe000] [info]    config: 'capture_screen' = 0
+[2026-03-21 21:46:33.694642] [0x00007f2b4ecfe000] [info]    config: 'x264_preset' = ultrafast
+[2026-03-21 21:46:33.694647] [0x00007f2b4ecfe000] [info]    config: 'bitrate' = 1000
+[2026-03-21 21:46:33.694651] [0x00007f2b4ecfe000] [info]    config: 'min_threads' = 2
+[2026-03-21 21:46:33.694654] [0x00007f2b4ecfe000] [info]    config: 'fec_percentage' = 20
+[2026-03-21 21:46:33.694657] [0x00007f2b4ecfe000] [info]    config: 'max_threads' = 4
+[2026-03-21 21:46:33.694661] [0x00007f2b4ecfe000] [info]    config: 'encoder' = software
+Warning: Unrecognized configurable option [capture_screen]
+Warning: Unrecognized configurable option [x264_preset]
+Warning: Unrecognized configurable option [bitrate]
+Warning: Unrecognized configurable option [max_threads]
+[2026-03-21 21:46:33.694]: Info: Sunshine version: 2025.924.154138 commit: 86188d47a7463b0f73b35de18a628353adeaa20e
+[2026-03-21 21:46:33.695]: Info: Package Publisher: LizardByte
+[2026-03-21 21:46:33.695]: Info: Publisher Website: https://app.lizardbyte.dev
+[2026-03-21 21:46:33.695]: Info: Get support: https://app.lizardbyte.dev/support
+[2026-03-21 21:46:33.695]: Info: config: 'encoder' = software
+[2026-03-21 21:46:33.695]: Info: config: 'max_threads' = 4
+[2026-03-21 21:46:33.695]: Info: config: 'fec_percentage' = 20
+[2026-03-21 21:46:33.695]: Info: config: 'min_threads' = 2
+[2026-03-21 21:46:33.695]: Info: config: 'bitrate' = 1000
+[2026-03-21 21:46:33.695]: Info: config: 'x264_preset' = ultrafast
+[2026-03-21 21:46:33.695]: Info: config: 'capture_screen' = 0
+Cannot load libcuda.so.1
+[2026-03-21 21:46:33.697]: Error: Couldn't load cuda: -1
+[2026-03-21 21:46:33.697]: Warning: Couldn't find /dev/dri, kmsgrab won't be enabled
+[2026-03-21 21:46:33.697]: Info: Detecting displays
+[2026-03-21 21:46:33.698]: Info: Detected display: screen (id: 0)screen connected: true
+[2026-03-21 21:46:33.741]: Warning: Unable to create virtual mouse: No such file or directory
+[2026-03-21 21:46:33.741]: Warning: Unable to create virtual keyboard: No such file or directory
+[2026-03-21 21:46:33.741]: Warning: Gamepad xone is disabled due to No such file or directory
+[2026-03-21 21:46:33.741]: Warning: Gamepad ds5 is disabled due to No such file or directory
+[2026-03-21 21:46:33.741]: Warning: Gamepad switch is disabled due to No such file or directory
+[2026-03-21 21:46:33.741]: Warning: No gamepad input is available
+[2026-03-21 21:46:33.741]: Info: Trying encoder [software]
+[2026-03-21 21:46:33.741]: Info: Screencasting with X11
+[2026-03-21 21:46:33.743]: Info: Creating encoder [libx264]
+[2026-03-21 21:46:33.743]: Info: Color coding: SDR (Rec. 601)
+[2026-03-21 21:46:33.743]: Info: Color depth: 8-bit
+[2026-03-21 21:46:33.743]: Info: Color range: JPEG
+[2026-03-21 21:46:33.744]: Info: Streaming bitrate is 1000000
+[2026-03-21 21:46:33.745]: Info: [libx264 @ 0x5630eddd7bc0] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+[2026-03-21 21:46:33.747]: Info: [libx264 @ 0x5630eddd7bc0] profile High, level 4.2, 4:2:0, 8-bit
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] frame I:1     Avg QP:31.00  size:  1203
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] mb I  I16..4: 99.9%  0.0%  0.0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] 8x8 transform intra:0.0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] coded y,uvDC,uvAC intra: 0.0% 0.0% 0.0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] i16 v,h,dc,p: 97%  0%  3%  0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu:  0%  0% 75% 12%  0%  0%  0%  0% 12%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu:  0%  0% 100%  0%  0%  0%  0%  0%  0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] i8c dc,h,v,p: 100%  0%  0%  0%
+[2026-03-21 21:46:33.772]: Info: [libx264 @ 0x5630eddd7bc0] kb/s:577.44
+[2026-03-21 21:46:33.773]: Info: Creating encoder [libx264]
+[2026-03-21 21:46:33.773]: Info: Color coding: SDR (Rec. 601)
+[2026-03-21 21:46:33.773]: Info: Color depth: 8-bit
+[2026-03-21 21:46:33.773]: Info: Color range: JPEG
+[2026-03-21 21:46:33.773]: Info: Streaming bitrate is 1000000
+[2026-03-21 21:46:33.774]: Info: [libx264 @ 0x5630eddd7bc0] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+[2026-03-21 21:46:33.775]: Info: [libx264 @ 0x5630eddd7bc0] profile High 4:4:4 Predictive, level 4.2, 4:4:4, 8-bit
+[2026-03-21 21:46:33.813]: Info: [libx264 @ 0x5630eddd7bc0] frame I:1     Avg QP:31.00  size:  1312
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] mb I  I16..4: 99.9%  0.0%  0.0%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] 8x8 transform intra:0.0%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] coded y,u,v intra: 0.0% 0.0% 0.0%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] i16 v,h,dc,p: 97%  0%  3%  0%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu:  0%  0% 75% 12%  0%  0%  0%  0% 12%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu:  0%  0% 100%  0%  0%  0%  0%  0%  0%
+[2026-03-21 21:46:33.814]: Info: [libx264 @ 0x5630eddd7bc0] kb/s:629.76
+[2026-03-21 21:46:33.814]: Info: Screencasting with X11
+[2026-03-21 21:46:33.850]: Info: // Testing for available encoders, this may generate errors. You can safely ignore those errors. //
+[2026-03-21 21:46:33.850]: Info:
+[2026-03-21 21:46:33.850]: Info: // Ignore any errors mentioned above, they are not relevant. //
+[2026-03-21 21:46:33.850]: Info:
+[2026-03-21 21:46:33.850]: Info: Found H.264 encoder: libx264 [software]
+[2026-03-21 21:46:33.850]: Info: Open the Web UI to set your new username and password and getting started
+[2026-03-21 21:46:33.852]: Info: Starting system tray
+[2026-03-21 21:46:33.856]: Error: Failed to create client: Daemon not running
+[2026-03-21 21:46:33.856]: Info: Configuration UI available at [https://localhost:47990]
+[2026-03-21 21:46:33.936]: Info: System tray created
+[2026-03-21 21:46:33.936]: Info: Starting main loop
+
+(sunshine:59704): libayatana-appindicator-WARNING **: 21:46:33.936: Unable to get the session bus: Cannot spawn a message bus when AT_SECURE is set
+
+(sunshine:59704): LIBDBUSMENU-GLIB-WARNING **: 21:46:33.936: Unable to get session bus: Cannot spawn a message bus when AT_SECURE is set

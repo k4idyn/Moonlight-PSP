@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 /*
  * http.c - PSP-native HTTP client for Moonlight
  * 
@@ -387,7 +388,7 @@ static int https_tls_request(const char *host, int port, const char *path,
             LOGF("sceIoOpen cert failed '%s': 0x%08x", g_certPath, cert_fd);
             free(cert_buf);
             TLS_CLEANUP();
-            static char io_err[128];
+            static char io_err[1024];
             snprintf(io_err, sizeof(io_err), "sceIoOpen cert failed: 0x%08x (%s)", cert_fd, g_certPath);
             gs_error = io_err;
             return GS_FAILED;
@@ -429,7 +430,7 @@ static int https_tls_request(const char *host, int port, const char *path,
             LOGF("sceIoOpen key failed '%s': 0x%08x", g_keyPath, key_fd);
             free(key_buf);
             TLS_CLEANUP();
-            static char io_err2[128];
+            static char io_err2[1024];
             snprintf(io_err2, sizeof(io_err2), "sceIoOpen key failed: 0x%08x (%s)", key_fd, g_keyPath);
             gs_error = io_err2;
             return GS_FAILED;

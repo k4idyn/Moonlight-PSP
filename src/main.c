@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
 /**
  * @file main.c
  * @brief Main application entry point for PSP Moonlight
@@ -76,15 +77,12 @@ typedef enum {
     STATE_QUIT_CONFIRM
 } AppState;
 
-static AppState current_state = STATE_MAIN_MENU;
+static AppState current_state = STATE_CONNECTING;
 
 /* Host configuration */
 #define MAX_HOSTS 5
 static char saved_hosts[MAX_HOSTS][64] = {
-    "10.0.0.73",
-    "127.0.0.1",
-    "192.168.1.100",
-    "Empty",
+    "127.0.0.1",    "Empty",
     "Empty"
 };
 static int menu_selection = 0;
@@ -190,23 +188,23 @@ static void draw_wrapped_text(int x, int y, const char* text, int max_width, uns
     char buffer[1024];
     strncpy(buffer, text, sizeof(buffer)-1);
     buffer[sizeof(buffer)-1] = '\0';
-    
+
     char* lines[10];
     int line_count = 0;
     char* start = buffer;
-    
+
     while (*start && line_count < 10) {
         lines[line_count++] = start;
         char* last_space = NULL;
         char* p = start;
         int current_width = 0;
-        
+
         while (*p && current_width < max_width) {
             if (*p == ' ') last_space = p;
             current_width += 8; // Estimating 8px per char for standard font
             p++;
         }
-        
+
         if (current_width >= max_width && last_space && last_space > start) {
             *last_space = '\0';
             start = last_space + 1;
@@ -224,7 +222,7 @@ static void draw_wrapped_text(int x, int y, const char* text, int max_width, uns
             break;
         }
     }
-    
+
     for (int i = 0; i < line_count; i++) {
         // Center text in the line if it's within the box
         int len = strlen(lines[i]);
@@ -252,7 +250,7 @@ static int initialize_modules(void) {
   if (ui_renderer_init() < 0) return -1;
 
   /* Ensure folder exists for pairing persistence before any GS operations */
-  sceIoMkdir("ms0:/moonlight", 0777); 
+  sceIoMkdir("ms0:/moonlight", 0777);
   sceIoMkdir("ms0:/moonlight/keys", 0777); /* Absolute Perfection: Ensure keys subfolder specifically exists */
 
   g_network_receiver = network_receiver_create();
@@ -273,12 +271,12 @@ static int initialize_modules(void) {
   render_pipeline_set_video_decoder(g_render_pipeline, g_video_decoder);
   network_receiver_set_video_decoder(g_network_receiver, g_video_decoder);
   network_receiver_set_audio_decoder(g_network_receiver, g_audio_decoder);
-  
+
   LOG_INFO(COMPONENT_MAIN, "All modules initialized successfully.");
   return 0;
 }
 
-/* cleanup_modules is not used to prevent PSP kernel crashes on exit */  
+/* cleanup_modules is not used to prevent PSP kernel crashes on exit */
 
 static int is_button_pressed(unsigned int button) {
     return (pad_data.Buttons & button) && !(old_pad.Buttons & button);
@@ -290,9 +288,9 @@ static void draw_main_menu_logic() {
     ui_draw_background();
     ui_draw_header("PSP MOONLIGHT");
     ui_draw_panel(20, 50, 440, 200, 0xCC111111, 1); /* Increased height to 200 */
-    
+
     for (int i = 0; i < MAX_HOSTS; i++) {
-        char item_text[128];
+        char item_text[512];
         if (strcmp(saved_hosts[i], "Empty") != 0) snprintf(item_text, sizeof(item_text), "[%s]", saved_hosts[i]);
         else snprintf(item_text, sizeof(item_text), "[ <ADD NEW HOST> ]");
         ui_draw_menu_item(item_text, 40, 65 + (i * 22), 400, (menu_selection == i));
@@ -311,7 +309,7 @@ static void draw_main_menu_logic() {
     char bitrate_str[64];
     snprintf(bitrate_str, sizeof(bitrate_str), "Bitrate: %d", bitrate_opts[current_bitrate_idx]);
     ui_draw_menu_item(bitrate_str, 40, 210, 195, (menu_selection == MAX_HOSTS + 2));
-    
+
     const char* mode_names[] = {"Xbox", "Browser"};
     char control_str[64];
     snprintf(control_str, sizeof(control_str), "Mode: %s", mode_names[current_control_mode]);
@@ -326,7 +324,7 @@ static void draw_enter_ip_logic() {
     ui_draw_header("ADD / EDIT HOST IP");
     ui_draw_panel(20, 50, 440, 100, 0xCC222222, 1);
     /* Semi-transparent green cursor DRAWN BEFORE text for character visibility */
-    ui_draw_panel(82 + (ip_cursor * 8), 78, 8, 12, 0x7F00FF00, 0); 
+    ui_draw_panel(82 + (ip_cursor * 8), 78, 8, 12, 0x7F00FF00, 0);
     char buf[128];
     snprintf(buf, sizeof(buf), "IP: %s", temp_ip);
     ui_draw_text(buf, 50, 80, 0xFFFFFFFF);
@@ -341,13 +339,13 @@ static void draw_connecting_logic(int is_error) {
     char buf[256];
     snprintf(buf, sizeof(buf), "Host: %s", saved_hosts[menu_selection]);
     ui_draw_text(buf, 50, 70, 0xFFFFFFFF);
-    
+
     const char* status = network_receiver_get_status(g_network_receiver);
     snprintf(buf, sizeof(buf), "Status: %s", status);
-    
+
     /* Absolute Perfection: Space-aware word wrap for premium UI aesthetics */
     draw_wrapped_text(50, 95, buf, 380, is_error ? 0xFF0000FF : 0xFFFFFF00);
-    
+
     ui_draw_status_bar("Press CIRCLE to return to menu");
 }
 
@@ -367,13 +365,13 @@ static void draw_app_select_logic(char names[][64], int count, int selection) {
 static void draw_quit_confirm_logic(const char* current_app, const char* new_app) {
     ui_draw_panel(60, 80, 360, 120, 0xDD111111, 1);
     ui_draw_text("ANOTHER APP IS RUNNING", 110, 95, 0xFFFFFF00);
-    
-    char msg[128];
+
+    char msg[4096];
     snprintf(msg, sizeof(msg), "Quit %s", current_app);
     ui_draw_text(msg, 100, 115, 0xFFFFFFFF);
     snprintf(msg, sizeof(msg), "and start %s?", new_app);
     ui_draw_text(msg, 100, 130, 0xFFFFFFFF);
-    
+
     ui_draw_menu_item("Yes, Quit and Start", 80, 150, 320, (quit_confirm_selection == 0));
     ui_draw_menu_item("No, Cancel", 80, 172, 320, (quit_confirm_selection == 1));
 }
@@ -394,7 +392,7 @@ static void draw_pause_overlay_logic() {
 
 static void main_loop(void) {
     LOG_INFO(COMPONENT_MAIN, "Entering main loop...");
-    
+
     while (g_running) {
         sceCtrlReadBufferPositive(&pad_data, 1);
         ui_renderer_begin_frame();
@@ -414,7 +412,7 @@ static void main_loop(void) {
                     strcpy(saved_hosts[menu_selection], "Empty");
                     save_hosts();
                 }
-                if (is_button_pressed(PSP_CTRL_CROSS)) {
+                if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
                     if (menu_selection < MAX_HOSTS) {
                         if (strcmp(saved_hosts[menu_selection], "Empty") == 0) {
                             strcpy(temp_ip, "192.168.1.    ");
@@ -422,8 +420,8 @@ static void main_loop(void) {
                             current_state = STATE_ENTER_IP;
                         } else {
                             current_state = STATE_CONNECTING;
-                            network_receiver_connect(g_network_receiver, saved_hosts[menu_selection], 47989, 
-                                                  res_w[current_res_idx], res_h[current_res_idx], 
+                            network_receiver_connect(g_network_receiver, saved_hosts[menu_selection], 47989,
+                                                  res_w[current_res_idx], res_h[current_res_idx],
                                                   host_w[current_res_idx], host_h[current_res_idx],
                                                   fps_opts[current_fps_idx], bitrate_opts[current_bitrate_idx]);
                         }
@@ -447,15 +445,15 @@ static void main_loop(void) {
                     else idx = (idx - 1 + map_len) % map_len;
                     temp_ip[ip_cursor] = char_map[idx];
                 }
-                if (is_button_pressed(PSP_CTRL_CROSS)) {
+                if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
                     char clean_ip[64] = {0};
                     int j = 0;
                     for(int k=0; temp_ip[k] != '\0' && k < 15; k++) if (temp_ip[k] != ' ') clean_ip[j++] = temp_ip[k];
-                    
+
                     /* IP Validation: Must not end in a dot and must have at least one character */
-                    if (j > 0 && clean_ip[j-1] != '.') { 
-                        strncpy(saved_hosts[menu_selection], clean_ip, 63); 
-                        save_hosts(); 
+                    if (j > 0 && clean_ip[j-1] != '.') {
+                        strncpy(saved_hosts[menu_selection], clean_ip, 62); saved_hosts[menu_selection][63] = 0;
+                        save_hosts();
                         current_state = STATE_MAIN_MENU;
                     }
                 }
@@ -491,7 +489,7 @@ static void main_loop(void) {
                 if (count > 0) {
                     if (is_button_pressed(PSP_CTRL_UP)) app_selection_idx = (app_selection_idx - 1 + count) % count;
                     if (is_button_pressed(PSP_CTRL_DOWN)) app_selection_idx = (app_selection_idx + 1) % count;
-                    if (is_button_pressed(PSP_CTRL_CROSS)) {
+                    if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
                         int live_app_id = network_receiver_get_current_app_id(g_network_receiver);
                         if (live_app_id != 0 && live_app_id != ids[app_selection_idx]) {
                             pending_app_id = ids[app_selection_idx];
@@ -504,11 +502,11 @@ static void main_loop(void) {
                     }
                 }
                 if (is_button_pressed(PSP_CTRL_CIRCLE)) { network_receiver_disconnect(g_network_receiver); current_state = STATE_MAIN_MENU; }
-                
+
                 /* Highlight current app in the list if it matches ids[i] */
                 int current_app_id = network_receiver_get_current_app_id(g_network_receiver);
                 draw_app_select_logic(apps, count, app_selection_idx);
-                
+
                 /* Overlays the "Live" tag if we identify the running app */
                 for (int i=0; i<count; i++) {
                     if (ids[i] == current_app_id && current_app_id != 0) {
@@ -523,20 +521,20 @@ static void main_loop(void) {
                 char apps[20][64];
                 int ids[20];
                 int count = network_receiver_get_app_list(g_network_receiver, apps, ids, 20);
-                
+
                 const char* cur_name = "current app";
                 const char* new_name = "selected app";
                 int live_id = network_receiver_get_current_app_id(g_network_receiver);
-                
+
                 for (int i=0; i<count; i++) {
                     if (ids[i] == live_id) cur_name = apps[i];
                     if (ids[i] == pending_app_id) new_name = apps[i];
                 }
 
-                if (is_button_pressed(PSP_CTRL_UP) || is_button_pressed(PSP_CTRL_DOWN)) 
+                if (is_button_pressed(PSP_CTRL_UP) || is_button_pressed(PSP_CTRL_DOWN))
                     quit_confirm_selection = !quit_confirm_selection;
-                
-                if (is_button_pressed(PSP_CTRL_CROSS)) {
+
+                if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
                     if (quit_confirm_selection == 0) {
                         /* User confirmed: Quit then Start */
                         network_receiver_quit_app(g_network_receiver);
@@ -548,7 +546,7 @@ static void main_loop(void) {
                     }
                 }
                 if (is_button_pressed(PSP_CTRL_CIRCLE)) current_state = STATE_APP_SELECT;
-                
+
                 draw_quit_confirm_logic(cur_name, new_name);
                 break;
             }
@@ -601,7 +599,7 @@ static void main_loop(void) {
                             stability_check_frames = 0;
                         }
                     }
-                    
+
                     render_pipeline_draw_video(g_render_pipeline);
 
                     /* Absolute Perfection: Sunshine Message Overlay (Toast) */
@@ -609,7 +607,7 @@ static void main_loop(void) {
                     if (status && strncmp(status, "MSG: ", 5) == 0) {
                         ui_draw_panel(20, 20, 440, 30, 0xCC111111, 1);
                         ui_draw_text(status + 5, 30, 32, 0xFF00FFFF);
-                        
+
                         /* Auto-clear message after 5 seconds */
                         static uint64_t msg_start_time = 0;
                         static char last_msg[128] = {0};
@@ -618,8 +616,8 @@ static void main_loop(void) {
                             strncpy(last_msg, status, 127);
                         }
                         if (sceKernelGetSystemTimeWide() - msg_start_time > 5000000) {
-                            /* We can't easily clear the status in receiver from here, 
-                               but we can stop drawing it. 
+                            /* We can't easily clear the status in receiver from here,
+                               but we can stop drawing it.
                                Actually, let's just use the timer. */
                         }
                     }
@@ -628,7 +626,7 @@ static void main_loop(void) {
                     if (pause_active) {
                         if (is_button_pressed(PSP_CTRL_UP)) pause_menu_selection = (pause_menu_selection - 1 + 5) % 5;
                         if (is_button_pressed(PSP_CTRL_DOWN)) pause_menu_selection = (pause_menu_selection + 1) % 5;
-                        if (is_button_pressed(PSP_CTRL_CROSS)) {
+                        if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
                             if (pause_menu_selection == 0) pause_active = 0;
                             else if (pause_menu_selection == 1) current_control_mode = !current_control_mode;
                             else if (pause_menu_selection == 2) {
@@ -661,7 +659,7 @@ static void main_loop(void) {
                 draw_pause_overlay_logic();
                 if (is_button_pressed(PSP_CTRL_CIRCLE)) current_state = STATE_STREAMING;
                 break;
-            
+
             default:
                 break;
         }
@@ -687,9 +685,9 @@ int main(int argc, char *argv[]) {
 
   /* Set max CPU/BUS speed to prevent stream lag */
   scePowerSetClockFrequency(333, 333, 166);
-  
+
   SetupCallbacks();
-  
+
   /* CRASH TEST: Uncomment to verify the Blue Screen Exception Handler */
   // *(volatile int*)0x00000001 = 0xDEADBEEF;
   // __asm__ volatile ("break");
@@ -702,14 +700,14 @@ int main(int argc, char *argv[]) {
       LOG_ERROR(COMPONENT_MAIN, "Failed to initialize modules.");
       return -1;
   }
-  
+
   g_ui_sema = sceKernelCreateSema("UI Sema", 0, 1, 1, NULL);
   load_hosts();
   // Callbacks are already set up above
   g_running = 1;
   main_loop();
 
-  /* Exit cleanly - PSP kernel handles all resource cleanup on exit. 
+  /* Exit cleanly - PSP kernel handles all resource cleanup on exit.
    * Do NOT call cleanup_modules() here: sceMpegDelete and similar
    * PSP SDK calls crash on real hardware if mpeg was never fully used. */
   ui_renderer_begin_frame();
@@ -722,4 +720,14 @@ int main(int argc, char *argv[]) {
   logger_shutdown();
   sceKernelExitGame();
   return 0;
-}
+}
+// MIPS Toolchain Compatibility shim for libmxml 2.x
+// The precompiled libmxml.a in lib/ appears to have been compiled against
+// an older toolchain that expected __ctype_ptr__.
+#include <ctype.h>
+#ifdef _PSP
+// MIPS Toolchain Compatibility shim for libmxml 2.x
+// Redirect __ctype_ptr__ to the native _ctype_ array in the PSP SDK
+extern const char _ctype_[];
+const char *__ctype_ptr__ = _ctype_;
+#endif

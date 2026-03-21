@@ -267,7 +267,7 @@ int video_decoder_submit_frame(VideoDecoder* d, const void* data, unsigned int s
     }
 
     /* Decode */
-    int iInit = 0;
+    SceInt32 iInit = 0;
     void* frame_out = d->me_output_frame;
     unsigned long long start = sceKernelGetSystemTimeWide();
     if (d->frame_count % 600 == 0) {

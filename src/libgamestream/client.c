@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 /*
  * This file is part of Moonlight Embedded.
  *
@@ -210,7 +211,7 @@ static int load_cert(const char *keyDirectory) {
   snprintf(keyPath, sizeof(keyPath), "%s/%s", keyDirectory, KEY_FILE_NAME);
 
   char derFile[PATH_MAX];
-  strncpy(derFile, certPath, PATH_MAX - 1);
+  strncpy(derFile, certPath, PATH_MAX - 2); derFile[PATH_MAX-1] = 0;
   char *dot = strrchr(derFile, '.');
   if (dot)
     strcpy(dot, ".der");
@@ -1331,7 +1332,7 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId,
       url, sizeof(url),
       "https://%s:%u/"
       "%s?uniqueid=%s&uuid=%s&devicename=%s&clientname=%s&appid=%d&mode=%dx%dx%"
-      "d&additionalStates=1&sops=%d&rikey=%s&rikeyid=%d&localAudioPlayMode=%d&"
+      "d&additionalStates=1&sops=%d&rikey=%s&rikeyid=%lu&localAudioPlayMode=%d&"
       "surroundAudioInfo=%d&remoteControllersBitmap=%d&gcmap=%d%s",
       server->serverInfo.address, server->httpsPort,
       server->currentGame ? "resume" : "launch", unique_id, uuid_str, unique_id,

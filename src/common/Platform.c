@@ -329,7 +329,7 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
 #elif defined(_PSP)
     {
         // PSP threads need a bit of stack. 128KB should be enough for mbedTLS/RTSP without OOM.
-        thread->thread = sceKernelCreateThread(name, (SceKernelThreadEntry)entry, 0x10, 0x20000, 0, NULL);
+        thread->thread = sceKernelCreateThread(name, (void *)entry, 0x10, 0x20000, 0, NULL);
         if (thread->thread < 0) {
             free(ctx);
             return thread->thread;

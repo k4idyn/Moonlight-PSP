@@ -1,0 +1,7 @@
+psp-gcc -Iinclude -Iinclude/libgamestream -Iinclude/modules -Iinclude/common -Iinclude/ark4 -I. -I/usr/local/pspdev/psp/include -I/usr/local/pspdev/psp/sdk/include -O2 -g -G0 -Wall -Wextra -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99 -D_PSP_FW_VERSION=600   -c -o src/main.o src/main.c
+src/main.c: In function 'main_loop':
+src/main.c:415:59: error: 'auto_trigger' undeclared (first use in this function)
+  415 |                 if (is_button_pressed(PSP_CTRL_CROSS) || (auto_trigger > 0 && --auto_trigger == 0)) {
+      |                                                           ^~~~~~~~~~~~
+src/main.c:415:59: note: each undeclared identifier is reported only once for each function it appears in
+make: *** [<builtin>: src/main.o] Error 1

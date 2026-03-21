@@ -60,7 +60,7 @@ int xml_search(const char* data, size_t len, const char* node, char** result) {
   mxml_node_t *target = mxmlFindElement(tree, tree, node, NULL, NULL, MXML_DESCEND);
   mxml_node_t *child = mxmlGetFirstChild(target);
   if (target && child && mxmlGetType(child) == MXML_OPAQUE && mxmlGetOpaque(child)) {
-    *result = strdup(mxmlGetOpaque(child));
+    const char* opaque = mxmlGetOpaque(child); *result = opaque ? strdup(opaque) : NULL;
   } else {
     /* 2. Try finding as an attribute of the root node */
     mxml_node_t *root_node = mxmlFindElement(tree, tree, NULL, NULL, NULL, MXML_DESCEND);
@@ -100,7 +100,7 @@ int xml_applist(const char* data, size_t len, PAPP_LIST *app_list) {
     }
     mxml_node_t *title_child = mxmlGetFirstChild(title_node);
     if (title_node && title_child && mxmlGetType(title_child) == MXML_OPAQUE) {
-      item->name = strdup(mxmlGetOpaque(title_child));
+      const char* opaque = mxmlGetOpaque(title_child); item->name = opaque ? strdup(opaque) : NULL;
     }
     
     item->next = head;

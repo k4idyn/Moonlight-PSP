@@ -1,13 +1,12 @@
-Seeding DRBG...
-DRBG seed result: 0
-Generating 2048-bit RSA key...
-Seeding DRBG...
-DRBG seed result: 0
-Generating 2048-bit RSA key...
-RSA gen result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
+--- Moonlight Log Started ---
+[11754] [INFO] [MAIN] --- BOOTING PSP MOONLIGHT --- [RAM:45072KB]
+[162135] [INFO] [MAIN] Initializing PSP Moonlight V2... (Build: Mar 21 2026 19:57:29) [RAM:45056KB]
+[183491] [INFO] [NETWORK] Loading net modules (Exhaustive Absolute Perfection Recipe)... [RAM:45056KB]
+[308844] [INFO] [NETWORK] WLAN switch is OFF. (Ignoring for emulator compatibility) [RAM:42360KB]
+[309082] [INFO] [NETWORK] WLAN radio power is OFF. (Attempting wakeup via connect later) [RAM:42360KB]
+[314946] [INFO] [NETWORK] Found 1 saved WiFi profiles. [RAM:42360KB]
+[315182] [INFO] [NETWORK] Entering Wi-Fi Selector Loop... [RAM:42360KB]
+rStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
 currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
 Seeding DRBG...
 DRBG seed result: 0

@@ -107,7 +107,7 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
     // of fd_set does not have the same stack corruption hazards that UNIX does.
     fd_set readFds, writeFds, exceptFds;
     int i, err, nfds;
-    struct timeval tv;
+    // struct timeval tv;
 
     FD_ZERO(&readFds);
     FD_ZERO(&writeFds);
@@ -134,8 +134,8 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         }
     }
 
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    // tv.tv_sec = timeoutMs / 1000;
+    // tv.tv_usec = (timeoutMs % 1000) * 1000;
 
 #ifdef _PSP
     uint64_t start_time = sceKernelGetSystemTimeWide();
@@ -169,8 +169,8 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         }
 
         // Adjust timeout for this iteration
-        struct timeval iter_tv;
-        struct timeval* p_tv = NULL;
+        struct SceNetInetTimeval iter_tv;
+        struct SceNetInetTimeval* p_tv = NULL;
         if (timeoutMs >= 0) {
             uint64_t now = sceKernelGetSystemTimeWide();
             uint64_t elapsed_us = now - start_time;
@@ -862,7 +862,7 @@ int sendMtuSafe(SOCKET s, char* buffer, int size) {
         int bytesToSend = size - bytesSent > TCPv4_MSS ?
                           TCPv4_MSS : size - bytesSent;
 
-        if (send(s, &buffer[bytesSent], bytesToSend, 0) < 0) {
+        if ((int)send(s, &buffer[bytesSent], bytesToSend, 0) < 0) {
             return -1;
         }
 

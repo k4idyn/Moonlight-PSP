@@ -6,6 +6,7 @@
 #include <pspthreadman.h>
 #include <pspiofilemgr.h>
 #include <pspdebug.h>
+#include <pspsysmem.h>
 
 static SceUID logMutex = -1;
 static int logInitialized = 0;

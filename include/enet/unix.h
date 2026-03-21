@@ -1,4 +1,4 @@
-/** 
+/**
  @file  unix.h
  @brief ENet Unix header
 */
@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #if defined(_PSP) || defined(__psp__)
+#if !defined(_SYS_SOCKET_H_) && !defined(_PSP_SDK_SYS_SOCKET_H) && !defined(_SYS_SOCKET_H)
 #ifndef _SOCKADDR_STORAGE
 #define _SOCKADDR_STORAGE
 struct sockaddr_storage {
@@ -22,6 +23,7 @@ struct sockaddr_storage {
   unsigned char ss_family;
   char __ss_padding[128 - 2];
 };
+#endif
 #endif
 #endif
 
@@ -55,6 +57,5 @@ typedef fd_set ENetSocketSet;
 #define ENET_SOCKETSET_ADD(sockset, socket)    FD_SET (socket, & (sockset))
 #define ENET_SOCKETSET_REMOVE(sockset, socket) FD_CLR (socket, & (sockset))
 #define ENET_SOCKETSET_CHECK(sockset, socket)  FD_ISSET (socket, & (sockset))
-    
-#endif /* MOONLIGHT_ENET_UNIX_H */
 
+#endif /* MOONLIGHT_ENET_UNIX_H */
