@@ -39,7 +39,7 @@ OBJS = \
     src/common/rswrapper.o
 
 INCDIR = include include/libgamestream include/modules include/common include/ark4
-CFLAGS = -O2 -g -G0 -Wall -Wextra -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99
+CFLAGS = -O2 -g -G0 -Wall -Wextra -D_PSP -D__psp__ -DUSE_MBEDTLS -std=gnu99 -I$(shell psp-config --pspdev-path)/psp/include
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
