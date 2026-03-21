@@ -11,7 +11,6 @@
 #include <pspgum.h>
 #include <pspdisplay.h>
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -108,9 +107,9 @@ static const unsigned char font_basic[128][8] = {
 
 };
 
-struct UIVertex {
+struct __attribute__((aligned(4))) UIVertex {
     unsigned int color;
-    float x, y, z;
+    short x, y, z, pad;
 };
 
 int ui_renderer_init(void) {
@@ -134,7 +133,6 @@ int ui_renderer_init(void) {
     sceGuDisable(GU_TEXTURE_2D);
     sceGuDisable(GU_DEPTH_TEST);
     
-    /* Clean state: clear both buffers to black */
     sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
     sceGuFinish();
@@ -151,6 +149,8 @@ void ui_renderer_shutdown(void) {
 
 void ui_renderer_begin_frame(void) {
     sceGuStart(GU_DIRECT, g_gu_display_list);
+    sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
+    sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
 }
 
@@ -162,40 +162,32 @@ void ui_renderer_end_frame(void) {
 }
 
 void ui_draw_background(void) {
-    /* Deep Space Gradient */
-    unsigned int clr1 = 0xFF220000; /* Deep Midnight Blue/Black (ABGR) */
-    unsigned int clr2 = 0xFF000000; /* Pitch Black */
-
+    /* Absolute Perfection: Solid Dark Grey background for premium look */
     struct UIVertex* v = (struct UIVertex*)sceGuGetMemory(2 * sizeof(struct UIVertex));
-    v[0].color = clr1; v[0].x = 0; v[0].y = 0; v[0].z = 0;
-    v[1].color = clr2; v[1].x = SCR_WIDTH; v[1].y = SCR_HEIGHT; v[1].z = 0;
+    v[0].color = 0xFF111111; v[0].x = 0; v[0].y = 0; v[0].z = 0;
+    v[1].color = 0xFF111111; v[1].x = 480; v[1].y = 272; v[1].z = 0;
 
     sceGuDisable(GU_TEXTURE_2D);
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 2, 0, v);
+    sceGuDisable(GU_BLEND);
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 2, 0, v);
 
-    /* Dynamic Starfield */
-    static struct UIVertex stars[100];
+    /* Stars / Particle Overlay */
+    static struct UIVertex stars[50];
     static int stars_init = 0;
     if (!stars_init) {
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 50; i++) {
             stars[i].x = rand() % 480;
             stars[i].y = rand() % 272;
             stars[i].z = 0;
-            unsigned char bright = 150 + (rand() % 105);
-            stars[i].color = 0xFF000000 | (bright << 16) | (bright << 8) | bright;
+            stars[i].color = 0x88FFFFFF;
         }
         stars_init = 1;
     }
     
-    /* Subtle star twinkle/movement */
-    for (int i = 0; i < 100; i++) {
-        if ((rand() % 1000) < 5) {
-            unsigned char bright = 150 + (rand() % 105);
-            stars[i].color = 0xFF000000 | (bright << 16) | (bright << 8) | bright;
-        }
-    }
-
-    sceGuDrawArray(GU_POINTS, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 100, 0, stars);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceKernelDcacheWritebackInvalidateRange(stars, 50 * sizeof(struct UIVertex));
+    sceGuDrawArray(GU_POINTS, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 50, 0, stars);
 }
 
 void ui_draw_panel(int x, int y, int w, int h, unsigned int color, int border) {
@@ -207,12 +199,12 @@ void ui_draw_panel(int x, int y, int w, int h, unsigned int color, int border) {
     }
 
     struct UIVertex* v = (struct UIVertex*)sceGuGetMemory(2 * sizeof(struct UIVertex));
-    v[0].color = color; v[0].x = (float)x; v[0].y = (float)y; v[0].z = 0;
-    v[1].color = color; v[1].x = (float)(x + w); v[1].y = (float)(y + h); v[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 2, 0, v);
+    v[0].color = color; v[0].x = x; v[0].y = y; v[0].z = 0;
+    v[1].color = color; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 2, 0, v);
 
     if (border) {
-        sceGuEnable(GU_BLEND); /* Borders always use blending */
+        sceGuEnable(GU_BLEND);
         sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
         unsigned int border_color = 0x88FFFFFF;
         struct UIVertex* bv = (struct UIVertex*)sceGuGetMemory(5 * sizeof(struct UIVertex));
@@ -221,7 +213,7 @@ void ui_draw_panel(int x, int y, int w, int h, unsigned int color, int border) {
         bv[2].color=border_color; bv[2].x=x+w; bv[2].y=y+h; bv[2].z=0;
         bv[3].color=border_color; bv[3].x=x; bv[3].y=y+h; bv[3].z=0;
         bv[4].color=border_color; bv[4].x=x; bv[4].y=y; bv[4].z=0;
-        sceGuDrawArray(GU_LINE_STRIP, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 5, 0, bv);
+        sceGuDrawArray(GU_LINE_STRIP, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 5, 0, bv);
     }
 }
 
@@ -230,8 +222,6 @@ void ui_draw_text(const char* text, int x, int y, unsigned int color) {
     int len = strlen(text);
     if (len == 0) return;
     
-    /* Max vertices: 2 (per sprite) * 8 (rows) * 8 (bits) * length */
-    /* A more realistic limit for the shared pool */
     int max_vcount = len * 64; 
     struct UIVertex* v_base = (struct UIVertex*)sceGuGetMemory(max_vcount * sizeof(struct UIVertex));
     if (!v_base) return;
@@ -254,8 +244,8 @@ void ui_draw_text(const char* text, int x, int y, unsigned int color) {
                     if (start_col != -1) {
                         if (v_idx + 2 <= max_vcount) {
                             int width = col - start_col;
-                            v_base[v_idx].color = color; v_base[v_idx].x = (float)(x + (i * 8) + start_col); v_base[v_idx].y = (float)(y + row); v_base[v_idx].z = 0;
-                            v_base[v_idx+1].color = color; v_base[v_idx+1].x = (float)(x + (i * 8) + start_col + width); v_base[v_idx+1].y = (float)(y + row + 1); v_base[v_idx+1].z = 0;
+                            v_base[v_idx].color = color; v_base[v_idx].x = x + (i * 8) + start_col; v_base[v_idx].y = y + row; v_base[v_idx].z = 0;
+                            v_base[v_idx+1].color = color; v_base[v_idx+1].x = x + (i * 8) + start_col + width; v_base[v_idx+1].y = y + row + 1; v_base[v_idx+1].z = 0;
                             v_idx += 2;
                         }
                         start_col = -1;
@@ -265,8 +255,8 @@ void ui_draw_text(const char* text, int x, int y, unsigned int color) {
             if (start_col != -1) {
                 if (v_idx + 2 <= max_vcount) {
                     int width = 8 - start_col;
-                    v_base[v_idx].color = color; v_base[v_idx].x = (float)(x + (i * 8) + start_col); v_base[v_idx].y = (float)(y + row); v_base[v_idx].z = 0;
-                    v_base[v_idx+1].color = color; v_base[v_idx+1].x = (float)(x + (i * 8) + start_col + width); v_base[v_idx+1].y = (float)(y + row + 1); v_base[v_idx+1].z = 0;
+                    v_base[v_idx].color = color; v_base[v_idx].x = x + (i * 8) + start_col; v_base[v_idx].y = y + row; v_base[v_idx].z = 0;
+                    v_base[v_idx+1].color = color; v_base[v_idx+1].x = x + (i * 8) + start_col + width; v_base[v_idx+1].y = y + row + 1; v_base[v_idx+1].z = 0;
                     v_idx += 2;
                 }
             }
@@ -277,21 +267,20 @@ void ui_draw_text(const char* text, int x, int y, unsigned int color) {
         sceGuEnable(GU_BLEND);
         sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
         sceGuDisable(GU_TEXTURE_2D);
-        sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, v_idx, 0, v_base);
+        sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, v_idx, 0, v_base);
         sceGuDisable(GU_BLEND);
     }
 }
 
 void ui_draw_header(const char* title) {
-    ui_draw_panel(0, 0, SCR_WIDTH, 40, 0xCC442200, 0); /* Cyan-Blue Space Header */
-    ui_draw_text(title, 20, 16, 0xFF00FFFF); /* Bright Cyan Text */
+    ui_draw_panel(0, 0, SCR_WIDTH, 40, 0xCC442200, 0);
+    ui_draw_text(title, 20, 16, 0xFF00FFFF);
     
-    /* Subtle underline glow */
     unsigned int glow = 0xFF884400;
     struct UIVertex* v = (struct UIVertex*)sceGuGetMemory(2 * sizeof(struct UIVertex));
     v[0].color = glow; v[0].x = 0; v[0].y = 38; v[0].z = 0;
     v[1].color = glow; v[1].x = 480; v[1].y = 40; v[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 2, 0, v);
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 2, 0, v);
 }
 
 void ui_draw_menu_item(const char* label, int x, int y, int width, int selected) {
@@ -300,15 +289,14 @@ void ui_draw_menu_item(const char* label, int x, int y, int width, int selected)
 }
 
 void ui_draw_status_bar(const char* text) {
-    ui_draw_panel(0, SCR_HEIGHT - 20, SCR_WIDTH, 20, 0xCC000000, 0); /* Glassy Black */
+    ui_draw_panel(0, SCR_HEIGHT - 20, SCR_WIDTH, 20, 0xCC000000, 0);
     ui_draw_text(text, 10, SCR_HEIGHT - 16, 0xFFCCCCCC);
     
-    /* Status glow line */
     unsigned int glow = 0xFF553300;
     struct UIVertex* v = (struct UIVertex*)sceGuGetMemory(2 * sizeof(struct UIVertex));
     v[0].color = glow; v[0].x = 0; v[0].y = SCR_HEIGHT - 20; v[0].z = 0;
     v[1].color = glow; v[1].x = 480; v[1].y = SCR_HEIGHT - 19; v[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_2D, 2, 0, v);
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888|GU_VERTEX_16BIT|GU_TRANSFORM_2D, 2, 0, v);
 }
 
 void ui_draw_wifi_selector(const char* profiles[], int count, int selected) {

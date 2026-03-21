@@ -7,7 +7,6 @@
 #include <pspdebug.h>
 
 static SceUID logMutex = -1;
-static SceUID logFileHandle = -1;
 static int logInitialized = 0;
 
 const char* LogComponentToString(LogComponent comp) {
@@ -26,17 +25,16 @@ void logger_init() {
         logMutex = sceKernelCreateSema("MoonlightLogMutex", 0, 1, 1, NULL);
         logInitialized = 1;
         
-        // Open log file once (Clear on startup: TRUNC)
-        logFileHandle = sceIoOpen("ms0:/moonlight.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+        FILE* f = fopen("moonlight_debug.log", "w");
+        if (f) {
+            fprintf(f, "--- Moonlight Log Started ---\n");
+            fclose(f);
+        }
     }
 }
 
 void logger_shutdown() {
     if (logInitialized) {
-        if (logFileHandle >= 0) {
-            sceIoClose(logFileHandle);
-            logFileHandle = -1;
-        }
         if (logMutex >= 0) {
             sceKernelDeleteSema(logMutex);
             logMutex = -1;
@@ -75,11 +73,12 @@ void moonlight_log(const char* level, const char* component_str, const char* for
     printf("[%s] [%s] %s [RAM:%dKB]\n", level, component_str, buffer, (int)(free_ram/1024));
 
     // File I/O (must be protected by mutex)
-    if (logFileHandle >= 0 && locked) {
-        char file_buf[4224];
-        int len = snprintf(file_buf, sizeof(file_buf), "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
-        if (len > 0) {
-            sceIoWrite(logFileHandle, file_buf, len);
+    if (locked) {
+        FILE* f = fopen("moonlight_debug.log", "a");
+        if (f) {
+            fprintf(f, "[%llu] [%s] [%s] %s [RAM:%dKB]\n", time_us, level, component_str, buffer, (int)(free_ram/1024));
+            fflush(f);
+            fclose(f);
         }
     }
 

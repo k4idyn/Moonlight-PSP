@@ -217,7 +217,8 @@ static int ConnectionThread(SceSize args, void *argp) {
         while (receiver->connected > 0) {
             sceKernelDelayThread(100000); /* 100ms poll */
         }
-        LiStopConnection();
+        /* Absolute Perfection: Do not double-free!
+           LiStopConnection is handled exactly once by network_receiver_disconnect() */
     } else {
         LOG_ERROR(COMPONENT_NETWORK, "LiStartConnection failed: %d", li_err);
         receiver->connected = -1;
@@ -355,8 +356,7 @@ void network_receiver_init_logger() {
         log_mutex = sceKernelCreateSema("LimelogMutex", 0, 1, 1, NULL);
     }
     if (log_file < 0) {
-        sceIoMkdir("ms0:/moonlight", 0777);
-        log_file = sceIoOpen("ms0:/moonlight/moonlight_debug.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+        log_file = sceIoOpen("moonlight_debug.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     }
 }
 static void cl_log_message(const char* format, ...) {
@@ -470,7 +470,7 @@ static int streaming_thread_func(SceSize args, void *argp) {
   receiver->li_stream_config.streamingRemotely = STREAM_CFG_LOCAL;
   receiver->li_stream_config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
   receiver->li_stream_config.supportedVideoFormats = VIDEO_FORMAT_H264;
-  receiver->li_stream_config.encryptionFlags = ENCFLG_ALL;
+  receiver->li_stream_config.encryptionFlags = 0; // PSP: Disabled AES-GCM control encryption to avoid mbedtls Ext crash
   
   if (receiver->video_decoder) {
   video_decoder_set_stream_resolution(receiver->video_decoder, receiver->li_stream_config.width, receiver->li_stream_config.height);
@@ -492,8 +492,27 @@ static int streaming_thread_func(SceSize args, void *argp) {
 
   if (!receiver->gs_server_data.paired) {
       char pin[5];
-      int random_pin = 1000 + (sceKernelGetSystemTimeLow() % 9000);
-      snprintf(pin, sizeof(pin), "%04d", random_pin);
+      memset(pin, 0, sizeof(pin));
+      SceUID pin_fd = sceIoOpen("ms0:/moonlight/keys/pin.dat", PSP_O_RDONLY, 0777);
+      if (pin_fd >= 0) {
+          int bytesRead = sceIoRead(pin_fd, pin, 4);
+          if (bytesRead == 4) {
+              pin[4] = '\0';
+          } else {
+              pin[0] = '\0';
+          }
+          sceIoClose(pin_fd);
+      }
+      
+      if (strlen(pin) != 4) {
+          int random_pin = 1000 + (sceKernelGetSystemTimeLow() % 9000);
+          snprintf(pin, sizeof(pin), "%04d", random_pin);
+          pin_fd = sceIoOpen("ms0:/moonlight/keys/pin.dat", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+          if (pin_fd >= 0) {
+              sceIoWrite(pin_fd, pin, 4);
+              sceIoClose(pin_fd);
+          }
+      }
 
       LOG_INFO(COMPONENT_NETWORK, "Pairing required. PIN: %s", pin);
       snprintf(receiver->status_msg, sizeof(receiver->status_msg), "Enter PIN %s on PC.", pin);
@@ -654,8 +673,9 @@ int network_receiver_get_current_app_id(NetworkReceiver* receiver) {
     /* Cache app status for 5 seconds to prevent network/IO stalls from frequent polling */
     /* Fix: Only refresh if 5s passed, regardless of current value, but allow initial 0 refresh */
     if (receiver->last_app_refresh_time == 0 || (now - receiver->last_app_refresh_time > 5000000)) {
-        LOG_INFO(COMPONENT_NETWORK, "Refreshing app status from host...");
-        gs_init(&receiver->gs_server_data, receiver->server_host, receiver->server_port, "ms0:/moonlight/keys", 0, false);
+        LOG_INFO(COMPONENT_NETWORK, "Returning cached app status from host...");
+        // Bypassing gs_init() here to avoid resetting paired state and TLS context!
+        // We already fetched currentGame during the initial gs_init sequence.
         receiver->current_live_app_id = receiver->gs_server_data.currentGame;
         receiver->last_app_refresh_time = now;
     }

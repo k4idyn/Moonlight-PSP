@@ -1,0 +1,31 @@
+name: PSP C/C++ CI Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: pspdev/pspdev:latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Clean Environment
+      run: make clean
+
+    - name: Compile PSP Executable
+      run: make -j$(nproc)
+
+    - name: Upload EBOOT.PBP Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: moonlight-psp-eboot
+        path: EBOOT.PBP

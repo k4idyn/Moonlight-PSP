@@ -32,7 +32,7 @@
 /* ---------- Configuration ---------- */
 #define HTTP_CONNECT_TIMEOUT_S  10
 #define HTTP_READ_TIMEOUT_S     90
-#define LOG_FILE "ms0:/moonlight_debug.log"
+#define LOG_FILE "moonlight_debug.log"
 
 /* ---------- Static state ---------- */
 static char g_certPath[4096];
@@ -518,10 +518,8 @@ int http_init(const char *keyDirectory, int logLevel) {
 }
 
 int http_request(char *url, PHTTP_DATA data) {
-    char host[256];
-    int  port;
-    char path[8192];
-    int  is_https;
+    char host[256], path[16384];
+    int port, is_https;
 
     LOGF("http_request: %s", url);
 

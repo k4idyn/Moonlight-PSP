@@ -7,6 +7,7 @@
 
 #include "systemctrl.h"
 #include "macros.h"
+#include "module2.h"
 
 // Credits to @Moment
 

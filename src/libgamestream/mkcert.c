@@ -15,6 +15,7 @@
 #include <mbedtls/error.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/oid.h>
+#include <mbedtls/ecp.h>
 
 static int better_entropy_mkcert(void *data, unsigned char *output, size_t len) {
     (void)data;
@@ -26,8 +27,6 @@ static int better_entropy_mkcert(void *data, unsigned char *output, size_t len) 
     }
     return 0;
 }
-
-static const int NUM_BITS = 2048;
 
 CERT_KEY_PAIR mkcert_generate(const char* device_name) {
     (void)device_name;
@@ -50,19 +49,18 @@ CERT_KEY_PAIR mkcert_generate(const char* device_name) {
     int ret = mbedtls_ctr_drbg_seed(ctr_drbg, better_entropy_mkcert, entropy, (const unsigned char *)pers, strlen(pers));
     if (flog) { fprintf(flog, "DRBG seed result: %d\n", ret); fflush(flog); }
 
-    mbedtls_pk_setup(pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    ret = mbedtls_pk_setup(pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+    if (ret != 0) { LOG_ERROR(COMPONENT_NETWORK, "mbedtls_pk_setup failed: %d", ret); }
     
-    if (flog) { fprintf(flog, "Generating 2048-bit RSA key...\n"); fflush(flog); }
-    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(*pkey), mbedtls_ctr_drbg_random, ctr_drbg, 2048, 65537);
-    if (flog) { fprintf(flog, "RSA gen result: %d\n", ret); fclose(flog); }
+    ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(*pkey), mbedtls_ctr_drbg_random, ctr_drbg);
+    if (ret != 0) { LOG_ERROR(COMPONENT_NETWORK, "mbedtls_ecp_gen_key failed: %d", ret); }
 
     mbedtls_x509write_crt_set_subject_key(crt, pkey);
     mbedtls_x509write_crt_set_issuer_key(crt, pkey);
 
     char dn_buf[128];
-    const char* standard_cn = "NVIDIA GameStream Client";
-    snprintf(dn_buf, sizeof(dn_buf), "CN=%s", standard_cn);
-    LOG_INFO(COMPONENT_NETWORK, "Generating certificate with %s", dn_buf);
+    snprintf(dn_buf, sizeof(dn_buf), "CN=%s", device_name);
+    LOG_INFO(COMPONENT_NETWORK, "Generating ECDSA certificate with %s", dn_buf);
     mbedtls_x509write_crt_set_subject_name(crt, dn_buf);
     mbedtls_x509write_crt_set_issuer_name(crt, dn_buf);
 

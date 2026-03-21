@@ -23,6 +23,7 @@
 #include <mxml.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../modules/logger.h"
 
 static char gs_error_static[256];
 
@@ -116,6 +117,7 @@ int xml_modelist(const char* data, size_t len, PDISPLAY_MODE *mode_list) {
 }
 
 int xml_status(const char* data, size_t len) {
+  LOG_INFO(COMPONENT_NETWORK, "xml_status: Received %d bytes: %.128s", (int)len, data);
   (void)len;
   mxml_node_t *tree = mxmlLoadString(NULL, data, MXML_OPAQUE_CALLBACK);
   if (!tree) return GS_INVALID;

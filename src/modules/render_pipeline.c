@@ -6,6 +6,7 @@
  */
 
 #include "render_pipeline.h"
+#include "modules/ui_renderer.h"
 #include <pspdisplay.h>
 #include <pspge.h>
 #include <pspgu.h>
@@ -22,12 +23,12 @@ extern unsigned int __attribute__((aligned(16))) g_gu_display_list[16384];
 
 struct Vertex {
   float u, v;
-  float x, y, z;
+  short x, y, z, pad;
 };
 
 struct VertexColor {
   unsigned int color;
-  float x, y, z;
+  short x, y, z, pad;
 };
 
 
@@ -66,24 +67,33 @@ void render_pipeline_stop(RenderPipeline *p) {
 void render_pipeline_draw_video(RenderPipeline *p) {
   if (!p || !p->initialized || !p->video_decoder) return;
 
+  static int frames_received = 0;
   unsigned int width = 0, height = 0;
   void *frame = video_decoder_get_output_frame(p->video_decoder, &width, &height);
   
-  /* Absolute Perfection: If no new frame is ready, we MUST NOT return early.
-     Returning early causes ui_renderer to clear the buffer to black,
-     creating the "flickering on and off" effect if stream FPS < UI FPS.
-     We reuse the last frame already uploaded to the GU texture. */
+  if (frame) frames_received++;
+
+  sceGuDisable(GU_BLEND);
+  sceGuEnable(GU_TEXTURE_2D);
+
+  /* Absolute Perfection: If no frames have ever been received, show the status.
+     If a frame WAS received but now it's NULL, it just means the decoder hasn't 
+     finished the next frame yet (e.g. 30fps stream in 60fps UI).
+     In that case, we MUST NOT draw the text, or it will flicker.
+     We instead reuse the last texture state already bound to the GPU. */
   if (!frame) {
-      /* If we have an initialized video decoder, we assume there's a valid 
-         texture already bound from the last successful draw. */
-      sceGuEnable(GU_TEXTURE_2D);
-      struct Vertex *v = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
-      v[0].u = 0.0f;          v[0].v = 0.0f;
-      v[0].x = 0.0f;          v[0].y = 0.0f;           v[0].z = 0.0f;
-      v[1].u = (float)SCR_WIDTH;  v[1].v = (float)SCR_HEIGHT; /* Use screen dims for safety */
-      v[1].x = (float)SCR_WIDTH; v[1].y = (float)SCR_HEIGHT; v[1].z = 0.0f;
-      // Re-draw with existing texture state
-      sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+      if (frames_received == 0) {
+          ui_draw_text("STREAMS ACTIVE - WAITING FOR VIDEO...", 100, 130, 0xFF00FFFF);
+      } else {
+          struct Vertex *v = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+          v[0].u = 0.0f;          v[0].v = 0.0f;
+          v[0].x = 0;             v[0].y = 0;              v[0].z = 0;
+          v[1].u = (float)SCR_WIDTH;  v[1].v = (float)SCR_HEIGHT; 
+          v[1].x = (short)SCR_WIDTH; v[1].y = (short)SCR_HEIGHT; v[1].z = 0;
+          
+          /* Do not re-upload texture, just draw with last state */
+          sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
+      }
       return;
   }
 
@@ -92,17 +102,16 @@ void render_pipeline_draw_video(RenderPipeline *p) {
 
   struct Vertex *v = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
   v[0].u = 0.0f;          v[0].v = 0.0f;
-  v[0].x = 0.0f;          v[0].y = 0.0f;           v[0].z = 0.0f;
+  v[0].x = 0;             v[0].y = 0;              v[0].z = 0;
   v[1].u = (float)width;  v[1].v = (float)height;
-  v[1].x = (float)SCR_WIDTH; v[1].y = (float)SCR_HEIGHT; v[1].z = 0.0f;
+  v[1].x = (short)SCR_WIDTH; v[1].y = (short)SCR_HEIGHT; v[1].z = 0;
 
-  sceGuEnable(GU_TEXTURE_2D);
   sceGuTexMode(GU_PSM_5650, 0, 0, 0);
   sceGuTexImage(0, 512, 512, BUF_WIDTH, frame);
   sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
   sceGuTexFilter(GU_LINEAR, GU_LINEAR);
 
-  sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+  sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
 }
 
 void render_pipeline_update(RenderPipeline *p) {
