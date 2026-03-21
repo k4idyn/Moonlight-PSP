@@ -15,8 +15,21 @@ sudo apt-get install -y \
 # 2. Install PSPSDK (Prebuilt for Ubuntu)
 if [ ! -d "/usr/local/pspdev" ]; then
     echo "Installing PSPSDK Toolchain..."
-    LATEST_TAG=$(curl -s https://api.github.com/repos/pspdev/pspdev/releases/latest | jq -r .tag_name)
-    curl -L "https://github.com/pspdev/pspdev/releases/download/${LATEST_TAG}/pspdev-linux-amd64.tar.gz" -o pspdev.tar.gz
+    # Using a specific known-good release to avoid API rate limits or missing assets
+    PSPDEV_VER="v20260301"
+    FILENAME="pspdev-ubuntu-latest-x86_64.tar.gz"
+    URL="https://github.com/pspdev/pspdev/releases/download/${PSPDEV_VER}/${FILENAME}"
+    
+    echo "Downloading from: $URL"
+    curl -L "$URL" -o pspdev.tar.gz
+    
+    # Check if the file is valid
+    if ! file pspdev.tar.gz | grep -q "gzip compressed data"; then
+        echo "Error: Downloaded pspdev.tar.gz is not a valid gzip file. Check the URL or GitHub status."
+        head -c 100 pspdev.tar.gz
+        exit 1
+    fi
+    
     sudo mkdir -p /usr/local/pspdev
     sudo tar -xzf pspdev.tar.gz -C /usr/local/pspdev --strip-components=1
     rm pspdev.tar.gz
