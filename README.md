@@ -73,20 +73,28 @@ moonlight-psp-core/
 
 Developing and compiling the client requires a fully configured PSP homebrew environment.
 
-### Quick Start (Linux / Jules VM)
+### Quick Start (Linux / WSL2)
 
-If you are operating in a fresh Ubuntu VM, you can automate the entire environment setup (PSPSDK + Dependencies) using the provided script:
+Use the automated setup script to install the PSPSDK and all necessary dependencies:
 
 ```bash
 cd moonlight-psp-core
-./jules_setup.sh
+chmod +x setup_linux.sh
+./setup_linux.sh
 make -j$(nproc)
 ```
 
-### Manual Compilation Process (Host / WSL)
+### Quick Start (Windows)
 
-1. Ensure `PSPSDK` is installed and the `PSPDEV` environment variable is set.
-2. Navigate to the root directory and invoke the standard build:
+If you have a local PSPSDK installation, you can use the provided batch script for a one-click build:
+
+```batch
+build_psp_windows.bat
+```
+
+### Manual Compilation
+
+Ensure `PSPSDK` is installed and the `PSPDEV` environment variable is set, then invoke `make`:
 
 ```bash
 cd moonlight-psp-core

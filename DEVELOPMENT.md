@@ -1,6 +1,4 @@
-# Moonlight PSP Core Monorepo: Agent Instructions
-
-**To: Jules (or any AI agent operating on this project)**
+# Moonlight PSP Core Monorepo: Developer Instructions
 
 ## Overview
 This repository contains the structured monorepo for the `moonlight-psp-core` project. It is designed to act as a proper C/C++ PSP SDK standard project structure for the Antigravity engine port of Moonlight.
