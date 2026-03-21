@@ -1138,10 +1138,10 @@ index 41e7dd8..3007b5e 100644
  #elif defined(LC_POSIX) && !defined(LC_CHROME)
      // Disable SIGPIPE signals to avoid us getting
 diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
-index 1ab0ee9..ea4cc9d 100644
+index 1ab0ee9..aed3b15 100644
 --- a/src/PlatformSockets.h
 +++ b/src/PlatformSockets.h
-@@ -12,10 +12,77 @@
+@@ -12,10 +12,103 @@
  extern in_port_t n3ds_udp_port;
  #endif
  
@@ -1186,6 +1186,32 @@ index 1ab0ee9..ea4cc9d 100644
 +#include <sys/time.h>
 +#include <netdb.h>
 +
++#ifndef AI_PASSIVE
++struct addrinfo {
++    int ai_flags;
++    int ai_family;
++    int ai_socktype;
++    int ai_protocol;
++    socklen_t ai_addrlen;
++    char *ai_canonname;
++    struct sockaddr *ai_addr;
++    struct addrinfo *ai_next;
++};
++#define AI_PASSIVE 1
++#define AI_CANONNAME 2
++#define AI_NUMERICHOST 4
++#endif
++
++#ifndef AI_ADDRCONFIG
++#define AI_ADDRCONFIG 32
++#endif
++
++// Map to sceNetInet versions if they exist, or just declare them
++extern int getaddrinfo(const char *node, const char *service,
++                       const struct addrinfo *hints,
++                       struct addrinfo **res);
++extern void freeaddrinfo(struct addrinfo *res);
++
 +struct pollfd {
 +    int fd;
 +    short events;
@@ -1220,7 +1246,7 @@ index 1ab0ee9..ea4cc9d 100644
  #endif
  
  #ifdef _WIN32
-@@ -68,11 +135,18 @@ typedef int SOCKADDR_LEN;
+@@ -68,11 +161,18 @@ typedef int SOCKADDR_LEN;
  #include <netdb.h>
  #include <errno.h>
  #include <signal.h>
@@ -1239,7 +1265,7 @@ index 1ab0ee9..ea4cc9d 100644
  #define INVALID_SOCKET -1
  #define SOCKET_ERROR -1
  
-@@ -81,6 +155,14 @@ typedef ssize_t SOCK_RET;
+@@ -81,6 +181,14 @@ typedef ssize_t SOCK_RET;
  typedef socklen_t SOCKADDR_LEN;
  #endif
  
@@ -1254,7 +1280,7 @@ index 1ab0ee9..ea4cc9d 100644
  #ifdef AF_INET6
  typedef struct sockaddr_in6 LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
-@@ -90,6 +172,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
+@@ -90,6 +198,7 @@ typedef struct sockaddr_in LC_SOCKADDR;
  #define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
  #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
  #endif
@@ -1285,3 +1311,43 @@ index 52ce2b1..3b67e0c 100644
              EncryptionFeaturesRequested = 0;
          }
          EncryptionFeaturesEnabled = 0;
+diff --git a/src/SdpGenerator.c b/src/SdpGenerator.c
+index a2f9789..8e6cb3d 100644
+--- a/src/SdpGenerator.c
++++ b/src/SdpGenerator.c
+@@ -252,7 +252,7 @@ static int addGen5Options(PSDP_OPTION* head) {
+     return err;
+ }
+ 
+-static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
++static PSDP_OPTION getAttributesList(char* urlSafeAddr) {
+     PSDP_OPTION optionHead;
+     char payloadStr[92];
+     int audioChannelCount;
+@@ -269,7 +269,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+     if (IS_SUNSHINE()) {
+         // Send client feature flags to Sunshine hosts
+         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+-        snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
++        snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)moonlightFeatureFlags);
+         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
+ 
+         // New-style control stream encryption is low overhead, so we enable it any time it is supported
+@@ -299,7 +299,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+             EncryptionFeaturesEnabled |= SS_ENC_AUDIO;
+         }
+ 
+-        snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
++        snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)EncryptionFeaturesEnabled);
+         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
+ 
+         // Enable YUV444 if requested
+@@ -367,7 +367,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+ 
+         // Send the configured bitrate to Sunshine hosts, so they can adjust for dynamic FEC percentage
+         if (IS_SUNSHINE()) {
+-            snprintf(payloadStr, sizeof(payloadStr), "%u", StreamConfig.bitrate);
++            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)StreamConfig.bitrate);
+             err |= addAttributeString(&optionHead, "x-ml-video.configuredBitrateKbps", payloadStr);
+         }
+     }
