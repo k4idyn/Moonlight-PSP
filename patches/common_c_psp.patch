@@ -107,6 +107,19 @@ index 31d666b..07fc037 100644
  
  # nanors
  if (MSVC)
+diff --git a/nanors/deps/obl/oblas_lite.c b/nanors/deps/obl/oblas_lite.c
+index 64cc8d8..f122a18 100644
+--- a/nanors/deps/obl/oblas_lite.c
++++ b/nanors/deps/obl/oblas_lite.c
+@@ -172,7 +172,7 @@ void obl_axpyb32_ref(u8 *a, u32 *b, u8 u, unsigned k)
+         }                                                                                                                          \
+     } while (0)
+ 
+-#elif defined(OBLAS_SSE3) || !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_AMD64))
++#elif defined(OBLAS_SSE3) || (!(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_AMD64)) && !defined(_PSP))
+ 
+ #if defined(OBLAS_SSE3)
+ #include <emmintrin.h>
 diff --git a/src/ControlStream.c b/src/ControlStream.c
 index 2b5182e..2eaefee 100644
 --- a/src/ControlStream.c
