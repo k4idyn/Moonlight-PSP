@@ -12,19 +12,15 @@
 ## Latest Release: [v0.1.0.3-alpha](https://github.com/k4idyn/Moonlight-PSP/releases/tag/v0.1.0.3-alpha)
 **Status**: Active / Experimental Alpha
 
-**Release Highlight**: **Architectural Cleanup & Toolchain Stabilization**. This release resolves critical build errors, standardizes project-wide header guards, and implements Mini-XML 3.x compatibility for improved ABI safety.
+**Release Highlight**: **Architectural Cleanup & CodeRabbit Response**. This release focuses on project-wide header guard standardization, Mini-XML 3.x API compatibility for improved ABI safety, and build toolchain stabilization.
 
 **⚠️ CURRENT KNOWN PERSISTENT ERROR ⚠️**
 The client is currently experiencing a connection error during the GameStream initialization sequence:
 `Status: FAILED: control stream establishment (0x00000074)`
 
-This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We have verified functional parity with previous builds using the **PPSSPP emulator** and are investigating the ENet handshake failure.
+This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We have verified functional parity with previous builds via emulator verification and are investigating the ENet handshake failure.
 
 ---
-
-## Overview
-
-The `moonlight-psp-core` repository is the dedicated C/C++ SDK monorepo for the [Moonlight Game Streaming Client](https://moonlight-stream.org/) targeting the Sony PlayStation Portable (PSP-1000 and later).
 
 ## Repository Structure
 
@@ -52,12 +48,6 @@ We provide an automated build script for Windows environments:
 To verify the build in PPSSPP:
 ```powershell
 .\verify_build.ps1
-```
-
-## Build Instructions (Linux / WSL2)
-
-```bash
-make -j$(nproc)
 ```
 
 ## Licensing Information

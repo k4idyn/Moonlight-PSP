@@ -1,7 +1,7 @@
 # AGENTS.md - Repository Governance for Moonlight PSP
 
 ## Role: GitHub Architect
-This repository follows a strict **MIPS-PSP Monorepo Architecture**. All agents MUST adhere to these guidelines to maintain parallel reliability and cadence across the project.
+This repository follows a strict **MIPS-PSP Monorepo Architecture**. All contributors MUST adhere to these guidelines to maintain parallel reliability and cadence across the project.
 
 ## Core Architectural Rules
 1. **Directory Integrity**:
@@ -21,10 +21,11 @@ This repository follows a strict **MIPS-PSP Monorepo Architecture**. All agents 
    - Follow semantic versioning with `-alpha` or `-beta` suffixes as appropriate.
    - Tag all major stabilization milestones (e.g., `v0.1.0.x-alpha`).
 
-## Guidance for Jules
+## Architectural Alignment (CodeRabbit Response)
 - Maintain the **Exhaustive Absolute Perfection Recipe** for network module loading in `main.c`.
 - Ensure all new headers follow the `MOONLIGHT_*_H` guard convention.
 - If adding a new module, update the `Makefile` and `exports.c` (if kernel-exported).
+- Migrate from direct struct member access to public accessor APIs for all third-party libraries (e.g., Mini-XML).
 
 ---
 *Maintained by the GitHub Architect.*
