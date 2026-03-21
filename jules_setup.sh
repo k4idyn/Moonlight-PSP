@@ -59,8 +59,13 @@ find_or_clone() {
 # We install to $PSPDEV/psp to match the toolchain's search paths
 
 echo "Building ENet..."
-find_or_clone "enet-cgutman" "https://github.com/cgutman/enet.git" "master"
-# We should apply psp patches if needed, but for now we build the master
+# Clone the 'moonlight' branch which has the initial PSP support
+find_or_clone "enet-cgutman" "https://github.com/cgutman/enet.git" "moonlight"
+# Apply our custom Error 116 timeout fixes
+if [ -f "$ROOT_DIR/patches/enet_psp.patch" ]; then
+    echo "Applying ENet PSP patches..."
+    git apply --ignore-whitespace "$ROOT_DIR/patches/enet_psp.patch"
+fi
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" -G "Unix Makefiles"
 make -j$(nproc)
@@ -93,6 +98,10 @@ make install
 
 echo "Building Moonlight Common C..."
 find_or_clone "moonlight-common-c" "https://github.com/moonlight-stream/moonlight-common-c.git" "master"
+if [ -f "$ROOT_DIR/patches/common_c_psp.patch" ]; then
+    echo "Applying Common C PSP patches..."
+    git apply --ignore-whitespace "$ROOT_DIR/patches/common_c_psp.patch"
+fi
 rm -rf build-linux-psp && mkdir build-linux-psp && cd build-linux-psp
 cmake .. -DCMAKE_TOOLCHAIN_FILE="$ROOT_DIR/generic-psp-toolchain.cmake" -DUSE_MBEDTLS=ON
 make -j$(nproc)
