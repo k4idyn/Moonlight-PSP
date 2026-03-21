@@ -32,6 +32,8 @@
 #include "modules/logger.h"
 
 
+static int auto_trigger = 1800;
+
 PSP_MODULE_INFO("PSPMoonlight", 0, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 
