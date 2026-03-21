@@ -1,8 +1,39 @@
-﻿diff --git a/include/enet/unix.h b/include/enet/unix.h
-index b55be33..d088f0f 100644
+﻿diff --git a/CMakeLists.txt b/CMakeLists.txt
+index da4624d..8c9ae3f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,6 +20,7 @@ check_function_exists("inet_ntop" HAS_INET_NTOP)
+ check_struct_has_member("struct msghdr" "msg_flags" "sys/types.h;sys/socket.h" HAS_MSGHDR_FLAGS)
+ set(CMAKE_EXTRA_INCLUDE_FILES "sys/types.h" "sys/socket.h")
+ check_type_size("socklen_t" HAS_SOCKLEN_T BUILTIN_TYPES_ONLY)
++check_type_size("struct sockaddr_storage" HAS_SOCKADDR_STORAGE BUILTIN_TYPES_ONLY)
+ unset(CMAKE_EXTRA_INCLUDE_FILES)
+ set(CMAKE_EXTRA_INCLUDE_FILES "winsock2.h;qos2.h")
+ check_type_size("QOS_FLOWID" HAS_QOS_FLOWID BUILTIN_TYPES_ONLY)
+@@ -64,6 +65,9 @@ endif()
+ if(HAS_SOCKLEN_T)
+     add_definitions(-DHAS_SOCKLEN_T=1)
+ endif()
++if(HAS_SOCKADDR_STORAGE)
++    add_definitions(-DHAS_SOCKADDR_STORAGE=1)
++endif()
+ if(HAS_QOS_FLOWID)
+     add_definitions(-DHAS_QOS_FLOWID=1)
+ endif()
+@@ -113,7 +117,7 @@ endif()
+ if(NOT ENET_NO_INSTALL)
+     install(TARGETS enet
+         RUNTIME DESTINATION bin
+-        ARCHIVE DESTINATION lib/static
++        ARCHIVE DESTINATION lib
+         LIBRARY DESTINATION lib)
+ 
+     install(DIRECTORY include/
+diff --git a/include/enet/unix.h b/include/enet/unix.h
+index b55be33..cebfc55 100644
 --- a/include/enet/unix.h
 +++ b/include/enet/unix.h
-@@ -8,11 +8,23 @@
+@@ -8,11 +8,25 @@
  #include <stdlib.h>
  #include <sys/time.h>
  #include <sys/types.h>
@@ -13,6 +44,7 @@ index b55be33..d088f0f 100644
  #include <unistd.h>
  
 +#if defined(_PSP) || defined(__psp__)
++#ifndef HAS_SOCKADDR_STORAGE
 +#ifndef _SOCKADDR_STORAGE
 +#define _SOCKADDR_STORAGE
 +struct sockaddr_storage {
@@ -20,6 +52,7 @@ index b55be33..d088f0f 100644
 +  unsigned char ss_family;
 +  char __ss_padding[128 - 2];
 +};
++#endif
 +#endif
 +#endif
 +
