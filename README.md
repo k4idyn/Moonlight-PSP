@@ -22,7 +22,7 @@ The client is currently experiencing a persistent connection error during the Ga
 This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We have implemented several PSP-specific socket workarounds and are currently verifying them on both real hardware and the PPSSPP emulator.
 
 **Hardware Support Phase**
-The project is currently in a **Beta Testing Phase**. While the core engine and protocol logic are functional, streaming stability is limited by ongoing network timing issues. We recommend using the **PPSSPP emulator** for all active debugging and contribution.
+The project is currently in a **Alpha Testing Phase**. While the core engine and protocol logic are functional, streaming stability is limited by ongoing network timing issues. We recommend using the **PPSSPP emulator** for all active debugging and contribution.
 
 ---
 

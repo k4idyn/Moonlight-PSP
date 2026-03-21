@@ -25,5 +25,5 @@ This document outlines the development phases, current status, and future goals 
 - [ ] Add basic UI for server discovery and pairing.
 
 ## Phase 4: Release
-- [ ] Official "Beta" Release for real hardware testers.
+- [ ] Official "Alpha 1.0" Release for real hardware testers.
 - [ ] Performance benchmarks and hardware compatibility list.
