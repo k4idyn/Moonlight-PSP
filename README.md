@@ -9,16 +9,18 @@
 
 </div>
 
-## Development Status: Active Debugging Phase
+## Development Status: Active Debugging & Porting
+
+**Current Focus**: Stabilizing the ENet control stream and optimizing the `moonlight-common-c` integration for the PSP's MIPS architecture.
 
 **⚠️ CURRENT KNOWN PERSISTENT ERROR ⚠️**
 The client is currently experiencing a persistent connection error during the GameStream initialization sequence:
 `Status: FAILED: control stream establishment (0x00000074)`
 
-This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We are actively investigating UDP socket non-blocking behavior and packet routing on the MIPS architecture to resolve this.
+This is an `ETIMEDOUT` (Error 116) timeout stemming from the ENet network layer. We have implemented several PSP-specific socket workarounds and are currently verifying them on both real hardware and the PPSSPP emulator.
 
 **Hardware Support Phase**
-The project is currently entirely in a **testing phase** and is primarily developed and tested using the **PPSSPP emulator**. We are actively working toward achieving stable 60FPS streaming on authentic **real PSP-1000 hardware**, but due to the current control stream connection issues, physical deployment is highly volatile and untested. Please rely on PPSSPP for debugging.
+The project is currently in a **Beta Testing Phase**. While the core engine and protocol logic are functional, streaming stability is limited by ongoing network timing issues. We recommend using the **PPSSPP emulator** for all active debugging and contribution.
 
 ---
 
@@ -71,20 +73,25 @@ moonlight-psp-core/
 
 Developing and compiling the client requires a fully configured PSP homebrew environment.
 
-### Prerequisites
+### Quick Start (Linux / Jules VM)
 
-1. A modern shell development environment (Linux or WSL).
-2. The `pspdev` or `psptoolchain` package compiled, installed, and active in your system path.
-3. Relevant PSP SDK variables correctly mapped (e.g., `PSPDEV` and `PSPSDK`).
+If you are operating in a fresh Ubuntu VM, you can automate the entire environment setup (PSPSDK + Dependencies) using the provided script:
 
-### Compilation Process
+```bash
+cd moonlight-psp-core
+./jules_setup.sh
+make -j$(nproc)
+```
 
-Navigate to the root directory of this repository and invoke the standard deployment commands:
+### Manual Compilation Process (Host / WSL)
+
+1. Ensure `PSPSDK` is installed and the `PSPDEV` environment variable is set.
+2. Navigate to the root directory and invoke the standard build:
 
 ```bash
 cd moonlight-psp-core
 make clean
-make
+make -j$(nproc)
 ```
 
 ### Deployment

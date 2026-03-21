@@ -13,12 +13,23 @@ Thank you for your interest in contributing to the Moonlight PSP client! As a pr
 ## Setting Up Your Environment
 
 This project utilizes the standard `pspsdk` infrastructure. 
-We strongly recommend using the official [pspdev Docker image](https://github.com/pspdev/pspdev) to ensure your toolchain exactly matches the CI environment:
+
+### 1. Automated Setup (Recommended for Linux/VM)
+If you are developing in an Ubuntu environment or a VM, use the provided setup script to automate the toolchain and dependencies:
+
+```bash
+cd moonlight-psp-core
+./jules_setup.sh
+make -j$(nproc)
+```
+
+### 2. Docker Setup
+We also recommend using the official [pspdev Docker image](https://github.com/pspdev/pspdev) to ensure your toolchain exactly matches the CI environment:
 
 ```bash
 docker run -it -v "/path/to/moonlight-psp-core:/src" pspdev/pspdev:latest /bin/bash
 cd /src
-make clean && make
+make clean && make -j$(nproc)
 ```
 
 ## Pull Request Process

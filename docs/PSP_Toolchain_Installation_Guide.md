@@ -9,7 +9,18 @@ This guide provides detailed instructions for installing the PSP toolchain (psp-
 - Internet connection
 - Approximately 2-3 GB of free disk space
 
-## Step 1: Install MSYS2 (Recommended Approach)
+## RECOMMENDED: Automated Setup (Linux / Jules VM)
+
+If you have access to an Ubuntu environment or a VM (e.g., WSL2 or Jules VM), it is **highly recommended** to use the automated setup script. This script handles the toolchain and all dependencies in a single step:
+
+```bash
+cd moonlight-psp-core
+./jules_setup.sh
+```
+
+---
+
+## Step 1: Install MSYS2 (Alternative Approach for Native Windows)
 
 Since you don't have a Unix-like environment, we'll install MSYS2 which provides a Unix-like environment on Windows.
 

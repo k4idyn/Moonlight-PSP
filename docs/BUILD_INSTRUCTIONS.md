@@ -13,6 +13,20 @@ This document provides detailed build instructions for compiling the PSP Moonlig
 
 ---
 
+## RECOMMENDED: Automated Setup (Linux / Jules VM)
+
+For a simplified development experience, it is highly recommended to use the automated setup script. This script handles the installation of the PSPSDK, all necessary system dependencies, and cross-compiles ENet, mbedTLS, Opus, and Mini-XML specifically for the PSP architecture.
+
+```bash
+cd moonlight-psp-core
+./jules_setup.sh
+make -j$(nproc)
+```
+
+This ensures your environment matches the verified build configuration used by the core team.
+
+---
+
 ## 1. PSP Toolchain Setup
 
 ### 1.1 Installing psptoolchain
