@@ -1,328 +1,67 @@
 --- Moonlight Log Started ---
-[11754] [INFO] [MAIN] --- BOOTING PSP MOONLIGHT --- [RAM:45072KB]
-[162135] [INFO] [MAIN] Initializing PSP Moonlight V2... (Build: Mar 21 2026 19:57:29) [RAM:45056KB]
-[183491] [INFO] [NETWORK] Loading net modules (Exhaustive Absolute Perfection Recipe)... [RAM:45056KB]
-[308844] [INFO] [NETWORK] WLAN switch is OFF. (Ignoring for emulator compatibility) [RAM:42360KB]
-[309082] [INFO] [NETWORK] WLAN radio power is OFF. (Attempting wakeup via connect later) [RAM:42360KB]
-[314946] [INFO] [NETWORK] Found 1 saved WiFi profiles. [RAM:42360KB]
-[315182] [INFO] [NETWORK] Entering Wi-Fi Selector Loop... [RAM:42360KB]
-rStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-Generating 2048-bit RSA key...
-RSA gen result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-Seeding DRBG...
-DRBG seed result: 0
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
-XML payload received:
-<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200"><hostname>SER-8</hostname><appversion>7.1.431.-1</appversion><GfeVersion>3.23.0.74</GfeVersion><uniqueid>F3C105A3-722E-EC22-261E-80AD93162934</uniqueid><HttpsPort>47984</HttpsPort><ExternalPort>47989</ExternalPort><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC><mac>00:00:00:00:00:00</mac><Permission>0</Permission><LocalIP>10.0.0.73</LocalIP><ServerCodecModeSupport>197377</ServerCodecModeSupport><PairStatus>0</PairStatus><currentgame>0</currentgame><currentgameuuid/><state>SUNSHINE_SERVER_FREE</state></root>
-currentGameText: '0', pairedText: '0', appVersion: '7.1.431.-1', stateText: 'SUNSHINE_SERVER_FREE'
+[11754] [INFO] [MAIN] --- BOOTING PSP MOONLIGHT --- [RAM:45073KB]
+[162135] [INFO] [MAIN] Initializing PSP Moonlight V2... (Build: Mar 22 2026 05:42:24) [RAM:45057KB]
+[183491] [INFO] [NETWORK] Loading net modules (Exhaustive Absolute Perfection Recipe)... [RAM:45057KB]
+[308843] [INFO] [NETWORK] Already connected - skipping selector [RAM:42361KB]
+[309079] [INFO] [NETWORK] WiFi connected! [RAM:42361KB]
+[309314] [INFO] [NETWORK] WiFi connected! [RAM:42361KB]
+[309550] [INFO] [NETWORK] Local IP: 0.0.0.0 [RAM:42361KB]
+[309785] [INFO] [NETWORK] Local IP: 0.0.0.0 [RAM:42361KB]
+[390052] [INFO] [VIDEO] ME init OK: ES=0x1 target=0x8adab40 480x272 stride=512 [RAM:42313KB]
+[390373] [INFO] [AUDIO] sceAudioChReserve OK: ch=7 samples=1024 [RAM:42313KB]
+[390619] [INFO] [AUDIO] Audio initialized: ch=7 rate=48000 [RAM:42313KB]
+[390856] [INFO] [MAIN] All modules initialized successfully. [RAM:42313KB]
+[401150] [INFO] [MAIN] No hosts file found, using defaults. [RAM:42313KB]
+[401386] [INFO] [MAIN] Entering main loop... [RAM:42313KB]
+
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_get_display_properties2 (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_get_physical_device_properties2 (00000002)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_get_surface_capabilities2 (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_surface (00000019)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_surface_maintenance1 (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_surface_protected_capabilities (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_wayland_surface (00000006)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_xcb_surface (00000006)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_xlib_surface (00000006)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_acquire_drm_display (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_acquire_xlib_display (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_debug_report (0000000a)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_debug_utils (00000002)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_direct_mode_display (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_display_surface_counter (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_headless_surface (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_surface_maintenance1 (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_EXT_swapchain_colorspace (00000005)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_KHR_portability_enumeration (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:530 I[G3D]: VulkanMaybeAvailable: Instance extension found: VK_LUNARG_direct_driver_loading (00000001)
+43:59:689 Vulkan/VulkanLoader.cpp:568 I[G3D]: VulkanMayBeAvailable: Calling vkCreateInstance
+43:59:702 Vulkan/VulkanLoader.cpp:575 I[G3D]: VulkanMayBeAvailable: Vulkan test instance created successfully.
+43:59:702 Vulkan/VulkanLoader.cpp:578 E[G3D]: VulkanMayBeAvailable: Failed to count physical devices (VK_ERROR_INITIALIZATION_FAILED)
+43:59:702 Vulkan/VulkanLoader.cpp:642 I[G3D]: VulkanMayBeAvailable: Destroying instance
+43:59:703 Vulkan/VulkanLoader.cpp:649 W[G3D]: Vulkan with working device not detected.
+DEBUG: Vulkan is not available, not using Vulkan.
+Info: We compiled against SDL version 2.32.8 and we are linking against SDL version 2.32.8. :)
+43:59:738 Thread/ThreadManager.cpp:228 I[SYSTEM]: ThreadManager::Init(compute threads: 4, all: 8)
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /usr/local/share/ppsspp/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /opt/ppsspp/bin/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /opt/ppsspp/bin
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /usr/local/share/ppsspp/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /usr/local/share/games/ppsspp/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /usr/share/ppsspp/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /usr/share/games/ppsspp/assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : assets
+43:59:738 VFS/VFS.cpp:14 D[IO]: Registered VFS for prefix : /home/jules
+43:59:738 Core/Config.cpp:415 I[G3D]: Longest display side: 960 pixels. Choosing scale 1
+43:59:738 Core/Config.cpp:1578 N[AUDIO]: Secondary instance 13 - silencing audio
+OpenGL 2.0 or higher.
+ALSA lib confmisc.c:855:(parse_card) [error.core] cannot find card '0'
+ALSA lib conf.c:5207:(_snd_config_evaluate) [error.core] function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) [error.core] error evaluating strings
+ALSA lib conf.c:5207:(_snd_config_evaluate) [error.core] function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1342:(snd_func_refer) [error.core] error evaluating name
+ALSA lib conf.c:5207:(_snd_config_evaluate) [error.core] function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5730:(snd_config_expand) [error.core] Evaluate error: No such file or directory
+ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default
+44:00:300 SDL/SDLMain.cpp:188 E[AUDIO]: Failed to open audio device 'ALSA: Couldn't open audio device: No such file or directory', second try. Giving up.
+44:00:316 Core/System.cpp:620 N[BOOT]: PPSSPP v1.20.3
+44:00:503 idle0        N[BOOT]: UI/EmuScreen.cpp:392 Booted /app/EBOOT.PBP...

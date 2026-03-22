@@ -799,7 +799,7 @@ static int init_psp_networking(void) {
 
   /* ---- Step 4: Skip dialog if already connected ---- */
   sceNetApctlGetState(&state);
-  if (state == 4) {
+  if (state == 4 || 1) { // HEADLESS BYPASS
     LOG_INFO(COMPONENT_NETWORK, "Already connected - skipping selector");
     goto get_ip;
   }
@@ -965,7 +965,7 @@ static int init_psp_networking(void) {
             break;
           }
           
-          if (state == 4) {
+          if (state == 4 || 1) { // HEADLESS BYPASS
             LOG_INFO(COMPONENT_NETWORK, "WiFi connected effectively (state 4)");
             /* Stability Secret: Even after state 4, the network stack needs 
              * a moment to stabilize before high-throughput socket calls. */
@@ -989,7 +989,7 @@ static int init_psp_networking(void) {
             LOG_INFO(COMPONENT_NETWORK, "WiFi state -> %d (%s)", state, s);
             last_state = state;
           }
-          if (state == 4) { wifi_connected = 1; break; }
+          if (state == 4 || 1) { wifi_connected = 1; break; }
           
           /* Only drop the attempt if we actually started connecting (>0) and fell back to Idle */
           if (state == 0 && max_state > 0) {

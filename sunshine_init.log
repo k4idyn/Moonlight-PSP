@@ -1,0 +1,51 @@
+[2026-03-22 05:17:58.291232] [0x00007f244dc22000] [info]    config: 'capture_screen' = 0
+[2026-03-22 05:17:58.291431] [0x00007f244dc22000] [info]    config: 'x264_preset' = ultrafast
+[2026-03-22 05:17:58.291438] [0x00007f244dc22000] [info]    config: 'bitrate' = 1000
+[2026-03-22 05:17:58.291442] [0x00007f244dc22000] [info]    config: 'min_threads' = 2
+[2026-03-22 05:17:58.291446] [0x00007f244dc22000] [info]    config: 'fec_percentage' = 20
+[2026-03-22 05:17:58.291449] [0x00007f244dc22000] [info]    config: 'max_threads' = 4
+[2026-03-22 05:17:58.291453] [0x00007f244dc22000] [info]    config: 'encoder' = software
+Warning: Unrecognized configurable option [capture_screen]
+Warning: Unrecognized configurable option [x264_preset]
+Warning: Unrecognized configurable option [bitrate]
+Warning: Unrecognized configurable option [max_threads]
+[2026-03-22 05:17:58.296]: Info: Sunshine version: 2025.924.154138 commit: 86188d47a7463b0f73b35de18a628353adeaa20e
+[2026-03-22 05:17:58.297]: Info: Package Publisher: LizardByte
+[2026-03-22 05:17:58.297]: Info: Publisher Website: https://app.lizardbyte.dev
+[2026-03-22 05:17:58.297]: Info: Get support: https://app.lizardbyte.dev/support
+[2026-03-22 05:17:58.297]: Info: config: 'encoder' = software
+[2026-03-22 05:17:58.297]: Info: config: 'max_threads' = 4
+[2026-03-22 05:17:58.297]: Info: config: 'fec_percentage' = 20
+[2026-03-22 05:17:58.297]: Info: config: 'min_threads' = 2
+[2026-03-22 05:17:58.297]: Info: config: 'bitrate' = 1000
+[2026-03-22 05:17:58.297]: Info: config: 'x264_preset' = ultrafast
+[2026-03-22 05:17:58.297]: Info: config: 'capture_screen' = 0
+Cannot load libcuda.so.1
+[2026-03-22 05:17:58.303]: Error: Couldn't load cuda: -1
+[2026-03-22 05:17:58.303]: Warning: Couldn't find /dev/dri, kmsgrab won't be enabled
+[2026-03-22 05:17:58.303]: Info: Detecting displays
+[2026-03-22 05:17:58.309]: Error: Unable to initialize capture method
+[2026-03-22 05:17:58.309]: Error: Platform failed to initialize
+[2026-03-22 05:17:58.310]: Warning: Unable to create virtual mouse: No such file or directory
+[2026-03-22 05:17:58.310]: Warning: Unable to create virtual keyboard: No such file or directory
+[2026-03-22 05:17:58.311]: Warning: Gamepad xone is disabled due to No such file or directory
+[2026-03-22 05:17:58.311]: Warning: Gamepad ds5 is disabled due to No such file or directory
+[2026-03-22 05:17:58.311]: Warning: Gamepad switch is disabled due to No such file or directory
+[2026-03-22 05:17:58.311]: Warning: No gamepad input is available
+[2026-03-22 05:17:58.311]: Info: Trying encoder [software]
+[2026-03-22 05:17:58.712]: Info: Encoder [software] failed
+[2026-03-22 05:17:58.712]: Error: Couldn't find any working encoder matching [software]
+[2026-03-22 05:17:58.712]: Info: // Testing for available encoders, this may generate errors. You can safely ignore those errors. //
+[2026-03-22 05:17:58.712]: Info: Trying encoder [nvenc]
+[2026-03-22 05:17:59.112]: Info: Encoder [nvenc] failed
+[2026-03-22 05:17:59.113]: Info: Trying encoder [vaapi]
+[2026-03-22 05:17:59.513]: Info: Encoder [vaapi] failed
+[2026-03-22 05:17:59.513]: Fatal: Unable to find display or encoder during startup.
+[2026-03-22 05:17:59.513]: Fatal: Please check that a display is connected and powered on.
+[2026-03-22 05:17:59.513]: Error: Video failed to find working encoder
+[2026-03-22 05:17:59.514]: Info: Open the Web UI to set your new username and password and getting started
+[2026-03-22 05:17:59.517]: Info: Starting system tray
+[2026-03-22 05:17:59.526]: Info: Configuration UI available at [https://localhost:47990]
+[2026-03-22 05:17:59.534]: Warning: Failed to create system tray
+[2026-03-22 05:17:59.534]: Info: Starting main loop
+[2026-03-22 05:17:59.536]: Error: Failed to create client: Daemon not running
