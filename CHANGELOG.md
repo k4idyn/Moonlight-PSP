@@ -1,0 +1,273 @@
+# Changelog
+
+All notable changes to PSP Moonlight are documented here.
+
+v0.2.0-beta is the first public release of this codebase. For the history of the original
+`moonlight-psp-core` project (the prior public alpha that used `sceMpeg` + `moonlight-common-c`),
+see the [archived repo](https://github.com/k4idyn/Moonlight-PSP). Nothing from that codebase
+carries into this one — it's a clean-sheet rewrite. The internal dev milestones below were
+never published; they're documented here so the commit history makes sense.
+
+---
+
+## [0.2.0-beta] — 2026-04-11 — First Public Release
+
+**This is the first public beta.** The pipeline is proven on real PSP-1000 hardware at
+15–18 fps with zero visual artifacts over 3-minute sessions. The architecture is stable
+enough to publish for broader hardware testing.
+
+### What works
+- Wi-Fi connect + host discovery (LAN mDNS probe + manual IP entry)
+- TLS 1.2 pairing with Sunshine (RSA + ECDH + AES-GCM, 5-step protocol)
+- Game library fetch + box art icon cache (ms0:)
+- RTSP session setup (custom, Sunshine Gen7, no moonlight-common-c)
+- UDP video receive + Reed-Solomon FEC (up to 66% parity)
+- H.264 Baseline decode (FFmpeg libavcodec, CAVLC only)
+- VFPU YUV→RGBA on Media Engine (~31 µs/frame, >99.9% success)
+- Opus stereo audio decode (48 kHz, fixed-point Silk+CELT)
+- Controller input forwarding (all PSP buttons mapped, L+D-pad virtual L2/R2)
+- Dual-mode watchdog with auto-restart (ME hang recovery, RTP stall recovery)
+- HUD overlay, signal strength monitor, safety buffer, power switch suspend
+
+### Known gaps
+- No deblocking filter (ME bandwidth constraint)
+- Single-buffered display (tearing on fast motion)
+- No 30 fps support yet (overhead ceiling at ~18 fps on PSP-1000 at 500 kbps)
+
+---
+
+## [INTERNAL — 0.3.0-alpha] — 2026-04-11
+
+> *Never published. Internal dev checkpoint.*
+
+### Architecture — FFmpeg Dual-Core Pipeline
+
+Replaced hand-rolled CAVLC+VFPU orchestrated path with **FFmpeg libavcodec** as the H.264
+frontend. The ME is retained solely for YUV→RGBA, running concurrently with FFmpeg decode.
+
+#### Added
+- `ffmpeg_decode.c` — FFmpeg H.264 decode + ME YUV→RGBA dispatch
+  - Double-buffered AVFrame pool (zero-copy ME dispatch)
+  - Dual-mode watchdog: Mode A (FFmpeg CPU hang >500ms), Mode B (RTP stall >3s)
+  - Force-restart: `sceKernelTerminateThread` + `ffmpeg_pipeline_abandon()` + reinit + new thread
+  - Early-skip gate: unconditional non-IDR drop when `g_refs_corrupted == 1` (zero visual artifacts)
+  - `ffmpeg_pipeline_flush_buffers()` — flushes FFmpeg AVCodec + clears ME state
+  - `ffmpeg_pipeline_abandon()` — nulls globals without free for crash-safe recovery
+- `stream_resolution.c` / `stream_resolution.h` — unified resolution table; eliminates hardcoded 480/272 scattered across decode, display, and buffer alloc
+- `decode_flags.h` — shared decode state flags and watchdog counter declarations
+- `sw_decoder_thread.c` — complete rewrite: dual-mode watchdog, force-restart, ring backlog safety net
+
+#### Fixed
+- **Display freeze (run 070):** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` stuck in permanent `EAGAIN`, destroying arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` now called from overrun handler.
+- **ME data cache bug:** Switched ME buffer pointers from uncached (`0x48xxxxxx`) to cached addresses with pre/post dcache flush. YUV→RGBA went from 47,000 µs → 31 µs (1,500× improvement).
+- **ME crash recovery:** Single-shot ME disable replaced with KillME+reinit retry (up to 3 recoveries).
+
+#### Performance (500 kbps @ 15 fps target)
+- **17.9 fps** sustained
+- **25/25 screenshots clean**
+- **Full 180s** — no stalls, no freezes
+
+---
+
+## [INTERNAL — 0.2.0-alpha] — 2026-04-08
+
+> *Never published. Internal dev checkpoint.*
+
+### ENet Per-Channel Sequence Bug Fix
+
+- `control_stream.c`: Replaced two shared reliable sequence counters with `reliable_seq_per_ch[CTRL_CHANNEL_COUNT]` array (48 entries). Each channel now starts at seq 1.
+  - **Root cause:** Pings on channel 0x00 and input on channel 0x10 shared a counter. Server expected seq #1 on channel 0x10; counter was at 200+ when first input packet arrived. All input silently dropped, no errors logged.
+  - **Symptom:** `[INP] Button transition` confirmed in logs, correct packets sent, zero effect on host. All 11 screenshots were identical.
+
+---
+
+## [INTERNAL — 0.1.5-alpha] — 2026-04-07
+
+> *Never published. Internal dev checkpoint.*
+
+### RTP/FEC Corruption Gating
+
+- `rtp_fec.c` RS failure path now sets `g_refs_corrupted=1` (previously skipped)
+- `rtp_reassembly.c` seq-gap frames now set `g_refs_corrupted=1` (previously only dropped)
+- **Result:** 100% clean frames (25/25) vs 56% (prior run). Zero visual artifacts.
+
+### IDR Flooding Fix
+
+- `rtp_fec.c` unrecoverable drop path now checks `g_refs_corrupted` before requesting IDR:
+  - `== 0` → use RFI (Reference Frame Invalidation) — DPB intact, ask encoder for partial intra
+  - `!= 0` → request full IDR
+  - **Result:** IDR requests dropped 98% (123 → 2 per session); RFI handles the rest
+
+---
+
+## [INTERNAL — 0.1.0-alpha] — 2026-04-05
+
+> *Never published. First hardware test checkpoint.*
+
+### Overview
+
+First end-to-end streaming confirmation on real PSP-1000 hardware. Custom asymmetric
+dual-core CAVLC+VFPU pipeline. Baseline 15+ fps sustained streaming confirmed.
+
+### Dual-Core CAVLC + VFPU Pipeline (original)
+- `sw_cavlc.c` — H.264 Baseline CAVLC entropy decoder (CPU)
+  - Full SPS/PPS, I16×16, I4×4, P-frame, P_SKIP
+  - Exp-Golomb + Golomb-Rice coefficient parsing, emulation prevention byte removal
+- `sw_vfpu_recon.c` — VFPU-accelerated reconstruction (ME)
+  - 45-instruction vectorised 4×4 IDCT, zero scalar loops
+  - Hadamard 4×4 butterfly (spec-correct order)
+  - All 9 I4×4 intra prediction modes
+  - Inter prediction with half-pixel luma interpolation
+  - P_SKIP optimisation: reference plane memcpy bypass (~95% MB skip for static scenes)
+- `sw_me_worker.c` — ME job worker, semaphore sync (`BeginME`/`WaitME`)
+- `sw_decode_orchestrator.c` — CAVLC→ME handoff coordinator
+
+---
+
+## [moonlight-psp-core] — Public Alpha Archive (separate repo)
+
+> Prior project: [github.com/k4idyn/Moonlight-PSP](https://github.com/k4idyn/Moonlight-PSP)
+> Architecture: `moonlight-common-c` + `sceMpegAvcDecode` + ENet + Opus + mbedTLS + MXML
+> Status: Abandoned. Never decoded a frame. Final open issue: `0x80` ENOTCONN on control stream.
+
+### v0.1.0.3-alpha — Architectural Cleanup
+- Header guard standardization (`MOONLIGHT_*_H` convention) applied project-wide
+- XML parsing layer in `xml.c` refactored to use public Mini-XML 3.x accessor APIs (ABI safety)
+- Toolchain: replaced hardcoded Windows drive paths with dynamic `psp-config --pspsdk-path`
+- Makefile library link order fixed for `psp-fixup-imports` requirements
+- Verified: PPSSPP network init + pairing PIN generation successful; `EBOOT.PBP` = 1,794,994 bytes
+
+### v0.1.0.2-alpha — Architectural Stabilization
+- **Root cause identified:** `0x80020320` (too many open files) error during pairing/certificate load
+  - `libgamestream` HTTP used POSIX `close()` on sockets; PSP requires `closeSocket()` (`sceNetInetClose`)
+  - High-frequency logger (50+ open/write/close cycles/sec) overwhelmed the PSP FAT driver's async close queue, leaking handles until the kernel limit was hit
+- `logger.c` rewritten with a single persistent global file handle opened at boot
+- `http.c` and TLS cleanup macros patched to use `closeSocket()` throughout
+- Known issue remaining: `0x80` (ENOTCONN) — connection to control stream ends prematurely; suspected ENet handshake failure or Sunshine server rejection
+
+### v0.1.0.1-alpha — Standalone Build Verification
+- First fully standalone build: all dependencies (mbedTLS, ENet, Opus, MXML) bundled in-repo
+- No manual pre-compiled dependency step required
+- Clean-room build on Windows verified with PSPSDK toolchain
+
+### v0.1.0-alpha — Initial Alpha Build
+- Initial alpha release of `moonlight-psp-core`
+- Functional but in active debugging phase at time of release
+
+---
+
+## [0.3.0-alpha] — 2026-04-11
+
+### Architecture: FFmpeg Dual-Core Pipeline (Full Replacement)
+
+Replaced the hand-rolled CAVLC+VFPU orchestrated pipeline with **FFmpeg libavcodec** as the H.264 decode frontend. The ME is retained for YUV→RGBA conversion, running concurrently with FFmpeg decode on the main CPU.
+
+#### Added
+- **`ffmpeg_decode.c`** — FFmpeg libavcodec H.264 decode + ME YUV→RGBA dispatch
+  - Double-buffered AVFrame pool (zero-copy ME dispatch)
+  - Dual-mode watchdog: Mode A (FFmpeg CPU hang >3s), Mode B (RTP stall >5s)
+  - Force-restart sequence with ME re-init and ring/counter reset
+  - Watchdog credit restoration (1 restart slot restored per 15s clean window)
+  - Early-skip: unconditional non-IDR skip when `g_refs_corrupted` set (zero visual artifacts)
+  - Adaptive `me_stressed` detection (>500ms ME decode → stress flag)
+  - `ffmpeg_pipeline_flush_buffers()` — flushes FFmpeg AVCodec + clears ME state
+  - `ffmpeg_pipeline_abandon()` — nulls globals without free for crash recovery
+- **`stream_resolution.c`** / **`stream_resolution.h`** — unified resolution table; eliminates hardcoded 480/272 scattered across decode, display, and buffer allocation
+- **`decode_flags.h`** — shared decode state flags and watchdog counter declarations
+- `sw_decoder_thread.c` — complete rewrite: dual-mode watchdog, force-restart, ring backlog safety net, static-local reset via `g_decode_counters_reset_pending`
+
+#### Fixed
+- **Display freeze bug (run 070):** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` permanently returned `EAGAIN`, causing infinite overrun loop that destroyed arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` called from overrun handler.
+- **ME crash recovery:** Permanent ME disable after first crash replaced with KillME+reinit retry (up to 3 recoveries). 11/11 ME timeouts recovered in testing.
+- **ME data cache bug:** Switched ME buffer pointers from uncached (`0x48xxxxxx`) to cached addresses with pre/post dcache flush. Eliminated bus-error ME crashes at 640×360. YUV→RGBA: 47,000 µs → 31 µs (1500× faster).
+- **Resume/quit dialog** re-enabled (`prompt_existing_session_action()`, `/resume` endpoint).
+- **Connection retry:** Auto-retry RTSP launch once after 2s on failure.
+
+#### Performance (VQ#16 — 500 kbps @ 15 fps)
+- **17.9 fps** sustained (exceeds 15 fps target)
+- **25/25 screenshots clean** — zero artifacts
+- **Full 180s** — no stalls, no freezes
+- ME decode: 19–31 ms/frame (32–51.5 fps capable on ME alone)
+
+---
+
+## [0.2.0-alpha] — 2026-04-08
+
+### ENet Per-Channel Sequence Bug Fix
+
+- **`control_stream.c`:** Replaced two shared reliable sequence counters with `reliable_seq_per_ch[CTRL_CHANNEL_COUNT]` array (48 entries). Each channel now starts at seq 1.
+  - **Root cause:** Pings on channel 0x00 and input on channel 0x10 shared a counter. By the time the first input packet was sent, the shared counter was at 200+. Server expected seq #1 on channel 0x10, buffered packet forever. All input silently dropped.
+  - **Symptom:** `[INP] Button transition` in logs, no `Send FAILED`, but all 11 screenshots identical.
+
+---
+
+## [0.1.5-alpha] — 2026-04-07
+
+### RTP/FEC Corruption Gating
+
+- **`rtp_fec.c`:** RS failure path sets `g_refs_corrupted=1` (previously skipped)
+- **`rtp_reassembly.c`:** Seq-gap frames set `g_refs_corrupted=1` (previously only dropped)
+- **Result (VQ#6):** 100% clean frames (25/25) vs 56% clean (VQ#5b). Zero visual artifacts.
+
+### IDR Flooding Fix
+
+- **`rtp_fec.c`:** Unrecoverable drop path now checks `g_refs_corrupted` before requesting IDR:
+  - `g_refs_corrupted == 0` → use lightweight RFI (Reference Frame Invalidation) — DPB intact
+  - `g_refs_corrupted != 0` → request IDR (legitimate corruption)
+  - `g_last_good_frame == 0` → request IDR (no reference)
+  - **Result:** IDR requests dropped 98% (123 → 2 per session); RFI requests replaced wasteful IDRs
+
+---
+
+## [0.1.0-alpha] — 2026-04-05 (first hardware test checkpoint)
+
+### Overview
+
+First hardware test checkpoint. Custom asymmetric dual-core CAVLC+VFPU pipeline. Confirmed working for 15+ fps sustained streaming on real PSP-1000 hardware.
+
+#### Dual-Core CAVLC + VFPU Pipeline (original)
+- **`sw_cavlc.c`** — H.264 Baseline CAVLC entropy decoder (CPU)
+  - Full SPS/PPS, I16×16, I4×4, P-frame, P_SKIP
+  - Exp-Golomb + Golomb-Rice coefficient parsing
+  - Emulation prevention byte removal
+- **`sw_vfpu_recon.c`** — VFPU-accelerated reconstruction (ME)
+  - Fully vectorised 4×4 IDCT: 45 VFPU instructions, zero scalar loops
+  - Hadamard 4×4 butterfly (spec-correct order)
+  - All 9 I4×4 intra prediction modes
+  - Inter prediction with half-pixel luma interpolation
+  - P_SKIP optimisation: reference plane memcpy bypass (~95% MB skip for static scenes)
+- **`sw_me_worker.c`** — ME job worker with semaphore sync (`BeginME`/`WaitME`)
+- **`sw_decode_orchestrator.c`** — CAVLC→ME handoff coordinator
+- **`sw_decoder_thread.c`** — Decoder thread entry point
+
+#### H.264 Bug Fixes (found during VFPU integration)
+- **Hadamard butterfly permutation:** Outputs 1/2/3 were cyclically wrong; corrected to spec `z0±z3, z1±z2`
+- **I16×16 DC double-dequant:** DC inserted before `dequant_4x4_vfpu` caused double-scaling
+- **Chroma DC double-dequant:** Same bug in P-frame and intra chroma paths
+- **Chroma cbp==1 IDCT skip:** DC residual only reached pixel (0,0); fix: always IDCT when DC present
+
+#### USB Stability Fix (run 041)
+- PSPLink keepalive loop replaces `Start-Sleep` during stream
+- `-NoKill` flag on `Invoke-PspSh` prevents VRAM overlay on timeout
+- Increased yields: 1.5ms/frame + 0.5ms/batch + priority 0x20
+
+#### Networking & Protocol (initial)
+- Moonlight Generation 7 (clientVersion 19)
+- Encrypted RTSP (AES-GCM)
+- Sunshine 8-byte frame header skip
+- 1024-slot UDP packet ring (1500 B slots)
+- IDR request burst (0x0302, 3×) on queue overrun
+- Reed-Solomon FEC (up to 66% parity)
+- Opus stereo (48 kHz, fixed-point Silk+CELT)
+
+#### VFPU Hardware Notes Discovered
+- `mfv` (VFPU→GP) always returns 0 on ME core — use `sv.s`/`sv.q` instead
+- `vi2uc.q` produces wrong output on real PSP — not usable for YUV→RGBA
+- Uncached ME addresses crash the ME — use cached aliases only
+- PS2 VU0 instructions (`vftoi0`, `vmad.q`) do not exist on PSP VFPU
+
+---
+
+## [0.0.1-archive] — prior attempt (moonlight-common-c + sceMpeg)
+
+Abandoned. Used `moonlight-common-c`, ENet, `libgamestream`, and `sceMpegAvcDecode`. The `sceMpeg` ringbuffer requires MPEG-PS framing; incompatible with the Moonlight RTP stream model. Threading model conflicts between ENet and PSP fixed-stack kernel threads caused additional instability. Archived in `Clean Build Old Github`.

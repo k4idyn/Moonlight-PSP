@@ -1,0 +1,164 @@
+/*
+ * diag_log.c — Diagnostic logger for PSP Moonlight
+ *
+ * Writes every log line to BOTH ms0: and host0: simultaneously so logs
+ * are always available regardless of which path the tool reads from.
+ * Also mirrors every line to Kprintf (UsbKprintf → pspsh console).
+ *
+ * Thread safety: PSP kernel semaphore protects the shared buffer.
+ */
+
+#include <pspkernel.h>
+#include <pspiofilemgr.h>
+#include <psptypes.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+#include "diag_log.h"
+
+/* ---------- debug/retail toggle ---------- */
+#ifdef RETAIL_BUILD
+int g_debug_logging = 0;  /* retail: logs off by default */
+#else
+int g_debug_logging = 1;  /* debug: logs on by default */
+#endif
+
+void diag_log_set_debug(int enable)
+{
+    g_debug_logging = enable ? 1 : 0;
+}
+
+/* ---------- paths ---------- */
+#define LOG_PATH_MS    "ms0:/moonlight.log"
+#define LOG_PATH_HOST  "host0:/moonlight.log"
+
+/* ---------- buffer ---------- */
+#define LOG_BUF_SIZE  4096
+#define LOG_LINE_MAX  512
+#define FLUSH_THRESH  (LOG_BUF_SIZE - LOG_LINE_MAX - 64)
+
+static char  s_buf[LOG_BUF_SIZE];
+static int   s_buf_pos = 0;
+static int   s_first_write = 1;  /* truncate log on first write each load */
+
+/* ---------- thread safety ---------- */
+static SceUID s_sem = -1;
+
+static void ensure_init(void)
+{
+    if (s_sem < 0) {
+        s_sem = sceKernelCreateSema("diag_log", 0, 1, 1, NULL);
+    }
+}
+
+/* ---------- write buffer to a single path ---------- */
+static void write_to_path(const char *path)
+{
+    int flags = PSP_O_WRONLY | PSP_O_CREAT;
+    if (s_first_write) {
+        flags |= PSP_O_TRUNC;
+        s_first_write = 0;
+    } else {
+        flags |= PSP_O_APPEND;
+    }
+    SceUID fd = sceIoOpen(path, flags, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, s_buf, (SceSize)s_buf_pos);
+        sceIoClose(fd);
+    }
+}
+
+/* ---------- internal flush (caller holds semaphore) ---------- */
+static void flush_locked(void)
+{
+    if (s_buf_pos == 0) return;
+
+    /* Write to ms0: only.  host0: writes go through psplink USB and
+     * can block if pspsh is simultaneously issuing commands (scrshot,
+     * cp, etc.), causing a deadlock: the diag_log semaphore is held
+     * while host0: blocks, so every other thread that tries to log
+     * also freezes.  ms0: writes are local and non-contended. */
+    write_to_path(LOG_PATH_MS);
+
+    s_buf_pos = 0;
+}
+
+/* ---------- public API ---------- */
+
+void diag_log_write(const char *tag, const char *fmt, ...)
+{
+    va_list ap;
+    char   line[LOG_LINE_MAX];
+    int    len;
+    u32    raw_us, sec, ms;
+
+    /* Retail mode: suppress all logs except FATAL tag */
+    if (!g_debug_logging && tag[0] != 'F') return;  /* 'F' = FATAL */
+
+    ensure_init();
+
+    /* timestamp — cheap, no heap */
+    raw_us = sceKernelGetSystemTimeLow();
+    sec = (raw_us / 1000000) % 10000;
+    ms  = (raw_us / 1000) % 1000;
+
+    /* build "[SSSS.mmm] [TAG] message" */
+    len = snprintf(line, sizeof(line), "[%04d.%03d] [%s] ",
+                   (int)sec, (int)ms, tag);
+    va_start(ap, fmt);
+    len += vsnprintf(line + len, sizeof(line) - (size_t)len, fmt, ap);
+    va_end(ap);
+    if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+
+    /* Mirror to Kprintf (shows in pspsh console via UsbKprintf).
+     * DISABLED: printf/Kprintf goes through USB and can block indefinitely
+     * if pspsh console buffer is full, hanging the calling thread.
+     * ms0: log is sufficient for diagnostics. */
+    /* printf("%s", line); */
+
+    if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
+
+    /* auto-flush if this line would overflow */
+    if (s_buf_pos + len >= LOG_BUF_SIZE) {
+        flush_locked();
+    }
+
+    memcpy(s_buf + s_buf_pos, line, (size_t)len);
+    s_buf_pos += len;
+
+    /* proactive flush when buffer is getting full */
+    if (s_buf_pos >= FLUSH_THRESH) {
+        flush_locked();
+    }
+
+    sceKernelSignalSema(s_sem, 1);
+}
+
+void diag_log_flush(void)
+{
+    ensure_init();
+    if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
+    flush_locked();
+    sceKernelSignalSema(s_sem, 1);
+}
+
+void diag_log_clear(void)
+{
+    ensure_init();
+    if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
+
+    s_buf_pos = 0;
+
+    sceIoRemove(LOG_PATH_MS);
+    sceIoRemove(LOG_PATH_HOST);
+    /* legacy cleanup */
+    sceIoRemove("host0:/moonlight_live.log");
+    sceIoRemove("ms0:/diag.log");
+    sceIoRemove("ms0:/net.log");
+    sceIoRemove("ms0:/moonlight_debug.log");
+    sceIoRemove("ms0:/hello_test.txt");
+    sceIoRemove("ms0:/applist_dump.xml");
+
+    sceKernelSignalSema(s_sem, 1);
+}

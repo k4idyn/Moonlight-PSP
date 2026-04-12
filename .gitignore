@@ -1,0 +1,58 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.prx
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+# Allow pre-compiled PSP libraries in lib/
+!lib/*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+EBOOT.PBP
+*.elf
+*.pbp
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Build directories
+build/
+bin/
+obj/
+
+# Build temporaries
+_all_objs.a
+*.SFO
+
+# Log / dump artifacts
+*.log
+*.txt

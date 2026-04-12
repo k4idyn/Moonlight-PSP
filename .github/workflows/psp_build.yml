@@ -1,0 +1,53 @@
+name: PSP Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    name: Build EBOOT.PBP
+    runs-on: ubuntu-latest
+    container:
+      image: pspdev/pspdev:latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Build ME helper PRX
+      run: |
+        cd moonlight_me_helper
+        make -j$(nproc)
+
+    - name: Build main application
+      run: make -j$(nproc)
+
+    - name: Verify outputs
+      run: |
+        ls -lh EBOOT.PBP moonlight.prx moonlight_me_helper/moonlight_me_helper.prx
+        echo "Build successful."
+
+    - name: Upload EBOOT.PBP
+      uses: actions/upload-artifact@v4
+      with:
+        name: moonlight-psp-${{ github.sha }}
+        path: |
+          EBOOT.PBP
+          moonlight_me_helper/moonlight_me_helper.prx
+        if-no-files-found: error
+
+    - name: Upload to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          EBOOT.PBP
+          moonlight_me_helper/moonlight_me_helper.prx
+
