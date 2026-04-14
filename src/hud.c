@@ -18,6 +18,7 @@
 #include "stream_session.h"
 #include "safety_buffer.h"
 #include "ui_manager.h"
+#include "diag_log.h"
 
 /*============================================================================
  * Constants
@@ -213,16 +214,28 @@ int hud_handle_input(u32 buttons)
     if (!g_initialized)
         return 0;
 
-    /* Toggle HUD on Note only. Reserve Home for the PSP system exit path. */
-    if (button_pressed(buttons, PSP_CTRL_NOTE)) {
-        g_hud_visible = !g_hud_visible;
-        if (g_hud_visible) {
-            g_selected_item = 0;  /* Reset selection when opening */
+    /* Toggle HUD on R+Up combo (PSP_CTRL_NOTE is kernel-mode only and
+     * invisible to user-mode sceCtrlPeekBufferPositive).  Both R-trigger and
+     * D-pad Up must be pressed together; the combo is debounced so it only
+     * fires on the rising edge. */
+    int combo_toggled = 0;
+    {
+        int combo_held = (buttons & PSP_CTRL_RTRIGGER) && (buttons & PSP_CTRL_UP);
+        int combo_prev = (g_prev_buttons & PSP_CTRL_RTRIGGER) && (g_prev_buttons & PSP_CTRL_UP);
+        if (combo_held && !combo_prev) {
+            g_hud_visible = !g_hud_visible;
+            combo_toggled = 1;
+            diag_log_write("HUD", "Toggle %s (btn=0x%08X)\n",
+                           g_hud_visible ? "ON" : "OFF", buttons);
+            if (g_hud_visible) {
+                g_selected_item = 0;  /* Reset selection when opening */
+            }
         }
     }
 
-    /* Handle navigation when HUD is visible */
-    if (g_hud_visible) {
+    /* Handle navigation when HUD is visible (skip on the combo toggle frame
+     * to prevent the Up component of R+Up from navigating the menu). */
+    if (g_hud_visible && !combo_toggled) {
         /* Navigate menu with Up/Down */
         if (button_pressed(buttons, PSP_CTRL_UP)) {
             g_selected_item--;
@@ -241,7 +254,8 @@ int hud_handle_input(u32 buttons)
             if (g_selected_item == MENU_ITEM_QUIT) {
                 quit_selected = 1;
                 g_hud_visible = 0;  /* Hide HUD */
-                abort_stream_to_menu();  /* Return to menu instead of exiting */
+                /* Teardown handled by main.c — do NOT call abort_stream_to_menu here
+                 * or double-teardown occurs and main.c falls through to sceKernelExitGame */
             } else if (g_selected_item == MENU_ITEM_PAUSE) {
                 quit_selected = 2;  /* 2 = pause (return to menu, keep host session) */
                 g_hud_visible = 0;

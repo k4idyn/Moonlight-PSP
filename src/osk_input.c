@@ -270,7 +270,7 @@ int osk_get_ip_input(char *out_ip, int max_len)
         }
 
         /* Footer */
-        ui_draw_footer_hint("D-pad:Move  X:Press  Start:Confirm  O:Cancel");
+        ui_draw_footer_hint("{DP}: Move  {X}: Press  {ST}: Confirm  {O}: Cancel");
         ui_end_frame();
         /* No extra sceKernelDelayThread — ui_end_frame syncs vblank (16ms) */
     }
@@ -467,7 +467,135 @@ int osk_get_resolution_input(int *out_width, int *out_height)
             }
         }
 
-        ui_draw_footer_hint("D-pad:Move  X:Press  Start:Confirm  O:Cancel");
+        ui_draw_footer_hint("{DP}: Move  {X}: Press  {ST}: Confirm  {O}: Cancel");
+        ui_end_frame();
+    }
+}
+
+/* =========================================================================
+ * FPS keypad
+ * ========================================================================= */
+static int validate_fps(const char *buf, int *out_fps)
+{
+    int fps = 0;
+    if (sscanf(buf, "%d", &fps) != 1) return 0;
+    if (fps < 1 || fps > 144) return 0;
+    *out_fps = fps;
+    return 1;
+}
+
+int osk_get_fps_input(int *out_fps)
+{
+    char buf[RES_MAX_LEN + 1];
+    int  buflen  = 0;
+    int  sel_row = 0;
+    int  sel_col = 0;
+    int  row, col;
+    int  flash_timer = 0;
+    SceCtrlData pad, prev;
+
+    if (!out_fps) return -3;
+
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+
+    memset(buf, 0, sizeof(buf));
+    memset(&pad,  0, sizeof(pad));
+    memset(&prev, 0, sizeof(prev));
+
+    /* Flush stale button state */
+    {
+        int flush_iters = 0;
+        do {
+            sceCtrlPeekBufferPositive(&pad, 1);
+            sceKernelDelayThread(16667);
+            flush_iters++;
+        } while (pad.Buttons != 0 && flush_iters < 60);
+    }
+
+    sceCtrlPeekBufferPositive(&pad, 1);
+    memcpy(&prev, &pad, sizeof(pad));
+
+    while (1) {
+        u32 pressed;
+        extern volatile unsigned int g_remote_buttons;
+        memcpy(&prev, &pad, sizeof(pad));
+        sceCtrlPeekBufferPositive(&pad, 1);
+        pad.Buttons |= g_remote_buttons; g_remote_buttons = 0;
+        pressed = pad.Buttons & ~prev.Buttons;
+
+        /* CANCEL: Circle */
+        if (pressed & PSP_CTRL_CIRCLE)
+            return -1;
+
+        /* CONFIRM: Start */
+        if (pressed & PSP_CTRL_START) {
+            int fps;
+            if (validate_fps(buf, &fps)) {
+                *out_fps = fps;
+                return 0;
+            }
+            flash_timer = FLASH_FRAMES;
+        }
+
+        if (flash_timer > 0) flash_timer--;
+
+        /* D-pad navigation */
+        if (pressed & PSP_CTRL_UP)
+            sel_row = (sel_row + KP_ROWS - 1) % KP_ROWS;
+        if (pressed & PSP_CTRL_DOWN)
+            sel_row = (sel_row + 1) % KP_ROWS;
+        if (pressed & PSP_CTRL_LEFT)
+            sel_col = (sel_col + KP_COLS - 1) % KP_COLS;
+        if (pressed & PSP_CTRL_RIGHT)
+            sel_col = (sel_col + 1) % KP_COLS;
+
+        /* PRESS KEY: Cross (X button) */
+        if (pressed & PSP_CTRL_CROSS) {
+            int k = s_keys[sel_row][sel_col];
+            if (k == KP_DEL) {
+                do_backspace(buf, &buflen);
+            } else if (k != KP_DOT) {
+                append_digit(buf, &buflen, k);
+            }
+        }
+
+        /* --- Draw frame --- */
+        ui_begin_frame();
+        ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+        ui_draw_header("Custom FPS");
+
+        /* Display box */
+        {
+            char display[RES_MAX_LEN + 2];
+            u32 box_border = (flash_timer > 0) ? 0xFF4040FFu : UI_COL_BORDER_FOC;
+            snprintf(display, sizeof(display), "%s_", buf);
+            ui_set_blend(1);
+            ui_draw_rect_rounded(IP_BOX_X, IP_BOX_Y, IP_BOX_W, IP_BOX_H, 8, box_border);
+            ui_draw_rect_rounded(IP_BOX_X + 2, IP_BOX_Y + 2, IP_BOX_W - 4, IP_BOX_H - 4, 6, UI_COL_CARD);
+            ui_set_blend(0);
+
+            ui_draw_text_large((float)(IP_BOX_X + 10),
+                               (float)(IP_BOX_Y + IP_BOX_H / 2 + 6),
+                               (flash_timer > 0) ? 0xFF4040FFu : UI_COL_TEXT_FOCUS,
+                               display);
+
+            if (flash_timer > 0) {
+                ui_draw_text_centered((float)IP_BOX_X, (float)IP_BOX_W,
+                                      (float)(IP_BOX_Y + IP_BOX_H + 4),
+                                      0xFF4040FFu,
+                                      "Min 1, Max 144");
+            }
+        }
+
+        /* 3x4 keypad */
+        for (row = 0; row < KP_ROWS; row++) {
+            for (col = 0; col < KP_COLS; col++) {
+                draw_key(row, col, (row == sel_row && col == sel_col) ? 1 : 0);
+            }
+        }
+
+        ui_draw_footer_hint("{DP}: Move  {X}: Press  {ST}: Confirm  {O}: Cancel");
         ui_end_frame();
     }
 }

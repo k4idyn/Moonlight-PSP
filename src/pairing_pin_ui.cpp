@@ -228,7 +228,7 @@ PairingPINState pairing_pin_ui_run(PairingPINUI *ui)
                              STATUS_Y_POSITION, UI_COL_TEXT_DIM);
 
         /* Footer hint — show both cancel keys so users know how to exit */
-        ui_draw_footer_hint("O / Triangle: Cancel pairing");
+        ui_draw_footer_hint("{O} / {TR}: Cancel pairing");
 
         ui_end_frame();
 

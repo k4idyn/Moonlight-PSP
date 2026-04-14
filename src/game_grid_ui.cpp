@@ -162,7 +162,7 @@ static void render_grid(void)
                               UI_COL_TEXT_DIM, "No games found on server.");
         ui_draw_text_centered(0.0f, (float)SCREEN_W, (float)(SCREEN_H / 2 + 18),
                               UI_COL_TEXT_DIM, "Press O to go back.");
-        ui_draw_footer_hint("O: Back");
+        ui_draw_footer_hint("{O}: Back");
         ui_end_frame();
         return;
     }
@@ -219,7 +219,7 @@ static void render_grid(void)
         ui_draw_text_right((float)(SCREEN_W - 18), 22.0f, UI_COL_TEXT_DIM, label); /* Right margin, centered in pill */
     }
 
-    ui_draw_footer_hint("D-Pad L/R: Navigate   X: Start   []: Refresh   O: Back");
+    ui_draw_footer_hint("{LF}/{RF}: Navigate  {X}: Start  {SQ}: Refresh  {O}: Back");
     ui_end_frame();
 }
 
@@ -244,7 +244,7 @@ static void load_games_from_server(const char *host_ip)
         snprintf(msg, sizeof(msg), "game_list_fetch error: %d", ret);
         ui_begin_frame();
         ui_draw_gradient_bg(g_ui_bg_color, g_ui_bg_color);
-        ui_draw_error_modal("Failed to Load Games", msg, "Check host IP and Sunshine.   O: Back");
+        ui_draw_error_modal("Failed to Load Games", msg, "Check host IP and Sunshine.   {O}: Back");
         ui_end_frame();
         sceKernelDelayThread(3 * 1000 * 1000);
         s_num_tiles = 0;

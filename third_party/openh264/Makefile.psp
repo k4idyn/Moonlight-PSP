@@ -1,0 +1,146 @@
+# =============================================================================
+# Makefile.psp — OpenH264 Decoder-Only Static Library for PSP / Allegrex
+#
+# Purpose-built for Moonlight-PSP. Builds ONLY the H.264 decoding pipeline.
+# NO encoder, NO processing, NO pthread dependency, NO SIMD.
+#
+# Output: libopenh264_dec_psp.a
+#
+# Usage:
+#   (with pspdev/bin on PATH)
+#   make -f Makefile.psp
+#   make -f Makefile.psp clean
+# =============================================================================
+
+# ---- Toolchain --------------------------------------------------------------
+
+PSP_SDK_PATH := $(shell psp-config --pspsdk-path 2>/dev/null)
+ifeq ($(PSP_SDK_PATH),)
+$(error psp-config not found. Add pspdev/bin to PATH.)
+endif
+
+CC     = psp-gcc
+CXX    = psp-g++
+AR     = psp-ar
+RANLIB = psp-ranlib
+
+# ---- Output -----------------------------------------------------------------
+
+TARGET = libopenh264_dec_psp.a
+
+# ---- Compiler flags ---------------------------------------------------------
+
+# Core PSP/Allegrex flags
+CXXFLAGS  = -march=allegrex -mabi=eabi -G0
+CXXFLAGS += -O3 -DNDEBUG
+CXXFLAGS += -fno-strict-aliasing
+CXXFLAGS += -MMD -MP
+
+# PSP platform defines
+CXXFLAGS += -DPSP
+CXXFLAGS += -DGENERATED_VERSION_HEADER    # suppress auto-detect version include
+CXXFLAGS += -DDISABLE_ENCODER_SIDE        # exclude any encoder-only code paths
+
+# *** KEY: single-threaded decoder ***
+# DISABLE_DECODER_MT=1 is the upstream flag, but it does NOT guard all threading
+# call sites in this version of OpenH264. Instead we use our own flag and provide
+# a full WelsThreadLib replacement that maps to no-ops / PSP sceKernel calls.
+CXXFLAGS += -DDISABLE_DECODER_MT
+
+# Skip in-loop deblocking filter — saves ~2-3ms per frame on 333MHz PSP.
+# The deblocking filter smooths block edges for visual quality, but at
+# 144p@30fps on 802.11b the CPU budget is too tight.  Disabling it frees
+# cycles for faster frame decode, reducing stall risk and IDR backlog.
+CXXFLAGS += -DPSP_SKIP_DEBLOCKING
+
+# PSP newlib has no pthread.h. Inject our shim via -include so every TU gets it
+# without requiring source modifications.
+CXXFLAGS += -include codec/common/inc/psp_thread_shim.h
+
+# SDK include
+CXXFLAGS += -I$(PSP_SDK_PATH)/include
+
+# OpenH264 internal includes
+INCFLAGS  = -Icodec/api/wels
+INCFLAGS += -Icodec/common/inc
+INCFLAGS += -Icodec/decoder/core/inc
+INCFLAGS += -Icodec/decoder/plus/inc
+
+CXXFLAGS += $(INCFLAGS)
+
+# Suppress warnings that spam and are harmless for our usage
+CXXFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare
+
+# ---- Source files -----------------------------------------------------------
+# ONLY decoder + minimal common. No encoder, no processing, no console.
+# Explicitly list each file so we have full control.
+
+COMMON_SRCS = \
+    codec/common/src/common_tables.cpp      \
+    codec/common/src/copy_mb.cpp            \
+    codec/common/src/cpu.cpp                \
+    codec/common/src/crt_util_safe_x.cpp    \
+    codec/common/src/deblocking_common.cpp  \
+    codec/common/src/expand_pic.cpp         \
+    codec/common/src/intra_pred_common.cpp  \
+    codec/common/src/mc.cpp                 \
+    codec/common/src/memory_align.cpp       \
+    codec/common/src/sad_common.cpp         \
+    codec/common/src/utils.cpp              \
+    codec/common/src/welsCodecTrace.cpp
+
+# WelsThreadLib.cpp, WelsThread.cpp, WelsTaskThread.cpp, WelsThreadPool.cpp
+# are REPLACED by our PSP-native stub (psp_thread_stubs.cpp below).
+
+DECODER_SRCS = \
+    codec/decoder/core/src/au_parser.cpp        \
+    codec/decoder/core/src/bit_stream.cpp        \
+    codec/decoder/core/src/cabac_decoder.cpp     \
+    codec/decoder/core/src/deblocking.cpp        \
+    codec/decoder/core/src/decoder.cpp           \
+    codec/decoder/core/src/decoder_core.cpp      \
+    codec/decoder/core/src/decoder_data_tables.cpp \
+    codec/decoder/core/src/decode_mb_aux.cpp     \
+    codec/decoder/core/src/decode_slice.cpp      \
+    codec/decoder/core/src/error_concealment.cpp \
+    codec/decoder/core/src/fmo.cpp               \
+    codec/decoder/core/src/get_intra_predictor.cpp \
+    codec/decoder/core/src/manage_dec_ref.cpp    \
+    codec/decoder/core/src/memmgr_nal_unit.cpp   \
+    codec/decoder/core/src/mv_pred.cpp           \
+    codec/decoder/core/src/parse_mb_syn_cabac.cpp \
+    codec/decoder/core/src/parse_mb_syn_cavlc.cpp \
+    codec/decoder/core/src/pic_queue.cpp         \
+    codec/decoder/core/src/rec_mb.cpp            \
+    codec/decoder/core/src/wels_decoder_thread.cpp \
+    codec/decoder/plus/src/welsDecoderExt.cpp
+
+# PSP-native thread stub (replaces WelsThreadLib / WelsThread / WelsThreadPool)
+STUB_SRCS = psp_thread_stubs.cpp
+
+ALL_SRCS = $(COMMON_SRCS) $(DECODER_SRCS) $(STUB_SRCS)
+
+OBJS = $(ALL_SRCS:.cpp=.o)
+DEPS = $(OBJS:.o=.d)
+
+# ---- Rules ------------------------------------------------------------------
+
+.PHONY: all clean
+
+all: $(TARGET)
+	@echo ""
+	@echo "=== OpenH264 PSP decoder built: $(TARGET) ==="
+	@psp-size $(TARGET) 2>/dev/null || true
+
+$(TARGET): $(OBJS)
+	$(AR) cr $(TARGET) $(OBJS)
+	$(RANLIB) $(TARGET)
+
+%.o: %.cpp
+	@echo "  CXX $<"
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(DEPS) $(TARGET)
+
+-include $(DEPS)

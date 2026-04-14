@@ -16,6 +16,7 @@
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
+#include <psputility_sysparam.h>
 #include <pspiofilemgr.h>
 #include <psprtc.h>
 #include <netinet/in.h>
@@ -69,6 +70,10 @@ static int udp_socket = -1;
 /* Thread IDs */
 static SceUID net_thread_id  = -1;
 static SceUID ping_thread_id = -1;
+
+/* WiFi power save: original state saved at init, restored at shutdown.
+ * -1 = not yet read (don't restore). */
+static int g_orig_wlan_powersave = -1;
 
 /* Guard net.log writes across threads so logging can never stall startup. */
 static volatile int net_log_lock = 0;
@@ -216,24 +221,31 @@ static int wifi_keepalive_thread(SceSize args, void *argp)
     net_log("[KEEPALIVE] thread started\n");
 
     while (g_keepalive_running) {
-        /* During active streaming the ping thread monitors WiFi — skip */
-        if (!me_running) {
+        /* Monitor WiFi during ALL phases — including streaming.
+         * The ping thread also checks WiFi, but keepalive provides a
+         * safety net with reconnect capability.  During streaming the
+         * ping thread detects disconnect faster (1s vs 5s), but only
+         * keepalive attempts the full reconnect sequence. */
+        {
             int ap_state = -1;
             int ret = sceNetApctlGetState(&ap_state);
 
             if (ret >= 0 && ap_state == 0 && !g_wifi_reconnecting) {
                 /* State 0 = fully disconnected (confirmed by API). Reconnect.
                  * Don't reconnect on ap_state < 0 (API error) or 1-3 (connecting). */
-                net_log("[KEEPALIVE] WiFi disconnected ap_state=%d, reconnecting\n", ap_state);
+                net_log("[KEEPALIVE] WiFi disconnected ap_state=%d me_running=%d, reconnecting\n",
+                        ap_state, me_running);
                 int rc = wifi_try_reconnect();
                 net_log("[KEEPALIVE] reconnect result=%d\n", rc);
             }
         }
 
-        /* Sleep 5 seconds (in 500ms chunks so we can exit promptly) */
+        /* Sleep 3 seconds during streaming, 5 seconds during idle.
+         * (in 500ms chunks so we can exit promptly) */
         {
             int i;
-            for (i = 0; i < 10 && g_keepalive_running; i++) {
+            int chunks = me_running ? 6 : 10;  /* 3s vs 5s */
+            for (i = 0; i < chunks && g_keepalive_running; i++) {
                 sceKernelDelayThread(500 * 1000);
             }
         }
@@ -490,6 +502,29 @@ void network_me_init(PacketRingBuffer *rb)
 
     /* Zero the ring buffer */
     memset(rb, 0, sizeof(PacketRingBuffer));
+
+    /* Disable WiFi power save to eliminate 50-280ms periodic gap spikes.
+     * 802.11b power save causes the radio to sleep between beacons, adding
+     * multi-frame latency spikes every ~2 seconds.  Save the original
+     * setting and restore it in network_me_shutdown(). */
+    {
+        int ps_val = -1;
+        int ps_ret = sceUtilityGetSystemParamInt(
+            PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE, &ps_val);
+        if (ps_ret == 0) {
+            g_orig_wlan_powersave = ps_val;
+            net_log("[NET INIT] WLAN power save current=%d\n", ps_val);
+            if (ps_val != PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF) {
+                ps_ret = sceUtilitySetSystemParamInt(
+                    PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                    PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF);
+                net_log("[NET INIT] WLAN power save disabled (ret=%d)\n",
+                        ps_ret);
+            }
+        } else {
+            net_log("[NET INIT] WLAN power save query failed (%d)\n", ps_ret);
+        }
+    }
 
     net_log("[NET INIT] starting, server=%s:%d\n",
             g_video_server_ip, g_video_server_port);
@@ -804,15 +839,17 @@ static int network_recv_thread(SceSize args, void *argp)
                 recv_err_count++;
                 net_log("[NET] recv err=%d count=%u\n", err, recv_err_count);
             }
-            /* Recv heartbeat every 5 seconds */
+            /* Recv heartbeat every 5 seconds (during no-data periods) */
             {
                 u32 now_s = sceKernelGetSystemTimeLow() / 1000000;
                 if (now_s - recv_hb_last >= 5) {
                     int ap_state = -1;
+                    extern int g_decoder_ready;
+                    u32 rq = (rb->head + RING_BUFFER_SLOTS - rb->tail) % RING_BUFFER_SLOTS;
                     sceNetApctlGetState(&ap_state);
-                    net_log("[NET] RECV_HB pkts=%u to=%u err=%u ap=%d rc=%d/%d\n",
-                            pkt_count, recv_total_timeout, recv_err_count,
-                            ap_state, g_reconnect_success, g_reconnect_count);
+                    net_log("[NET] RECV_IDLE pkts=%u q=%u dec_rdy=%d to=%u err=%u ap=%d\n",
+                            pkt_count, rq, g_decoder_ready,
+                            recv_total_timeout, recv_err_count, ap_state);
                     recv_hb_last = now_s;
                 }
             }
@@ -836,12 +873,24 @@ static int network_recv_thread(SceSize args, void *argp)
                     (unsigned)ntohs(from_addr.sin_port));
         }
 
+        /* Periodic recv heartbeat (fires even when data flowing — every 10s) */
+        {
+            u32 now_s = sceKernelGetSystemTimeLow() / 1000000;
+            if (now_s - recv_hb_last >= 10) {
+                extern int g_decoder_ready;
+                u32 rq = (rb->head + RING_BUFFER_SLOTS - rb->tail) % RING_BUFFER_SLOTS;
+                net_log("[NET] RECV_HB pkts=%u q=%u dec_rdy=%d to=%u err=%u\n",
+                        pkt_count, rq, g_decoder_ready,
+                        recv_total_timeout, recv_err_count);
+                recv_hb_last = now_s;
+            }
+        }
+
         if ((u32)n > MAX_PACKET_SIZE)
             continue;
 
-        /* Video packets are NOT encrypted on this Sunshine configuration.
-         * encryptionSupported:5 = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO (no SS_ENC_VIDEO).
-         * Wire format: [RTP(12)][NV_VIDEO_PACKET(16)][H264 data]. */
+        /* Video wire format: [RTP(12+ext)][NV_VIDEO_PACKET(16)][H264 data].
+         * Decryption (if any) is handled downstream in FEC/reassembly. */
 
         next_head = (rb->head + 1) % RING_BUFFER_SLOTS;
 
@@ -925,5 +974,14 @@ void network_me_shutdown(void)
         sceKernelWaitThreadEnd(net_thread_id, &timeout_us);
         sceKernelDeleteThread(net_thread_id);
         net_thread_id = -1;
+    }
+
+    /* Restore WiFi power save to its original state */
+    if (g_orig_wlan_powersave >= 0) {
+        sceUtilitySetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                                    g_orig_wlan_powersave);
+        net_log("[NET SHUTDOWN] WLAN power save restored to %d\n",
+                g_orig_wlan_powersave);
+        g_orig_wlan_powersave = -1;
     }
 }

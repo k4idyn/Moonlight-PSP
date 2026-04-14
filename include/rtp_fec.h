@@ -29,4 +29,15 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len);
 /* Reset FEC state (call on stream restart) */
 void rtp_fec_reset(void);
 
+/* Last FEC status values for CTRL PING piggyback.
+ * Updated by rtp_fec.c on every frame submit so the keepalive
+ * can echo real values instead of confusing the server with zeros. */
+extern volatile u16 g_fec_last_highest_seq;
+extern volatile u16 g_fec_last_next_contig_seq;
+extern volatile u16 g_fec_last_data_pkts;
+extern volatile u16 g_fec_last_parity_pkts;
+extern volatile u16 g_fec_last_recv_data;
+extern volatile u16 g_fec_last_recv_parity;
+extern volatile u8  g_fec_last_fec_pct;
+
 #endif /* RTP_FEC_H */

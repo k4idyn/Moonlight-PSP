@@ -20,6 +20,9 @@ static OpusMSDecoder *s_decoder = NULL;
 static int s_channels = 0;
 static int s_initialized = 0;
 static int s_decode_error_logs = 0;
+/* Frame size (samples/ch) of the most recently decoded Opus packet.
+ * Used by the audio thread to invoke PLC with the correct frame duration. */
+static int s_last_frame_size = 240; /* default: 5 ms @ 48 kHz */
 
 #define opus_log(fmt, ...) diag_log_write("OPUS", fmt, ##__VA_ARGS__)
 
@@ -66,18 +69,60 @@ int opus_psp_decode(const unsigned char *opus_data, int opus_len,
         s_decoder,
         opus_data, (opus_int32)opus_len,
         pcm_out, frame_size,
-        0  /* decode_fec = 0 */
+        0  /* decode_fec = 0: normal decode */
     );
 
     if (samples < 0) {
-        if (s_decode_error_logs < 10) {
-            opus_log("[OPUS] decode error: %d\n", samples);
-            s_decode_error_logs++;
+        /* Log first 10 errors, then every 50th so audio health stays visible */
+        if (s_decode_error_logs < 10 || (s_decode_error_logs % 50) == 0) {
+            opus_log("[OPUS] decode error: %d (total=%d)\n", samples, s_decode_error_logs + 1);
         }
+        s_decode_error_logs++;
         return -1;
     }
 
+    s_last_frame_size = samples;
     return samples;
+}
+
+int opus_psp_decode_fec(const unsigned char *opus_data, int opus_len,
+                        int16_t *pcm_out, int frame_size)
+{
+    int samples;
+
+    if (!s_initialized || s_decoder == NULL) {
+        return -1;
+    }
+
+    /* decode_fec = 1: extract the in-band FEC data from opus_data to
+     * reconstruct the PREVIOUS lost frame.  The Opus encoder embeds a
+     * low-bitrate copy of the prior frame in each packet specifically
+     * for packet loss recovery.  Quality is better than PLC (NULL decode)
+     * because it uses actual encoded audio data rather than synthesis. */
+    samples = opus_multistream_decode(
+        s_decoder,
+        opus_data, (opus_int32)opus_len,
+        pcm_out, frame_size,
+        1  /* decode_fec = 1: use in-band FEC from this packet */
+    );
+
+    if (samples < 0) {
+        if (s_decode_error_logs < 10 || (s_decode_error_logs % 50) == 0) {
+            opus_log("[OPUS] FEC decode error: %d (total=%d)\n", samples, s_decode_error_logs + 1);
+        }
+        s_decode_error_logs++;
+        return -1;
+    }
+
+    /* Don't update s_last_frame_size — the FEC decode produces the
+     * previous frame's size, not the current packet's.  The caller
+     * will do a normal decode of the current packet next. */
+    return samples;
+}
+
+int opus_psp_last_frame_size(void)
+{
+    return s_last_frame_size;
 }
 
 void opus_psp_shutdown(void)
@@ -89,4 +134,5 @@ void opus_psp_shutdown(void)
     s_initialized = 0;
     s_channels = 0;
     s_decode_error_logs = 0;
+    s_last_frame_size = 240;
 }

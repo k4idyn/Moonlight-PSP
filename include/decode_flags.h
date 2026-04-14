@@ -12,13 +12,13 @@
 #ifndef DECODE_FLAGS_H
 #define DECODE_FLAGS_H
 
-/* Reference corruption guard (defined in ffmpeg_decode.c) */
+/* Reference corruption guard (defined in openh264_decode.cpp) */
 extern volatile int g_refs_corrupted;
 
-/* Set when IDR is fully decoded (defined in ffmpeg_decode.c) */
+/* Set when IDR is fully decoded (defined in openh264_decode.cpp) */
 extern volatile int g_idr_fully_decoded;
 
-/* Per-frame corruption flag (defined in ffmpeg_decode.c) */
+/* Per-frame corruption flag (defined in openh264_decode.cpp) */
 extern volatile int g_current_frame_is_corrupt;
 
 /* CABAC detection flag (defined in sw_decoder_thread.c via check_nal_for_cabac) */
@@ -30,7 +30,7 @@ extern volatile unsigned int g_last_good_frame;
 /* FEC-requested IDR flag to avoid duplicate IDR requests (defined in rtp_fec.c) */
 extern volatile int g_fec_requested_idr;
 
-/* Watchdog restart signal for resetting function-level statics (defined in ffmpeg_decode.c) */
+/* Watchdog restart signal for resetting function-level statics (defined in openh264_decode.cpp) */
 extern volatile int g_decode_counters_reset_pending;
 
 /* Crypto fatal flag for consecutive decrypt failures (defined in stream_crypto.c) */

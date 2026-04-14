@@ -163,7 +163,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
              *   partial drop → g_refs_corrupted=1 → ALL P-frames REF-SKIPped
              *   → only IDRs decoded → effective ~1 fps instead of 30.
              * Instead, request IDR as a precaution but let P-frames through.
-             * FFmpeg's error concealment handles occasional missing refs. */
+             * OpenH264's error concealment handles occasional missing refs. */
             control_stream_request_idr();
         }
         assembly_pos = 0;
@@ -286,7 +286,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
             }
 
             /* If packets were missing within this frame (seq gaps), the
-             * assembled NAL data is incomplete.  FFmpeg's error concealment
+             * assembled NAL data is incomplete.  OpenH264's error concealment
              * can "successfully" decode such data (ret=0) while producing
              * visible macroblocking.  Mark refs corrupted so the decoder
              * skips P-frames until a clean IDR resets references.

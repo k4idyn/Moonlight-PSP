@@ -56,3 +56,15 @@ _all_objs.a
 # Log / dump artifacts
 *.log
 *.txt
+
+# Test artifacts
+test_logs/
+test_screenshots/
+test_*.ps1
+
+# Deployment copies
+Moonlight/
+
+# Temp / config artifacts
+temp_config.ini
+tmp_*.c

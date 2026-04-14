@@ -12,7 +12,7 @@ The PSP's dual-CPU model has constraints that aren't obvious from the source alo
 
 - [docs/BUILDING.md](BUILDING.md) — get the toolchain set up
 - [docs/ARCHITECTURE.md](ARCHITECTURE.md) — how the asymmetric dual-core pipeline works
-- [docs/DECODER_PIPELINE.md](DECODER_PIPELINE.md) — the FFmpeg + VFPU decode path in detail
+- [docs/DECODER_PIPELINE.md](DECODER_PIPELINE.md) — the OpenH264 + ME decode path in detail
 - [docs/KNOWN_ISSUES.md](KNOWN_ISSUES.md) — what's broken and what's actively being worked on
 
 ---
@@ -106,7 +106,7 @@ Read the docs:
 
 - [docs/BUILDING.md](BUILDING.md) — get the toolchain set up
 - [docs/ARCHITECTURE.md](ARCHITECTURE.md) — how the dual-core pipeline works
-- [docs/DECODER_PIPELINE.md](DECODER_PIPELINE.md) — the FFmpeg + VFPU decode path in detail
+- [docs/DECODER_PIPELINE.md](DECODER_PIPELINE.md) — the OpenH264 + ME decode path in detail
 - [docs/KNOWN_ISSUES.md](KNOWN_ISSUES.md) — what's broken and what's being worked on
 
 ---

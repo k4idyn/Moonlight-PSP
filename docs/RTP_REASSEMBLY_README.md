@@ -1,10 +1,10 @@
 # RTP Packet Reassembly
 
-This module handles RTP packet reassembly for the PSP Moonlight video stream. It converts raw UDP payloads into complete H.264 NAL units for the FFmpeg decoder. Supports single NAL units and FU-A fragmented NAL units per RFC 6184.
+This module handles RTP packet reassembly for the PSP Moonlight video stream. It converts raw UDP payloads into complete H.264 NAL units for the OpenH264 decoder. Supports single NAL units and FU-A fragmented NAL units per RFC 6184.
 
 ## Overview
 
-The module converts raw UDP payloads (12-byte RTP header + payload) into complete H.264 Annex-B NAL units ready for `ffmpeg_pipeline_decode_frame()`.
+The module converts raw UDP payloads (12-byte RTP header + payload) into complete H.264 Annex-B NAL units ready for `oh264_pipeline_decode_frame()`.
 
 ### Supported NAL Unit Types
 
@@ -52,7 +52,7 @@ while (1) {
 4. **NAL Type Detection**: The first payload byte determines if this is a single NAL or FU-A fragment
 5. **Reassembly**: Single NAL units and FU-A fragments are accumulated into the 64 KB static assembly buffer.
 6. **Annex-B formatting**: Reassembled NAL units are prefixed with the 4-byte Annex-B start code (`00 00 00 01`) before being passed to the decoder.
-7. **Decoding**: Complete NAL units are passed to `ffmpeg_pipeline_decode_frame()` on the main CPU.
+7. **Decoding**: Complete NAL units are passed to `oh264_pipeline_decode_frame()` on the main CPU.
 
 ## RTP Packet Format
 
@@ -136,7 +136,7 @@ The module integrates seamlessly with the existing PSP Moonlight codebase:
 
 ### Integration
 
-The reassembler is driven by `sw_decoder_thread.c`, which reads from the 1024-slot packet ring buffer and calls `rtp_reassembly_process_packet()`. When a complete NAL unit is ready, the callback calls `ffmpeg_pipeline_decode_frame()` on the main CPU. FEC repair (`rtp_fec.c`) is applied to each RTP frame group before passing to reassembly.
+The reassembler is driven by `sw_decoder_thread.c`, which reads from the 1024-slot packet ring buffer and calls `rtp_reassembly_process_packet()`. When a complete NAL unit is ready, the callback calls `oh264_pipeline_decode_frame()` on the main CPU. FEC repair (`rtp_fec.c`) is applied to each RTP frame group before passing to reassembly.
 
 ## Error Handling
 

@@ -159,6 +159,108 @@ volatile u32 g_ctrl_ping_heartbeat_us = 0;
 /* Address of control server to send IDR requests */
 static struct sockaddr_in g_server_addr;
 
+/* ── Retransmission ring buffer ──────────────────────────────────
+ * ENet requires strict sequential delivery of reliable commands per channel.
+ * On lossy 802.11b WiFi, a single lost reliable packet permanently blocks
+ * the server's dispatch queue for that channel — subsequent packets are
+ * ACKed (proving receipt) but never dispatched (no RECEIVE event fires).
+ * After 10 seconds with no RECEIVE events, Sunshine's pingTimeout expires
+ * and it kills the session.
+ *
+ * This ring buffer stores recently sent reliable packets so we can
+ * retransmit any that the server hasn't ACKed within 300ms. */
+#define RETX_SLOTS      32
+#define RETX_PKT_MAX    128   /* max packet size for retransmit storage */
+#define RETX_TIMEOUT_US 300000  /* 300ms before first retransmit */
+#define RETX_MAX_TRIES  5      /* max retransmissions per packet */
+
+typedef struct {
+    unsigned char  data[RETX_PKT_MAX];
+    int            len;
+    unsigned char  channel;
+    unsigned short seq;
+    u32            send_time_us;  /* sceKernelGetSystemTimeLow */
+    unsigned char  retries;
+    volatile unsigned char acked; /* set by recv thread */
+    unsigned char  active;        /* 1 = slot in use */
+} retx_entry_t;
+
+static retx_entry_t retx_ring[RETX_SLOTS];
+static int retx_head = 0;  /* next slot to write */
+
+/* Store a sent reliable packet for retransmission.
+ * Called from the ping thread (and recv thread for 0x010E echo). */
+static void retx_store(const unsigned char *pkt, int pkt_len,
+                        unsigned char channel, unsigned short seq)
+{
+    retx_entry_t *e;
+    if (pkt_len <= 0 || pkt_len > RETX_PKT_MAX) return;
+    e = &retx_ring[retx_head];
+    memcpy(e->data, pkt, (size_t)pkt_len);
+    e->len = pkt_len;
+    e->channel = channel;
+    e->seq = seq;
+    e->send_time_us = sceKernelGetSystemTimeLow();
+    e->retries = 0;
+    e->acked = 0;
+    e->active = 1;
+    retx_head = (retx_head + 1) % RETX_SLOTS;
+}
+
+/* Mark a reliable packet as ACKed. Called from the recv thread. */
+static void retx_ack(unsigned char channel, unsigned short seq)
+{
+    int i;
+    for (i = 0; i < RETX_SLOTS; i++) {
+        retx_entry_t *e = &retx_ring[i];
+        if (e->active && !e->acked && e->channel == channel && e->seq == seq) {
+            e->acked = 1;
+            return;
+        }
+    }
+}
+
+/* Retransmit un-ACKed reliable packets. Called from the ping thread.
+ * Returns the number of packets retransmitted. */
+static int retx_scan(int sock, const struct sockaddr_in *dst)
+{
+    int i, retransmitted = 0;
+    u32 now = sceKernelGetSystemTimeLow();
+
+    for (i = 0; i < RETX_SLOTS; i++) {
+        retx_entry_t *e = &retx_ring[i];
+        if (!e->active || e->acked) continue;
+
+        /* Check if enough time has passed since last send */
+        if ((now - e->send_time_us) < RETX_TIMEOUT_US) continue;
+
+        if (e->retries >= RETX_MAX_TRIES) {
+            /* Give up — mark inactive to free the slot */
+            e->active = 0;
+            continue;
+        }
+
+        /* Retransmit */
+        sceNetInetSendto(sock, e->data, e->len, 0,
+                         (const struct sockaddr *)dst, sizeof(*dst));
+        e->send_time_us = now;
+        e->retries++;
+        retransmitted++;
+    }
+    return retransmitted;
+}
+
+/* Clear all retransmit slots. Called during init/stop. */
+static void retx_clear(void)
+{
+    int i;
+    for (i = 0; i < RETX_SLOTS; i++) {
+        retx_ring[i].active = 0;
+        retx_ring[i].acked = 0;
+    }
+    retx_head = 0;
+}
+
 /* Per-channel reliable sequence allocation.
  * ENet tracks reliable sequence numbers independently for each channel.
  * Using a single global counter caused Sunshine to reject messages on
@@ -316,6 +418,20 @@ static int build_reliable_raw(unsigned char *buf, int buflen,
     }
 
     return (int)(p - buf);
+}
+
+/* Extract channel and reliable sequence from a built reliable packet.
+ * The packet layout is: [2-byte header][2-byte sentTime][cmd][channel][2-byte seq]... */
+static void pkt_get_channel_seq(const unsigned char *pkt, int pkt_len,
+                                unsigned char *out_ch, unsigned short *out_seq)
+{
+    if (pkt_len >= 8) {
+        *out_ch  = pkt[5]; /* channel byte in SEND_RELIABLE command */
+        *out_seq = (unsigned short)((pkt[6] << 8) | pkt[7]);
+    } else {
+        *out_ch = 0;
+        *out_seq = 0;
+    }
 }
 
 /* Unsequenced group counter for SEND_UNSEQUENCED messages */
@@ -535,7 +651,7 @@ static int parse_verify_connect(const unsigned char *data, int len,
             ctrl_log("[CTRL] indices validated, reading contents...\n");
             ctrl_log("[CTRL] extracting peer and session bits...\n");
             server_peer_id = get_be16(p + 4);  /* outgoingPeerID */
-            session_bits   = p[6] & 0x03;       /* incomingSessionID: bits 0-1 */
+            session_bits   = p[6] & 0x03;       /* incomingSessionID: what server validates on our packets */
 
             ctrl_log("[CTRL] verifying connectID...\n");
             unsigned int verify_cid = ((unsigned int)p[40] << 24) |
@@ -754,9 +870,15 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                     }
                 }
 
-                /* ── ACK (1): 8 bytes — RelSeq (2) + ReceivedSentTime (2) ── */
+                /* ── ACK (1): 8 bytes — server acknowledges our reliable cmd ── */
                 if (cmd_num == ENET_CMD_ACK) {
                     if (p + 8 > end) break;
+                    {
+                        /* Parse the ACKed sequence from the payload.
+                         * ENet puts receivedReliableSeq at command offset 4-5. */
+                        unsigned short acked_seq = get_be16(p + 4);
+                        retx_ack(channel_id, acked_seq);
+                    }
                     p += 8;
                     continue;
                 }
@@ -862,6 +984,13 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                                                 ctrl_socket, reply_buf, reply_len, 0,
                                                 (const struct sockaddr *)&server_addr,
                                                 sizeof(server_addr));
+                                    /* Store in retransmit buffer for gap recovery */
+                                    if (tx > 0) {
+                                        unsigned char rch = 0;
+                                        unsigned short rseq = 0;
+                                        pkt_get_channel_seq(reply_buf, reply_len, &rch, &rseq);
+                                        retx_store(reply_buf, reply_len, rch, rseq);
+                                    }
                                     ctrl_log("[CTRL RX] 0x010E server-hello: echoed %d bytes tx=%d\n",
                                              echo_len, tx);
                                 } else {
@@ -999,17 +1128,25 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                               ping_payload, 8, 0x00);
         if (pkt_len > 0) {
             int tx = 0;
-            /* Single-fire: The server-hello echo fix (0x010E → server_addr)
-             * eliminated the 5-second disconnect that necessitated triple-fire.
-             * Triple-fire sent 30 UDP pkts/sec on control alone, causing ENOBUFS
-             * after ~30s on PSP's tiny 802.11b socket buffer. Single-fire + the
-             * working ENet ACK path gives reliable delivery without flooding. */
+            unsigned char pkt_ch = 0;
+            unsigned short pkt_seq = 0;
+            /* Single-fire + retransmit: rely on the retransmit buffer to fill
+             * gaps from packet loss, rather than triple-firing every ping. */
             tx = (int)sceNetInetSendto(ctrl_socket, pkt, pkt_len, 0,
                              (struct sockaddr *)&dst, sizeof(dst));
-            if (count <= 5 || (count % 50) == 0 || tx < 0)
-                ctrl_log("[CTRL PING] #%u pkt=%d tx=%d lgf=%u%s%d\n",
-                         count, pkt_len, tx, g_last_good_frame,
-                         tx < 0 ? " errno=" : "", tx < 0 ? sceNetInetGetErrno() : 0);
+            /* Store in retransmit buffer for gap recovery */
+            if (tx > 0) {
+                pkt_get_channel_seq(pkt, pkt_len, &pkt_ch, &pkt_seq);
+                retx_store(pkt, pkt_len, pkt_ch, pkt_seq);
+            }
+            if (count <= 5 || (count % 100) == 0 || tx < 0) {
+                if (tx < 0)
+                    ctrl_log("[CTRL PING] #%u pkt=%d tx=%d lgf=%u errno=%d\n",
+                             count, pkt_len, tx, g_last_good_frame, sceNetInetGetErrno());
+                else
+                    ctrl_log("[CTRL PING] #%u pkt=%d tx=%d lgf=%u\n",
+                             count, pkt_len, tx, g_last_good_frame);
+            }
         } else {
             if (count <= 5)
                 ctrl_log("[CTRL PING] #%u build_failed\n", count);
@@ -1024,28 +1161,96 @@ static int ctrl_ping_thread(SceSize args, void *argp)
          * status update on every keepalive ping, Sunshine sees frame
          * progress even while the IDR is still being decoded.  This
          * prevents the 10-second "no frame ACK" disconnect.
-         * Only send every 5th ping (1/sec) to reduce ENOBUFS pressure. */
-        if (g_last_good_frame > 0 && ctrl_crypto_ready && (count % 5) == 0) {
+         *
+         * CRITICAL: Use the cached values from rtp_fec.c (g_fec_last_*)
+         * instead of zeros.  Sending highestReceivedSequenceNumber=0
+         * confuses Sunshine's flow control — the server interprets it as
+         * "client received no packets" and eventually stops sending video.
+         *
+         * STALL RECOVERY: When lgf is frozen (no new frames decoded),
+         * advance the piggybacked frame_index by 1 each second.  This
+         * prevents the server's pending-frame counter from growing past
+         * its threshold and permanently stopping video.  The server sees
+         * "client is slowly catching up" and keeps its send window open.
+         * Real frames resume once the IDR arrives and decoding restarts.
+         *
+         * Send every 5th ping (2/sec) to keep Sunshine's send window
+         * open during decode stalls. Was 1/sec but server's pending-frame
+         * counter outpaced our acks. */
+        if (ctrl_crypto_ready && (count % 5) == 0) {
+            extern volatile u16 g_fec_last_highest_seq;
+            extern volatile u16 g_fec_last_next_contig_seq;
+            extern volatile u16 g_fec_last_data_pkts;
+            extern volatile u16 g_fec_last_parity_pkts;
+            extern volatile u16 g_fec_last_recv_data;
+            extern volatile u16 g_fec_last_recv_parity;
+            extern volatile u8  g_fec_last_fec_pct;
+
+            /* Stall recovery: advance frame_index when lgf is frozen.
+             * This keeps the server's send window open.
+             * s_stall_advance resets to 0 when lgf changes.
+             *
+             * Advance rate: +60/sec (2x framerate) to give the server
+             * extra headroom in its pending-frame window.  At 1x (30/sec)
+             * the gap grew during decode stalls and killed the stream.
+             * Cap at 7200 (120s worth at 60/sec) to prevent overflow. */
+            static unsigned int s_piggy_last_lgf = 0;
+            static unsigned int s_stall_advance = 0;
+            unsigned int piggy_frame;
+
+            if (g_last_good_frame != s_piggy_last_lgf) {
+                /* lgf advanced — reset stall advance */
+                s_piggy_last_lgf = g_last_good_frame;
+                s_stall_advance = 0;
+            } else {
+                /* lgf frozen — advance by 30 each half-second (60/sec)
+                 * to outpace the server's frame counter (~30fps) and keep
+                 * Sunshine's send window comfortably open during stalls. */
+                if (s_stall_advance < 7200)
+                    s_stall_advance += 30;
+            }
+            piggy_frame = g_last_good_frame + s_stall_advance;
+
             control_stream_send_fec_status(
-                g_last_good_frame,
-                0,      /* highestReceivedSequenceNumber */
-                0,      /* nextContiguousSequenceNumber */
-                0,      /* missingPacketsBeforeHighestReceived */
-                1,      /* totalDataPackets */
-                0,      /* totalParityPackets */
-                1,      /* receivedDataPackets */
-                0,      /* receivedParityPackets */
-                0,      /* fecPercentage */
+                piggy_frame,
+                g_fec_last_highest_seq,      /* real highestReceivedSequenceNumber */
+                g_fec_last_next_contig_seq,  /* real nextContiguousSequenceNumber */
+                0,                           /* missingPacketsBeforeHighestReceived */
+                g_fec_last_data_pkts > 0 ? g_fec_last_data_pkts : 1,
+                g_fec_last_parity_pkts,
+                g_fec_last_recv_data > 0 ? g_fec_last_recv_data : 1,
+                g_fec_last_recv_parity,
+                g_fec_last_fec_pct,
                 0,      /* multiFecBlockIndex */
                 1       /* multiFecBlockCount */
             );
         }
 
-        if (count % 25 == 0) { /* 25 × 200ms = 5 seconds */
+        if (count % 50 == 0) { /* 50 × 100ms = 5 seconds */
             if (!g_idr_fully_decoded) {
                 ctrl_log("[CTRL PING] IDR accumulation incomplete, requesting IDR...\n");
                 control_stream_request_idr();
             }
+        }
+
+        /* Periodic IDR refresh: every 60 seconds during normal streaming,
+         * force-request an IDR to reset the H.264 reference chain.
+         * At low bitrate on 802.11b WiFi, quantization errors accumulate
+         * in P-frame references (especially without HEVC intra-refresh).
+         * Without periodic IDR, the picture progressively washes out.
+         *
+         * Only fires when g_idr_fully_decoded is set (normal streaming).
+         * Must clear g_idr_fully_decoded before requesting, otherwise
+         * the request is silently suppressed by control_stream_request_idr().
+         *
+         * Reduced from 10s to 60s to prevent IDR flood on lossy WiFi.
+         * Frequent IDR requests cause Sunshine to produce large keyframes
+         * that are more vulnerable to partial loss, creating a vicious
+         * cycle: lost IDR → request another → lost again → server gives up. */
+        if (count > 0 && (count % 600) == 0 && g_idr_fully_decoded) {
+            ctrl_log("[CTRL PING] Periodic IDR refresh (60s)\n");
+            g_idr_fully_decoded = 0;
+            control_stream_request_idr();
         }
 
         /* Stall recovery: if no new frames in 5 seconds, request IDR.
@@ -1060,13 +1265,13 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             static unsigned int stall_ticks = 0;
             if (g_last_good_frame > 0 && g_last_good_frame == stall_lgf) {
                 stall_ticks++;
-                if (stall_ticks == 25) { /* 25 × 200ms = 5 seconds */
+                if (stall_ticks == 50) { /* 50 × 100ms = 5 seconds */
                     ctrl_log("[CTRL PING] STALL lgf=%u for 5s, requesting IDR\n",
                              g_last_good_frame);
                     g_idr_fully_decoded = 0;
                     control_stream_request_idr();
                 }
-                if (stall_ticks == 50) { /* 50 × 200ms = 10 seconds */
+                if (stall_ticks == 100) { /* 100 × 100ms = 10 seconds */
                     ctrl_log("[CTRL PING] STALL lgf=%u for 10s, requesting IDR (urgent)\n",
                              g_last_good_frame);
                     g_idr_fully_decoded = 0;
@@ -1078,7 +1283,19 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             }
         }
 
-        sceKernelDelayThread(200000); /* 200 ms — halves outbound rate to avoid ENOBUFS */
+        /* ── Retransmit scan: resend un-ACKed reliable packets ─────
+         * This fills gaps from WiFi packet loss, preventing the server's
+         * ENet dispatch queue from permanently stalling on a missing seq.
+         * Runs every ping cycle (100ms). Only retransmits packets that
+         * haven't been ACKed within 300ms, up to RETX_MAX_TRIES times. */
+        if (ctrl_socket >= 0) {
+            int retx_count = retx_scan(ctrl_socket, &dst);
+            if (retx_count > 0 && (count <= 5 || (count % 100) == 0)) {
+                ctrl_log("[CTRL PING] retransmitted %d packets\n", retx_count);
+            }
+        }
+
+        sceKernelDelayThread(100000); /* 100 ms — matches moonlight-common-c ping interval */
 
         /* Graceful drain: after receiving DISCONNECT, keep running for
          * up to 5 seconds so the decode thread can process queued frames
@@ -1144,7 +1361,7 @@ int control_stream_send_fec_status(unsigned int frame_index,
     payload[20] = multi_fec_cnt;
 
     pkt_len = build_encrypted_unsequenced_msg(pkt, sizeof(pkt),
-                                              0x5502, payload, 21, 0x06);
+                                              0x5502, payload, 21, CTRL_CHANNEL_GENERIC);
     if (pkt_len <= 0) return -1;
 
     return (int)sceNetInetSendto(ctrl_socket, pkt, pkt_len, 0,
@@ -1205,13 +1422,13 @@ int control_stream_request_idr(void)
         return 0;
     }
 
-    /* Once IDR accumulation is complete (all 510 MBs covered), suppress
-     * further IDR requests.  Server-initiated periodic IDRs still arrive
-     * but we skip displaying them.  This prevents the vicious cycle of
-     * corrupt IDR → request → corrupt IDR that floods the link. */
-    if (g_idr_fully_decoded) {
-        return 0;
-    }
+    /* NOTE: We intentionally do NOT suppress IDR requests when
+     * g_idr_fully_decoded is set.  moonlight-common-c sends IDR requests
+     * freely whenever recovery is needed.  Our old guard here silently
+     * ate all IDR requests after the first successful decode, making
+     * watchdog recovery impossible (server only sends P-frames without
+     * an IDR request).  The rate limiter below (2/sec) is sufficient
+     * to prevent flooding. */
 
     extern void rtp_reassembly_flush_partial_frame(void);
 
@@ -1225,16 +1442,19 @@ int control_stream_request_idr(void)
         return -1;
     }
 
-    /* Rate-limit IDR requests to max 2/sec (500ms throttle).
+    /* Rate-limit IDR requests to max 1/sec (1000ms throttle).
      * Without this, frame drops + FEC failures flood the server with
-     * 10+ IDR requests in 19s, wasting bandwidth and confusing Sunshine.
+     * IDR requests, wasting bandwidth and confusing Sunshine.  At
+     * 500ms throttle, 66 IDR requests in 50s caused Sunshine to stop
+     * encoding entirely.  1/sec gives the server time to produce and
+     * deliver the IDR before we ask for another one.
      * First 5 requests bypass throttle for rapid-fire during initial connection. */
     {
         static u64 s_last_idr_tick = 0;
         static int s_idr_count = 0;
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (s_idr_count >= 5 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < 500000) {
+        if (s_idr_count >= 5 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < 1000000) {
             return 0; /* throttled — recent IDR already in flight */
         }
         s_last_idr_tick = now;
@@ -1251,11 +1471,17 @@ int control_stream_request_idr(void)
         return -2;
     }
 
-    /* Single send — the 500ms rate limiter + ENet ACK provides sufficient
-     * reliability. Burst-sending 3x amplified the loss feedback loop (C-1). */
+    /* Single send + retransmit buffer handles gap recovery on lossy WiFi. */
     ret_urgent = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                        (struct sockaddr *)&g_server_addr,
                                        sizeof(g_server_addr));
+    /* Store in retransmit buffer for gap recovery */
+    if (ret_urgent > 0) {
+        unsigned char rch = 0;
+        unsigned short rseq = 0;
+        pkt_get_channel_seq(send_buf, pkt_len, &rch, &rseq);
+        retx_store(send_buf, pkt_len, rch, rseq);
+    }
 
     ctrl_log("[CTRL] IDR request (0x0302) urgent=%d\n", ret_urgent);
     /* removed destructive flush: rtp_reassembly_flush_partial_frame(); */
@@ -1379,6 +1605,7 @@ int control_stream_start(void)
         for (i = 0; i < CTRL_CHANNEL_COUNT; i++)
             reliable_seq_per_ch[i] = 1;
     }
+    retx_clear(); /* Reset retransmit buffer for new session */
 
     ctrl_seq_sem_id = sceKernelCreateSema("ctrl_seq_sem", 0, 1, 1, NULL);
     if (ctrl_seq_sem_id < 0) {
@@ -1458,12 +1685,28 @@ int control_stream_start(void)
                                     (struct sockaddr *)&dst, sizeof(dst));
         ctrl_log("[CTRL] CONNECT sent=%d (attempt %d)\n", ret, attempt + 1);
 
-        /* Wait for response */
-        ret = (int)sceNetInetRecv(ctrl_socket, recv_buf, sizeof(recv_buf), 0);
+        /* Poll for response with MSG_DONTWAIT + manual 2s timeout.
+         * sceNetInetRecv blocks forever on PSP UDP sockets even with
+         * SO_RCVTIMEO set; non-blocking poll avoids the deadlock. */
+        {
+            int poll_loops;
+            ret = -1;
+            for (poll_loops = 0; poll_loops < 200; poll_loops++) {
+                struct sockaddr_in src;
+                socklen_t src_len = sizeof(src);
+                int r = (int)sceNetInetRecvfrom(ctrl_socket, recv_buf,
+                            sizeof(recv_buf), MSG_DONTWAIT,
+                            (struct sockaddr *)&src, &src_len);
+                if (r > 0) { ret = r; break; }
+                sceKernelDelayThread(10000); /* 10ms × 200 = 2s max */
+            }
+        }
         if (ret > 0) {
             ctrl_log("[CTRL] recv %d bytes\n", ret);
             if (parse_verify_connect(recv_buf, ret, &recv_sent_time) == 0)
                 break;
+        } else {
+            ctrl_log("[CTRL] recv timeout (attempt %d)\n", attempt + 1);
         }
     }
 
@@ -1501,6 +1744,7 @@ int control_stream_start(void)
             for (i = 0; i < CTRL_CHANNEL_COUNT; i++)
                 reliable_seq_per_ch[i] = 1;
         }
+        retx_clear(); /* Reset retransmit buffer after seq reset */
         pkt_len = build_encrypted_control_msg(send_buf, sizeof(send_buf),
                                               CTRL_TYPE_START_A, sa_payload, 2, CTRL_CHANNEL_URGENT);
         if (pkt_len <= 0) {
@@ -1549,7 +1793,7 @@ int control_stream_start(void)
 
     ctrl_recv_thread_id = sceKernelCreateThread(
         "ctrl_recv", ctrl_recv_thread,
-        0x11, 0x4000, PSP_THREAD_ATTR_USER, NULL);
+        0x18, 0x4000, PSP_THREAD_ATTR_USER, NULL);
     if (ctrl_recv_thread_id >= 0) {
         ret = sceKernelStartThread(ctrl_recv_thread_id, 0, NULL);
         if (ret < 0) {
@@ -1583,7 +1827,7 @@ int control_stream_start(void)
 
     ctrl_thread_id = sceKernelCreateThread(
         "ctrl_ping", ctrl_ping_thread,
-        0x11, 0x4000, PSP_THREAD_ATTR_USER, NULL);
+        0x18, 0x4000, PSP_THREAD_ATTR_USER, NULL);
     if (ctrl_thread_id >= 0) {
         ret = sceKernelStartThread(ctrl_thread_id, 0, NULL);
         if (ret < 0) {

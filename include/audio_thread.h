@@ -2,7 +2,7 @@
  * audio_thread.h - Moonlight Audio Receiver and Playback Thread
  *
  * Receives RTP/UDP audio from the Sunshine host on port 48000,
- * decodes PCM frames, and outputs them via sceAudio at 44100 Hz stereo.
+ * decodes PCM frames, and outputs them via sceAudio at 48000 Hz stereo.
  *
  * Architecture:
  *   Network Thread → AudioRingBuffer → Audio Thread → sceAudioOutputBlocking
@@ -42,14 +42,23 @@ extern "C" {
  */
 #define AUDIO_CHUNK_SAMPLES     512
 
+/**
+ * Maximum Opus frame size in samples per channel.
+ * Sunshine may send 5 ms (240), 10 ms (480), or 20 ms (960) frames.
+ * 960 = 20 ms @ 48 kHz — the largest standard Opus frame duration.
+ */
+#define AUDIO_MAX_FRAME_SAMPLES 960
+
 /** Maximum RTP payload (Moonlight uses up to 1400 bytes of PCM/OPUS) */
 #define AUDIO_MAX_RTP_SIZE      1400
 
 /**
  * Number of audio ring-buffer slots.
- * 8 × 512 stereo int16 frames = ~16 ms of pre-buffer.
+ * 64 × 512 samples / 48000 Hz ≈ 682 ms of pre-buffer — absorbs WiFi
+ * jitter and bursty packet arrivals on 802.11b.  Doubled from 32 to
+ * reduce ring-full drops and underruns caused by recv/decode bursts.
  */
-#define AUDIO_RING_SLOTS        8
+#define AUDIO_RING_SLOTS        64
 
 /*--------------------------------------------------------------------------
  * Audio Ring Buffer (lock-free SPSC)
@@ -119,6 +128,17 @@ void audio_thread_shutdown(void);
  * Returns: 1 if running, 0 if stopped or not started
  */
 int audio_thread_is_running(void);
+
+/**
+ * audio_thread_send_ping_burst - Send a rapid burst of audio pings after PLAY
+ *
+ * Mirrors the video ping burst in network_me.  Sends 3 pings with 30 ms
+ * spacing from the pre-bound audio socket to the server audio port so
+ * Sunshine can lock onto the client audio endpoint immediately.
+ *
+ * Returns: 0 on success (at least one ping sent), negative on error
+ */
+int audio_thread_send_ping_burst(void);
 
 /**
  * audio_thread_get_stats - Retrieve playback statistics

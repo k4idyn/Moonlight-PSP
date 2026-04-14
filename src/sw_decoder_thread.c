@@ -41,13 +41,13 @@
 
 extern PspConfig g_psp_config;
 
-/* FFmpeg-based decode pipeline (replaces CAVLC+VFPU) */
-extern int  ffmpeg_pipeline_init(void);
-extern void ffmpeg_pipeline_shutdown(void);
-extern int  ffmpeg_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 **out_rgba);
-extern void ffmpeg_pipeline_invalidate_refs(void);
-extern void ffmpeg_pipeline_flush_buffers(void);
-extern void ffmpeg_pipeline_abandon(void);
+/* OpenH264-based decode pipeline (native low-latency H.264 decoder) */
+extern int  oh264_pipeline_init(void);
+extern void oh264_pipeline_shutdown(void);
+extern int  oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 **out_rgba);
+extern void oh264_pipeline_invalidate_refs(void);
+extern void oh264_pipeline_flush_buffers(void);
+extern void oh264_pipeline_abandon(void);
 
 /* Forward declaration — lightweight CABAC detection */
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len);
@@ -69,7 +69,7 @@ static SceUID           g_dec_thread_id = -1;
 static SceUID           g_dec_sema = -1;
 static volatile int     g_dec_running = 0;
 
-/* These are now defined in ffmpeg_decode.c */
+/* These are now defined in openh264_decode.cpp */
 extern int              g_saw_first_idr;
 extern volatile int     g_idr_fully_decoded;
 int                     g_decoder_ready = 0;
@@ -82,7 +82,7 @@ static PacketRingBuffer *g_packet_rb = NULL;
 /* Timestamp of last decoded frame — read by main loop for latency display */
 volatile u32 g_last_frame_decode_us = 0;
 
-/* Watchdog: set to sceKernelGetSystemTimeLow() before ffmpeg_pipeline_decode_frame(),
+/* Watchdog: set to sceKernelGetSystemTimeLow() before oh264_pipeline_decode_frame(),
  * cleared to 0 after it returns.  Main loop checks: if non-zero and elapsed > 3s,
  * the decode is hung and force-restart is triggered. */
 volatile u32 g_decode_active_us = 0;
@@ -152,6 +152,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             s_wait_count = 0;
             s_cb_count = 0;
             s_last_usb_yield_us = 0;
+            g_decode_counters_reset_pending = 0;
         }
     }
 
@@ -214,12 +215,21 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     u64 t_cb_entry;
     sceRtcGetCurrentTick(&t_cb_entry);
 
-    /* Check first PPS NAL for CABAC before feeding to FFmpeg */
-    check_nal_for_cabac(nal_data, nal_len);
+    /* Check first PPS NAL for CABAC before feeding to OpenH264.
+     * After first successful PPS check OR 10 frames (whichever first),
+     * skip scanning entirely — saves ~50µs/frame of NAL traversal. */
+    {
+        static int s_cabac_check_count = 0;
+        if (s_cb_count <= 1) s_cabac_check_count = 0;  /* reset on restart */
+        if (!g_cabac_detected && s_cabac_check_count < 10) {
+            check_nal_for_cabac(nal_data, nal_len);
+            s_cabac_check_count++;
+        }
+    }
 
     u8 *rgba_out = NULL;
     g_decode_active_us = sceKernelGetSystemTimeLow();
-    int ret = ffmpeg_pipeline_decode_frame(nal_data, nal_len, &rgba_out);
+    int ret = oh264_pipeline_decode_frame(nal_data, nal_len, &rgba_out);
     g_decode_active_us = 0;  /* decode finished — watchdog can relax */
 
     if (s_cb_count <= 3 || (s_cb_count % 120) == 0 || ret < 0) {
@@ -245,6 +255,12 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         }
         s_prev_done = t_cb_done;
 
+        /* Frame pacing DISABLED — at 256x144@30fps with 12-17ms decode
+         * time, the PSP can barely sustain 15fps.  Any sleep here wastes
+         * precious CPU cycles.  The main loop's "skip to newest" already
+         * handles burst delivery by discarding stale frames, and
+         * sceDisplayWaitVblankStart provides natural 60Hz pacing. */
+
         /* Flush stale RTP packets when decoder falls behind.
          * A single decode takes 100-500ms. At 15fps / ~3 pkt/frame,
          * that's 5-25 packets accumulating per decode — NORMAL.
@@ -266,12 +282,12 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
                 rtp_reassembly_reset();
                 rtp_fec_reset();
 
-                /* Flush FFmpeg decoder state so it can cleanly accept the
-                 * next IDR.  Without this, FFmpeg stays in permanent EAGAIN
-                 * after receiving corrupted partial NALs from the post-flush
+                /* Flush OpenH264 decoder state so it can cleanly accept the
+                 * next IDR.  Without this, the decoder stays in permanent error
+                 * state after receiving corrupted partial NALs from the post-flush
                  * reassembly, and every callback returns ret=0 with the stale
                  * g_last_rgba → triggers another overrun → infinite loop. */
-                ffmpeg_pipeline_flush_buffers();
+                oh264_pipeline_flush_buffers();
 
                 /* Reset dedup counter so reassembly accepts fresh frames */
                 {
@@ -360,7 +376,7 @@ static int sw_decoder_thread(SceSize args, void *argp)
         while (g_packet_rb &&
                g_packet_rb->tail != g_packet_rb->head &&
                g_dec_running &&
-               batch < 256) {
+               batch < 512) {
 
             u16 pkt_len = g_packet_rb->slot_length[g_packet_rb->tail];
             if (pkt_len > 0) {
@@ -392,13 +408,13 @@ static int sw_decoder_thread(SceSize args, void *argp)
         if (processed && g_packet_rb) {
             u32 queued = (g_packet_rb->head + RING_BUFFER_SLOTS
                           - g_packet_rb->tail) % RING_BUFFER_SLOTS;
-            if (queued > 768) {
-                dec_log("RING BACKLOG %u/1024 -- flushing to prevent overflow\n",
+            if (queued > 512) {
+                dec_log("RING BACKLOG %u/1024 (>512) -- flushing to prevent overflow\n",
                         (unsigned)queued);
                 g_packet_rb->tail = g_packet_rb->head;
                 rtp_reassembly_reset();
                 rtp_fec_reset();
-                ffmpeg_pipeline_flush_buffers();
+                oh264_pipeline_flush_buffers();
                 {
                     extern volatile unsigned int g_last_good_frame;
                     g_last_good_frame = 0;
@@ -408,11 +424,11 @@ static int sw_decoder_thread(SceSize args, void *argp)
         }
 
         /* Sleep if nothing to do — woken by sema signal from network thread.
-         * Use 5-second timeout so heartbeats continue even when no packets arrive. */
+         * Use 500ms timeout so heartbeats continue and decoder wakes quickly. */
         if (!processed && g_dec_running &&
             (!g_packet_rb ||
              g_packet_rb->tail == g_packet_rb->head)) {
-            SceUInt timeout_us = 5 * 1000 * 1000;  /* 5 seconds */
+            SceUInt timeout_us = 500 * 1000;  /* 500ms */
             sceKernelWaitSema(g_dec_sema, 1, &timeout_us);
         }
         /* No per-batch yield: USB access is handled by time-based yield in
@@ -435,22 +451,22 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
 
     dec_log("Init: Software H.264 decode (CAVLC+VFPU dual-core)\n");
 
-    /* Frame pool REMOVED — push_sw_frame uses zero-copy from FFmpeg
+    /* Frame pool REMOVED — push_sw_frame uses zero-copy from OpenH264
      * double-buffer (g_rgba_buf[0/1]), saving ~2.2MB on PSP-1000. */
     dec_log("  Frame pool: DISABLED (zero-copy, saves %d KB)\n",
             (FRAME_POOL_SIZE * FRAME_BUF_SIZE) / 1024);
 
     /* Initialize unified resolution table from config — MUST happen before
-     * ffmpeg_pipeline_init() so all buffer allocations use consistent dimensions */
+     * oh264_pipeline_init() so all buffer allocations use consistent dimensions */
     stream_resolution_init(g_psp_config.width, g_psp_config.height);
 
-    /* Initialize FFmpeg H.264 decode pipeline */
-    int sw_res = ffmpeg_pipeline_init();
+    /* Initialize OpenH264 decode pipeline */
+    int sw_res = oh264_pipeline_init();
     if (sw_res < 0) {
-        dec_log("ffmpeg_pipeline_init failed: %d\n", sw_res);
+        dec_log("oh264_pipeline_init failed: %d\n", sw_res);
         return sw_res;
     }
-    dec_log("  Pipeline ready (FFmpeg H.264 decoder)\n");
+    dec_log("  Pipeline ready (OpenH264 decoder, low-latency)\n");
 
     /* Initialize FEC recovery subsystem (RS tables + slot buffers) */
     rtp_fec_init();
@@ -459,7 +475,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     g_dec_sema = sceKernelCreateSema("sw_dec_sema", 0, 0, 64, NULL);
     if (g_dec_sema < 0) {
         dec_log("CreateSema failed: 0x%08X\n", (unsigned)g_dec_sema);
-        ffmpeg_pipeline_shutdown();
+        oh264_pipeline_shutdown();
         return -2;
     }
 
@@ -475,7 +491,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     if (g_dec_thread_id < 0) {
         dec_log("CreateThread failed: 0x%08X\n", (unsigned)g_dec_thread_id);
         sceKernelDeleteSema(g_dec_sema);
-        ffmpeg_pipeline_shutdown();
+        oh264_pipeline_shutdown();
         return -3;
     }
     sceKernelStartThread(g_dec_thread_id, 0, NULL);
@@ -506,8 +522,8 @@ void sw_decoder_thread_shutdown(void)
         g_dec_sema = -1;
     }
 
-    /* Shut down FFmpeg decode pipeline */
-    ffmpeg_pipeline_shutdown();
+    /* Shut down OpenH264 decode pipeline */
+    oh264_pipeline_shutdown();
 
     /* Reset FEC state */
     rtp_fec_reset();
@@ -526,12 +542,12 @@ void sw_decoder_thread_shutdown(void)
  * sw_decoder_thread_force_restart — Watchdog recovery for decode pipeline stalls
  *
  * Called by main loop watchdog in two modes:
- * Mode A: FFmpeg infinite-loop — g_decode_active_us stuck >3s
+ * Mode A: OpenH264 infinite-loop — g_decode_active_us stuck >3s
  * Mode B: RTP/ring stall — no frames produced for >5s (idle >300)
  *
- * Forcibly terminates the stuck thread, abandons old FFmpeg context
+ * Forcibly terminates the stuck thread, abandons old OpenH264 context
  * (leaking ~2MB), flushes ring, reinits fresh, starts new thread.
- * Limited to 3 restarts max (~6MB total leak on 24MB PSP).
+ * Limited to 5 restarts max (~10MB total leak on 24MB PSP).
  * ============================================================================*/
 
 void sw_decoder_thread_force_restart(void)
@@ -569,18 +585,18 @@ void sw_decoder_thread_force_restart(void)
         sceKernelDelayThread(2000);  /* 2ms — enough for kernel cleanup */
     }
 
-    /* 2. Abandon old FFmpeg context (leaks memory but avoids accessing
+    /* 2. Abandon old OpenH264 context (leaks memory but avoids accessing
      *    corrupted state).  ME is killed and reinited inside. */
-    ffmpeg_pipeline_abandon();
+    oh264_pipeline_abandon();
     dec_log("WATCHDOG: pipeline abandoned\n");
 
-    /* 3. Allocate fresh FFmpeg codec context + RGBA buffers.
-     *    ffmpeg_pipeline_init skips ME PRX load (already loaded)
-     *    but re-creates codec context, AVFrames, AVPacket, RGBA bufs.
+    /* 3. Allocate fresh OpenH264 codec context + RGBA buffers.
+     *    oh264_pipeline_init skips ME PRX load (already loaded)
+     *    but re-creates codec context, RGBA bufs.
      *    ME ctrl/params are reused from abandon (not freed). */
-    int sw_res = ffmpeg_pipeline_init();
+    int sw_res = oh264_pipeline_init();
     if (sw_res < 0) {
-        dec_log("WATCHDOG: ffmpeg_pipeline_init FAILED %d -- decoder offline\n", sw_res);
+        dec_log("WATCHDOG: oh264_pipeline_init FAILED %d -- decoder offline\n", sw_res);
         diag_log_flush();
         return;
     }
@@ -613,13 +629,24 @@ void sw_decoder_thread_force_restart(void)
     g_idr_fully_decoded = 0;
     g_decode_active_us = 0;
 
-    /* 6b. Reset dedup counter so post-restart frames aren't dropped.
-     * Without this, g_last_good_frame holds the old frame_id from before
-     * the restart, causing a >100 jump detection on the first new frame. */
+    /* 6b. Preserve g_last_good_frame on restart.
+     * The CTRL PING thread piggybacks FEC status using lgf + stall_advance.
+     * If we reset lgf to 0, the piggybacked frame_index jumps backward
+     * (e.g. from 1502 to 10), which the server interprets as a corrupted
+     * client and permanently closes its send window.
+     *
+     * Instead, preserve lgf so the piggybacked frame_index continues
+     * monotonically from lgf + stall_advance.  When the RTP layer receives
+     * new frames after IDR, it will update lgf to the real frame index,
+     * which will be higher than the preserved value. */
     {
         extern volatile unsigned int g_last_good_frame;
-        g_last_good_frame = 0;
+        dec_log("WATCHDOG: preserving lgf=%u (not resetting to 0)\n",
+                g_last_good_frame);
     }
+
+    /* 6b2. Reset alive counter so watchdog detects fresh activity */
+    g_decoder_alive_counter = 0;
 
     /* 6c. Signal callback/decode statics to reset on next entry.
      * me_stressed, consecutive_corrupt, s_wait_count etc. are function-level

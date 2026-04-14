@@ -53,9 +53,11 @@ void resolution_update_custom(int width, int height);
  *   60Hz / 4 = 15fps,  60Hz / 3 = 20fps,
  *   60Hz / 2 = 30fps,  60Hz / 1 = 60fps
  */
-extern const char * const FPS_OPTIONS[4];
-extern const int    FPS_VALUES[4];
-#define FPS_COUNT 4
+extern const char * const FPS_OPTIONS[5];
+extern const int    FPS_VALUES[5];
+#define FPS_COUNT 5
+#define FPS_CUSTOM_INDEX 4
+
 
 /* Control mode options */
 extern const char * const CONTROL_MODE_OPTIONS[2];
@@ -109,15 +111,18 @@ typedef struct {
     char localBindIp[16];       /* Source IP for UDP sockets, or "" = INADDR_ANY */
     int uiThemeIndex;           /* Selected UI accent color index */
     int cabacTestMode;          /* 1 = request Main profile + CABAC in SDP (test only) */
+    int audioEnabled;           /* 1 = enable streaming audio, 0 = disable for performance */
 } PspConfig;
 
 /*--------------------------------------------------------------------------
  * Menu State
  *--------------------------------------------------------------------------*/
 typedef struct {
-    int currentSelection;   /* Currently selected menu item (0-3) */
+    int currentSelection;   /* Currently selected menu item */
     int resolutionIndex;    /* Selected resolution option */
     int fpsIndex;           /* Selected FPS option */
+    int customFpsValue;     /* The custom FPS value if custom is selected */
+    int audioEnabled;       /* Local state for Audio option */
     int controlModeIndex;   /* Selected control mode option */
     int bitrate;            /* Bitrate in kbps (500-4000) */
     int uiThemeIndex;       /* Selected UI theme index */

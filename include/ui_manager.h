@@ -241,6 +241,9 @@ void ui_clear(u32 color);
  */
 void ui_draw_gradient_bg(u32 top_color, u32 bottom_color);
 
+void ui_set_scissor(int x, int y, int w, int h);
+void ui_clear_scissor(void);
+
 /**
  * ui_draw_rect - Draw a filled axis-aligned rectangle.
  * Respects alpha (blending must be enabled via ui_set_blend(1) first
@@ -338,6 +341,20 @@ void ui_draw_header(const char *title);
  * @hint_text: the complete hint string (e.g. "X:Select  O:Back")
  */
 void ui_draw_footer_hint(const char *hint_text);
+
+/**
+ * ui_draw_text_inline - Render a mixed text+badge string at any (x,y).
+ *
+ * Parses {TOKEN} badge tokens inline with plain text. All 18 tokens
+ * supported: {X} {O} {SQ} {TR} {L} {R} {ST} {SE} {UP} {DN} {LF} {RF}
+ * {DP} {AN} {AU} {AD} {AL} {AR}. Returns the x position after the last
+ * character/icon rendered.
+ *
+ * @x, @y:  starting position (@y is the text baseline)
+ * @col:    ABGR colour for plain-text segments
+ * @text:   the hint string with optional {TOKEN} substitutions
+ */
+float ui_draw_text_inline(float x, float y, u32 col, const char *text);
 
 /**
  * ui_draw_panel - Draw a titled background panel (card).

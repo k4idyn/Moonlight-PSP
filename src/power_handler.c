@@ -215,10 +215,19 @@ static void handle_resume(void)
     }
 }
 
-static int power_callback(int arg1, int arg2, void *common)
+static int power_callback(int count, int powerFlags, void *common)
 {
-    if (arg1 == 1) g_power_event = 1;
-    else if (arg1 == 2) g_power_event = 2;
+    /* arg1 = callback invocation count (ignore).
+     * arg2 = power flag bitmask (PSP_POWER_CB_*).
+     * The old code checked arg1 which is the count, NOT the event type.
+     * This caused suspend/resume to never fire, leading to uncontrolled
+     * shutdown when the power switch was toggled. */
+    if (powerFlags & 0x00010000)      /* PSP_POWER_CB_SUSPENDING */
+        g_power_event = 1;
+    else if (powerFlags & 0x00080000) /* PSP_POWER_CB_STANDBY */
+        g_power_event = 1;
+    else if (powerFlags & 0x00040000) /* PSP_POWER_CB_RESUME_COMPLETE */
+        g_power_event = 2;
     return 0;
 }
 
@@ -258,7 +267,7 @@ int power_handler_init(void)
     memset(&g_cached_token, 0, sizeof(SessionToken));
     g_cached_token.is_valid = 0;
     
-    g_power_thread_id = sceKernelCreateThread("power_thread", power_thread, 0x18, 4096, 0, NULL);
+    g_power_thread_id = sceKernelCreateThread("power_thread", power_thread, 0x18, 4096, PSP_THREAD_ATTR_USER, NULL);
     if (g_power_thread_id < 0) return -1;
     
     int ret = sceKernelStartThread(g_power_thread_id, 0, NULL);

@@ -159,7 +159,8 @@ void configSetDefaults(PspConfig *config)
     /* PSP-specific settings */
     config->controlMode = DEFAULT_CONTROL_MODE;
     config->resolutionIndex = 0;             /* Quality preset: 368x208 */
-    config->fpsIndex = 0;                    /* 15 FPS (index 0 in [15,20,30,60]) */
+    config->fpsIndex = 0;                    /* 15 FPS (index 0 in [15,20,30,60,Custom]) */
+    config->audioEnabled = 1;                /* Enabled by default */
 
     /* Pairing persistence */
     memset(config->pairedHostIp, 0, sizeof(config->pairedHostIp));
@@ -260,7 +261,17 @@ int loadConfig(PspConfig *config)
             if (parseIntValue(trimmed, &value) == 0) {
                 config->fps = value;
                 /* Update fpsIndex for menu display */
-                config->fpsIndex = (value <= 15) ? 0 : (value <= 20) ? 1 : (value <= 30) ? 2 : 3;
+                if (value == 15) config->fpsIndex = 0;
+                else if (value == 20) config->fpsIndex = 1;
+                else if (value == 30) config->fpsIndex = 2;
+                else if (value == 60) config->fpsIndex = 3;
+                else config->fpsIndex = FPS_CUSTOM_INDEX;
+                fileLoaded = 1;
+            }
+        }
+        else if (strncmp(trimmed, "audioEnabled", 12) == 0) {
+            if (parseIntValue(trimmed, &value) == 0) {
+                config->audioEnabled = value;
                 fileLoaded = 1;
             }
         }
@@ -401,6 +412,9 @@ int saveConfig(const PspConfig *config)
     
     /* Write control mode */
     sprintf(line, "controlMode = %d\n", (int)config->controlMode);
+    writeString(fd, line);
+
+    sprintf(line, "audioEnabled = %d\n", config->audioEnabled);
     writeString(fd, line);
 
     writeString(fd, "\n[hosts]\n");

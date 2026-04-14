@@ -90,6 +90,15 @@ static u32 g_fec_percentage = 0;
 static int g_frame_submitted = 0;
 static int g_initialized = 0;
 
+/* Last FEC status echoed to server — used by CTRL PING piggyback */
+volatile u16 g_fec_last_highest_seq     = 0;
+volatile u16 g_fec_last_next_contig_seq = 0;
+volatile u16 g_fec_last_data_pkts       = 0;
+volatile u16 g_fec_last_parity_pkts     = 0;
+volatile u16 g_fec_last_recv_data       = 0;
+volatile u16 g_fec_last_recv_parity     = 0;
+volatile u8  g_fec_last_fec_pct         = 0;
+
 /* Reassembly callback */
 extern void rtp_reassembly_process_packet(u8 *packet, int packet_len);
 
@@ -126,6 +135,14 @@ void rtp_fec_reset(void)
     g_frame_submitted = 0;
     g_fec_recovery_clean = 0;
     s_consec_unrecoverable = 0;
+
+    /* NOTE: g_fec_last_* cached values are NOT reset here.
+     * These are used by the CTRL PING piggyback to report FEC status to
+     * the server.  After a force_restart, lgf is preserved to avoid a
+     * backward jump in piggybacked frame_index.  The cached sequence
+     * numbers must also be preserved for consistency — resetting them to 0
+     * while frame_index is 1452+ would confuse the server's flow control.
+     * Fresh frames will update these values naturally via rtp_fec_submit. */
 
     /* H-2: Free cached RS context to prevent leak across reconnects */
     if (s_cached_rs) {
@@ -241,26 +258,55 @@ static void submit_frame_packets(void)
     /* Per-frame FEC log silenced for performance */
     g_frame_submitted = 1;
 
-    /* Send per-frame FEC status (0x5502) to Sunshine so it knows we're alive */
+    /* Cache FEC values for CTRL PING piggyback (every frame) and send
+     * per-frame FEC status (0x5502) to Sunshine every 3rd frame.
+     *
+     * THROTTLE RATIONALE: At 30fps, sending FEC status every frame = 30
+     * UDP sends/sec on the CTRL socket.  Combined with CTRL PING (5/sec),
+     * IDR requests, and RFI messages, this overwhelms the PSP's tiny
+     * 802.11b socket send buffer after ~2 minutes.  When sends fail
+     * silently (ENOBUFS), the server stops receiving ACKs and its
+     * pending-frame counter grows until it hits the threshold and
+     * permanently stops sending video (observed at ~130s in 5-min tests).
+     *
+     * Sending every 3rd frame (10/sec) still gives the server timely
+     * ACKs while reducing CTRL socket pressure 3x.  The CTRL PING
+     * piggyback (1/sec) provides additional redundancy. */
     {
+        static u32 s_fec_send_counter = 0;
         u16 highest_seq = (u16)(g_lowest_seq + g_received_count - 1);
+        u16 next_contig = (u16)(g_lowest_seq + g_data_packets - 1);
         u16 received_data = (u16)(g_received_count > g_parity_packets ?
                                   g_received_count - g_parity_packets : g_received_count);
         u16 received_parity = (u16)(g_received_count > received_data ?
                                     g_received_count - received_data : 0);
-        control_stream_send_fec_status(
-            g_current_frame,
-            highest_seq,                           /* highestReceivedSequenceNumber */
-            (u16)(g_lowest_seq + g_data_packets - 1), /* nextContiguousSequenceNumber */
-            0,                                     /* missingPacketsBeforeHighestReceived */
-            (u16)g_data_packets,
-            (u16)g_parity_packets,
-            received_data,
-            received_parity,
-            (u8)g_fec_percentage,
-            0,  /* multiFecBlockIndex */
-            1   /* multiFecBlockCount */
-        );
+
+        /* Always cache — CTRL PING piggyback reads these */
+        g_fec_last_highest_seq     = highest_seq;
+        g_fec_last_next_contig_seq = next_contig;
+        g_fec_last_data_pkts       = (u16)g_data_packets;
+        g_fec_last_parity_pkts     = (u16)g_parity_packets;
+        g_fec_last_recv_data       = received_data;
+        g_fec_last_recv_parity     = received_parity;
+        g_fec_last_fec_pct         = (u8)g_fec_percentage;
+
+        s_fec_send_counter++;
+        if (s_fec_send_counter >= 3) {
+            s_fec_send_counter = 0;
+            control_stream_send_fec_status(
+                g_current_frame,
+                highest_seq,
+                next_contig,
+                0,
+                (u16)g_data_packets,
+                (u16)g_parity_packets,
+                received_data,
+                received_parity,
+                (u8)g_fec_percentage,
+                0,  /* multiFecBlockIndex */
+                1   /* multiFecBlockCount */
+            );
+        }
     }
 }
 
@@ -302,27 +348,28 @@ static void attempt_recovery_and_submit(void)
         /* DROP the frame entirely.  Submitting partial data causes the
          * CAVLC decoder to hit invalid VLC codes mid-NAL (Run045: IDR
          * frame 7 had 18/49 packets missing, producing 31KB of corrupt
-         * bitstream that even FFmpeg couldn't decode).  The decoder's
+         * bitstream that even OpenH264 couldn't decode).  The decoder's
          * error concealment will repeat the previous reference frame,
          * which looks far better than block-corruption artifacts.
          *
          * IMPORTANT: Do NOT set g_refs_corrupted here.  The dropped frame
-         * is never fed to FFmpeg, so FFmpeg's DPB (decoded picture buffer)
-         * remains intact.  The encoder's reference chain diverges for 1
-         * frame, but FFmpeg's error concealment handles this gracefully
-         * (mild motion compensation artifacts vs 60-frame REF-SKIP freeze
-         * cycle at 480x272 where IDRs are too rare to clear corruption).
+         * is never fed to the decoder, so OpenH264's DPB (decoded picture
+         * buffer) remains intact.  The encoder's reference chain diverges
+         * for 1 frame, but OpenH264's error concealment handles this
+         * gracefully (mild motion compensation artifacts vs 60-frame
+         * REF-SKIP freeze cycle at 480x272 where IDRs are too rare to
+         * clear corruption).
          *
          * History: VQ#15fps had 10 unrecoverable drops, each triggering
          * g_refs_corrupted=1 → 135 REF-SKIPs (4s freeze per cycle).
-         * Only 63 frames displayed in 200s.  With this fix, FFmpeg
+         * Only 63 frames displayed in 200s.  With this fix, OpenH264
          * decodes continuously with occasional 1-frame artifacts. */
         s_consec_unrecoverable++;
 
         /* Only escalate to IDR when the decode pipeline is actually broken
          * (g_refs_corrupted) or we have no reference at all.
          *
-         * When g_refs_corrupted==0, the dropped frame never entered FFmpeg
+         * When g_refs_corrupted==0, the dropped frame never entered OpenH264
          * so the DPB is intact.  Requesting IDR wastes bandwidth: at 480x272
          * IDRs are 17-20 data packets (23KB) which almost never survive
          * 802.11b packet loss.  Each failed IDR delivery consumes WiFi
@@ -373,9 +420,18 @@ static void attempt_recovery_and_submit(void)
      * 0 recoveries — too aggressive for small intra-refresh frames).
      * Now: attempt RS whenever we have enough total packets. */
 
-    /* We have enough packets — attempt RS recovery */
-    diag_log_write("FEC", "recovering frame %u: %u missing data, %u total received\n",
-                   g_current_frame, missing, g_received_count);
+    /* We have enough packets — attempt RS recovery.
+     * THROTTLED: log only first 3 + every 120th to avoid filling the
+     * 4KB diag_log buffer every ~2s and triggering a synchronous ms0:
+     * write that blocks ALL threads for 50-200ms (root cause of lag
+     * spikes at 15fps streaming). */
+    {
+        static u32 s_recovery_attempt_count = 0;
+        s_recovery_attempt_count++;
+        if (s_recovery_attempt_count <= 3 || (s_recovery_attempt_count % 120) == 0)
+            diag_log_write("FEC", "recovering frame %u: %u missing data, %u total received\n",
+                           g_current_frame, missing, g_received_count);
+    }
 
     receiveSize = 0;
     for (i = 0; i < g_total_packets; i++) {
@@ -443,8 +499,13 @@ static void attempt_recovery_and_submit(void)
     /* Do NOT release rs — keep cached for next frame */
 
     if (ret == 0) {
-        diag_log_write("FEC", "recovery SUCCESS for frame %u (%u packets recovered)\n",
-                       g_current_frame, missing);
+        {
+            static u32 s_recovery_ok_count = 0;
+            s_recovery_ok_count++;
+            if (s_recovery_ok_count <= 3 || (s_recovery_ok_count % 120) == 0)
+                diag_log_write("FEC", "recovery SUCCESS for frame %u (%u packets recovered)\n",
+                               g_current_frame, missing);
+        }
 
         /* Copy recovered packets into slots at full receiveSize.
          *

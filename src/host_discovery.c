@@ -602,7 +602,7 @@ int renderHostDiscoveryList(void)
                 item_y_tmp += HOST_ITEM_H + HOST_GAP;
             }
         }
-        ui_draw_footer_hint("X:Sel []:Scan /\\:Add Sel:WOL L+R:Del Start:Exit");
+        ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {SE}: WOL  {L}+{R}: Del  {ST}: Exit");
         ui_end_frame();
         return -1;
     }
@@ -648,7 +648,7 @@ int renderHostDiscoveryList(void)
         }
     }
 
-    ui_draw_footer_hint("X:Sel []:Scan /\\:Add Sel:WOL L+R:Del Start:Exit");
+    ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {SE}: WOL  {L}+{R}: Del  {ST}: Exit");
     ui_end_frame();
 
     if ((pad.Buttons & PSP_CTRL_CROSS) && !(g_prev_buttons & PSP_CTRL_CROSS)) {

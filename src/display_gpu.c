@@ -250,6 +250,14 @@ void display_frame(void *frame_data)
      * Must be power-of-2 and >= source width. */
     int tex_stride = g_stream_res.initialized ? g_stream_res.stride : ((src_w > 512) ? 1024 : 512);
 
+    /* RESTORE GU STATE AFTER POTENTIAL HUD/UI MODIFICATION
+     * The HUD uses intraFont which corrupts TexScale, TexOffset, Mode, Disable Blending, etc. */
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuColor(0xFFFFFFFF); /* Ensure no tint is applied */
+    sceGuDisable(GU_BLEND); /* Video frames shouldn't be blended */
+
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
 
@@ -295,16 +303,16 @@ void display_frame(void *frame_data)
 }
 
 /* ------------------------------------------------------------------ *
- * display_frame_finish - Swap buffers and VBlank sync
+ * display_frame_finish - Swap buffers (immediate, no VBlank wait)
  *
  * Call AFTER hud_render() so HUD composites before the swap.
- * PSPdisp calls sceGuSwapBuffers() then VBlank — we reverse
- * the order (VBlank first) to match existing Moonlight timing
- * and avoid tearing.
+ * Removed VBlank sync to maximize frame throughput — at 15fps
+ * actual decode rate on PSP, waiting for 60Hz VBlank wastes up
+ * to 16ms per frame (50% of decode budget).  Tearing is invisible
+ * at 256x144 resolution with GPU bilinear upscale.
  * ------------------------------------------------------------------ */
 void display_frame_finish(void)
 {
-    sceDisplayWaitVblankStart();
     s_frame_buffer = sceGuSwapBuffers();
 }
 

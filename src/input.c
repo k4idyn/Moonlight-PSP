@@ -22,6 +22,7 @@
 #include "control_stream.h"
 #include "diag_log.h"
 #include "settings_menu.h"
+#include "input.h"
 
 /* ------------------------------------------------------------------ *
  * Moonlight controller button bit-flags (u16 bitmask)
@@ -56,21 +57,6 @@
  * Combo modifier is always L-trigger (PSP_CTRL_LTRIGGER).
  * When L is held, the mapped psp_button activates the action.
  * ------------------------------------------------------------------ */
-typedef struct {
-    /* Virtual L2 trigger (left analog trigger 0xFF) */
-    uint32_t l2_button;      /* default: PSP_CTRL_CROSS */
-    /* Virtual R2 trigger (right analog trigger 0xFF) */
-    uint32_t r2_button;      /* default: PSP_CTRL_SQUARE */
-    /* Right stick directions */
-    uint32_t rs_up_button;   /* default: PSP_CTRL_UP    */
-    uint32_t rs_down_button; /* default: PSP_CTRL_DOWN  */
-    uint32_t rs_left_button; /* default: PSP_CTRL_LEFT  */
-    uint32_t rs_right_button;/* default: PSP_CTRL_RIGHT */
-    /* L3 / R3 (stick clicks) */
-    uint32_t l3_button;      /* default: PSP_CTRL_TRIANGLE (L+Tri=L3) */
-    uint32_t r3_button;      /* default: PSP_CTRL_CIRCLE   (L+Cir=R3) */
-} ButtonMapping;
-
 /* ------------------------------------------------------------------ *
  * Browser-mode mouse packet constants (Gen5+ protocol)
  * ------------------------------------------------------------------ */
@@ -92,7 +78,7 @@ typedef struct {
 static int          g_initialized = 0;
 static SceCtrlData  g_prev;      /* previous frame's controller state */
 static int          g_prev_valid; /* 0 until first poll completes  */
-static ButtonMapping g_mapping;  /* loaded combo mappings */
+ButtonMapping g_mapping;  /* loaded combo mappings */
 
 /* Access to global config for control mode */
 extern PspConfig g_psp_config;
@@ -138,6 +124,17 @@ void input_save_mapping(void)
     if (fd < 0) return;
     sceIoWrite(fd, &g_mapping, sizeof(g_mapping));
     sceIoClose(fd);
+}
+
+void button_mapping_get(ButtonMapping *mapping) {
+    if (mapping) *mapping = g_mapping;
+}
+
+void button_mapping_set(const ButtonMapping *mapping) {
+    if (mapping) {
+        g_mapping = *mapping;
+        input_save_mapping();
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -468,11 +465,12 @@ void input_poll_and_send(void)
     /* Read controller (non-blocking — peek, not read) */
     sceCtrlPeekBufferPositive(&pad, 1);
 
-    /* Inject remote/automation button state (from pspsh pokew) */
+    /* Inject remote/automation button state (from pspsh pokew).
+     * NOTE: Do NOT clear g_remote_buttons here — main.c clears it
+     * after all consumers (including hud_handle_input) have read it. */
     {
         extern volatile unsigned int g_remote_buttons;
         pad.Buttons |= g_remote_buttons;
-        g_remote_buttons = 0;
     }
 
     /* Only transmit when state actually changed */

@@ -10,6 +10,57 @@ never published; they're documented here so the commit history makes sense.
 
 ---
 
+## [0.2.1-beta] — 2026-04-13
+
+### Added — New Features
+- **Audio streaming (first time enabled):** Full Opus 48kHz stereo decode with AES-CBC decryption, PKCS#7 padding, FEC recovery, and Packet Loss Concealment (PLC). Audio is now on by default with an option to disable in the settings menu.
+- **PLC volume ducking:** Consecutive PLC frames are progressively attenuated (87.5% → 68.75% → 50%) to mask WiFi-loss-induced static artifacts. Uses fixed-point integer math for PSP-safe operation.
+- **Custom button mapping UI:** Interactive in-app menu to remap L2, R2, right stick axes, L3, and R3 to any PSP button/combo. Settings persist to config file.
+- **WiFi keepalive during streaming:** Network keepalive thread now stays active during stream sessions (was idle-only). Monitors WiFi state every 3s and prevents server-side stream stall from idle timeout.
+- **FEC piggyback acceleration:** Control stream FEC piggyback frequency doubled (every 5th ping → 2× per second), stall advance rate effectively doubled with cap raised 3600→7200.
+- **Audio enable/disable toggle:** New settings menu option to enable/disable audio decode. When disabled, audio thread is not started and all audio packets are silently consumed.
+- **OpenH264 third-party library:** Added `third_party/openh264/` with PSP-specific Makefile, decoder-only static build, deblocking disabled compile flag (`PSP_SKIP_DEBLOCKING`).
+
+### Changed — Decoder Replacement
+- **Replaced FFmpeg with OpenH264:** Switched H.264 decoder from FFmpeg libavcodec to a custom PSP port of OpenH264. Benefits: smaller code footprint, CABAC support, faster error concealment, no GPL dependency on FFmpeg. Old `ffmpeg_decode.c` moved to `legacy/`.
+- **Decoder pipeline:** New `openh264_decode.cpp` handles OpenH264 decode + ME YUV→RGBA dispatch with spin-wait ME completion (500K iterations, yield threshold 4).
+- **Deblocking filter disabled:** Compile-time `PSP_SKIP_DEBLOCKING` flag skips deblocking for ~15% decode speed improvement on PSP hardware.
+- **Decoder thread optimizations:** Batch decode size 512, ring threshold 512, semaphore timeout 500ms, optimized for throughput on PSP-1000.
+
+### Changed — UI Overhaul
+- **Settings menu revamp:** Added audio toggle, button mapping entry point, resolution/FPS selector, theme picker. Settings save to MS0 config file.
+- **Game grid UI:** Improved tile layout, icon rendering, visual polish.
+- **HUD overlay:** Updated FPS/latency display, Settings/Pause/Quit in-stream menu overlay.
+- **OSK input improvements:** Enhanced on-screen keyboard for IP/PIN entry with better cursor and validation.
+- **Exit dialog:** Improved stream exit confirmation dialog.
+
+### Changed — Network & Streaming
+- **Audio PLC threshold:** Increased from 25ms to 45ms (2.25× frame interval) to reduce false-positive PLC triggers that caused unnecessary static.
+- **Control stream:** Enhanced IDR request logic with rate limiting (1/sec after initial 5 rapid-fire), periodic IDR refresh every 60s, stall detection at 5s/10s.
+- **Thread priorities optimized:** net_recv=0x12, ctrl=0x18, audio=0x1A, decoder=0x1C, update=0x20, keepalive=0x30. Ensures network receives are highest priority.
+- **ME spin-wait tuning:** Reduced from 5M to 500K iterations, yield threshold from 64 to 4, for better CPU utilization.
+
+### Fixed
+- **Server-side stream stall:** WiFi keepalive now active during streaming prevents Sunshine from timing out the session. Sessions now run the full requested duration without server-initiated stop.
+- **IDR flood:** Three-part fix across RTP FEC, reassembly, and control stream reduces IDR requests from 66+ per session to near-zero during normal operation.
+- **Audio underruns:** Progressive optimization from 31% to 0% underrun rate through priority tuning, polling backoff, ring buffer management, and FEC recovery.
+- **Input forwarding reliability:** Per-channel reliable sequence numbers ensure all button presses register on the host.
+- **ME data cache coherence:** Proper dcache flush before/after ME dispatch eliminates corrupted YUV→RGBA output.
+
+### Performance (480×272 @ 15fps, 500 kbps)
+| Metric | v0.2.0-beta | v0.2.1-beta |
+|---|---|---|
+| Decoder | FFmpeg libavcodec | OpenH264 (smaller, CABAC) |
+| Audio | Decode-only, no playback | Full playback with PLC |
+| FPS (480×272) | 15–18 fps | 10–18 fps |
+| FPS (256×144@30fps) | N/A | 17 fps |
+| Audio underruns | N/A | 0.0–0.5% |
+| WiFi stability | Server stalled at ~35s | Full 120s+ sessions |
+| Watchdog restarts | Frequent | 0 |
+| Button mapping | Fixed L+D-pad | Customizable |
+
+---
+
 ## [0.2.0-beta] — 2026-04-11 — First Public Release
 
 **This is the first public beta.** The pipeline is proven on real PSP-1000 hardware at

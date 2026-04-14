@@ -143,7 +143,7 @@ int wol_show_confirm(const char *host_name, const char *mac_str)
         /* Prompt text */
         ui_draw_text_centered(80.0f, 320.0f, 116.0f, UI_COL_TEXT, prompt);
         /* Hint */
-        ui_draw_footer_hint("[X] Send  [O] Cancel");
+        ui_draw_footer_hint("{X}: Send  {O}: Cancel");
 
         ui_end_frame();
 

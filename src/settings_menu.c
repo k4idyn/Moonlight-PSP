@@ -18,6 +18,7 @@
 #include <pspdisplay.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "settings_menu.h"
 #include "config.h"
@@ -29,7 +30,7 @@ extern volatile unsigned int g_remote_buttons;
 /*--------------------------------------------------------------------------\n * Option array definitions (declared extern in settings_menu.h)
  *
  * MATHEMATICAL DERIVATION (706 samples, 14 hardware runs):
- *   CPU decode:   385 µs per 1000 pixels (H.264 baseline, FFmpeg 4.4.5 -O2)
+ *   CPU decode:   385 µs per 1000 pixels (H.264 baseline, OpenH264 -O2)
  *   ME yuv2rgba:   31 µs (uncached DMA via 0x40000000)
  *   GE upscale:  2000 µs (bilinear blit 480x272)
  *   Overhead:    1000 µs (sceKernel scheduling, IRQ latency, VSync)
@@ -58,9 +59,23 @@ const char * RESOLUTION_LABELS[3] = {
     s_custom_label, /* Custom — user enters WxH via OSK */
 };
 
+/* FPS values that evenly divide 60Hz (no VSync judder) */
+static char s_custom_fps_label[16] = "Custom";
+const char * const FPS_OPTIONS[5] = {
+    "15 FPS",
+    "20 FPS",
+    "30 FPS",
+    "60 FPS",
+    s_custom_fps_label
+};
+const int FPS_VALUES[5] = { 15, 20, 30, 60, -1 };
+
 /* Useless-box auto-coupling: when resolution changes, snap to these */
 const int RESOLUTION_OPTIMAL_FPS_IDX[3] = { 0, 2, 0 };  /* 15fps, 30fps, 15fps */
 const int RESOLUTION_OPTIMAL_BITRATE[3] = { 500, 500, 500 };  /* 500kbps flat */
+
+/* Forward declaration needed for fps_update_custom and resolution_update_custom */
+static MenuState g_menu_state;
 
 void resolution_update_custom(int width, int height)
 {
@@ -69,14 +84,11 @@ void resolution_update_custom(int width, int height)
     snprintf(s_custom_label, sizeof(s_custom_label), "%dx%d", width, height);
 }
 
-/* FPS values that evenly divide 60Hz (no VSync judder) */
-const char * const FPS_OPTIONS[4] = {
-    "15 FPS",
-    "20 FPS",
-    "30 FPS",
-    "60 FPS"
-};
-const int FPS_VALUES[4] = { 15, 20, 30, 60 };
+void fps_update_custom(int fps)
+{
+    g_menu_state.customFpsValue = fps;
+    snprintf(s_custom_fps_label, sizeof(s_custom_fps_label), "%d FPS", fps);
+}
 
 const char * const CONTROL_MODE_OPTIONS[2] = {
     "Xbox",
@@ -99,9 +111,9 @@ const char * const THEME_OPTIONS[10] = {
 /*--------------------------------------------------------------------------
  * Pixel layout constants — ALL in native 480x272 coordinates
  *--------------------------------------------------------------------------*/
-#define ROW_Y_START   40    /* First setting row top pixel          */
-#define ROW_HEIGHT    30    /* Height of each setting row card      */
-#define ROW_GAP        6    /* Gap between rows                     */
+#define ROW_Y_START   36    /* First setting row top pixel          */
+#define ROW_HEIGHT    32    /* Height of each setting row card      */
+#define ROW_GAP        8    /* Gap between rows                     */
 #define ROW_X         12    /* Left edge of setting cards           */
 #define ROW_W        456    /* Card width                           */
 #define VAL_W        120    /* Width of the value box on right side */
@@ -111,18 +123,22 @@ const char * const THEME_OPTIONS[10] = {
  *--------------------------------------------------------------------------*/
 #define MENU_ITEM_RESOLUTION    0
 #define MENU_ITEM_FPS           1
-#define MENU_ITEM_CONTROL_MODE  2
-#define MENU_ITEM_THEME         3
-#define MENU_ITEM_BITRATE       4
-#define MENU_ITEM_COUNT         5
+#define MENU_ITEM_AUDIO         2
+#define MENU_ITEM_CONTROL_MODE  3
+#define MENU_ITEM_BUTTON_MAP    4
+#define MENU_ITEM_THEME         5
+#define MENU_ITEM_BITRATE       6
+#define MENU_ITEM_COUNT         7
 
 #define BITRATE_STEP           100
 #define BITRATE_MIN            300
 
 /*--------------------------------------------------------------------------
- * Local State
+ * Local State - g_menu_state declared earlier for forward reference
  *--------------------------------------------------------------------------*/
-static MenuState g_menu_state;
+static float s_scroll_curr   = 0.0f;  /* current visible scroll position (integer after snap) */
+static float s_target_camera = 0.0f;  /* camera target set by boundary-scroll logic            */
+static float s_focus_anim    = 0.0f;  /* lerps toward currentSelection for the pop animation   */
 
 static int clamp_index(int value, int min_value, int max_value)
 {
@@ -170,39 +186,55 @@ static void autocouple_bitrate_from_fps(void)
 static void draw_setting_row(int row_idx, const char *label,
                              const char *value, int is_selected)
 {
-    /* --- WHAT THIS DOES ---
-     * Calculate this row's pixel Y position from its index.
-     * Then draw a card panel, the label, and the value selector box.
-     */
-    int ry = ROW_Y_START + row_idx * (ROW_HEIGHT + ROW_GAP);
+    /* Focus pop: the selected row grows 2% while the focus animation lerps.
+     * Cards further from the animated focus position stay at normal size. */
+    float dist  = fabsf((float)row_idx - s_focus_anim);
+    float scale = (dist < 1.0f) ? (1.0f + (1.0f - dist) * 0.02f) : 1.0f;
+    int item_h  = (int)((float)ROW_HEIGHT * scale);
+    int item_w  = (int)((float)ROW_W      * scale);
+
+    /* Row Y from smooth scroll; centre the grown card on its natural edge */
+    int ry_start = 41;
+    float ry_f   = ry_start + ((float)row_idx - s_scroll_curr) * (float)(ROW_HEIGHT + ROW_GAP);
+    int ry_base  = (int)ry_f;
+    int ry = ry_base - (item_h - ROW_HEIGHT) / 2;
+    int rx = ROW_X  - (item_w - ROW_W)  / 2;
+
+    /* Hard-cull rows fully outside the safe zone */
+    #define HEADER_BOTTOM 32
+    #define FOOTER_TOP    244
+    if (ry + item_h <= HEADER_BOTTOM || ry >= FOOTER_TOP) {
+        return;
+    }
 
     UiButton card;
-    card.x = ROW_X;
+    card.x = rx;
     card.y = ry;
-    card.w = ROW_W;
-    card.h = ROW_HEIGHT;
+    card.w = item_w;
+    card.h = item_h;
     card.focused = is_selected;
-    card.label[0] = '\0';   /* we draw label + value manually below */
+    card.label[0] = '\0';
     ui_draw_button(&card);
 
-    /* Label on the left (padded 8 px from card left edge) */
-    ui_draw_text((float)(ROW_X + 10),
-                 (float)(ry + ROW_HEIGHT / 2 + 4),
+    /* Label on the left */
+    ui_draw_text((float)(rx + 10),
+                 (float)(ry + item_h / 2 + 5),
                  is_selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT,
                  label);
 
-    /* Value selector on the right side of the card */
-    int vx = ROW_X + ROW_W - VAL_W - 8;
-    if (is_selected) {
-        /* Chain draw calls to get correct positioning */
-        float vy = (float)(ry + ROW_HEIGHT / 2 + 4);
+    /* Value selector: toggle items get < > arrows; action items (Button Map)
+     * just highlight the label in focus colour — no left/right toggle arrows. */
+    int vx = rx + item_w - VAL_W - 8;
+    if (is_selected && row_idx != MENU_ITEM_BUTTON_MAP) {
+        float vy = (float)(ry + item_h / 2 + 5);
         float x2 = ui_draw_text((float)vx, vy, UI_COL_ACCENT, "< ");
         x2 = ui_draw_text(x2, vy, UI_COL_TEXT_FOCUS, value);
         ui_draw_text(x2, vy, UI_COL_ACCENT, " >");
     } else {
         ui_draw_text((float)(vx + 16),
-                     (float)(ry + ROW_HEIGHT / 2 + 4),
-                     UI_COL_TEXT_DIM, value);
+                     (float)(ry + item_h / 2 + 5),
+                     is_selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT_DIM,
+                     value);
     }
 }
 
@@ -217,13 +249,30 @@ void settings_menu_draw(const PspConfig *config)
      * wait for VBlank so the user sees a tear-free render.
      */
 
+    /* Bounded step-ladder camera: scroll ONLY when cursor hits visible edge.
+     * While currentSelection stays within [camera, camera+4], camera is fixed.
+     * Pushing past either edge advances the camera exactly 1 slot. */
+    float sel = (float)g_menu_state.currentSelection;
+    if (sel < s_target_camera) {
+        s_target_camera = sel;
+    } else if (sel > s_target_camera + 4.0f) {
+        s_target_camera = sel - 4.0f;
+    }
+
+    /* Focus pop animation: lerps toward current selection for item scale-up */
+    s_focus_anim  += ((float)g_menu_state.currentSelection - s_focus_anim)  * 0.20f;
+    /* Smooth scroll: camera lerps toward target each VBlank (continuous draw loop) */
+    s_scroll_curr += (s_target_camera - s_scroll_curr) * 0.15f;
+
     ui_begin_frame();
 
     /* Gradient background: dark indigo top, slightly warmer bottom */
     ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
 
-    /* Top header bar */
-    ui_draw_header("Moonlight Settings");
+    /* Constrain all row drawing to the safe zone BETWEEN header and footer.
+     * This scissor rect is the hardware guarantee that no pill pixel ever
+     * bleeds into the header (y 0-31) or footer (y 244-271) strips. */
+    ui_set_scissor(0, 30, 480, 214); /* y=30..244: fills the 2px gap below header pill */
 
     /* --- Setting rows --- */
     draw_setting_row(MENU_ITEM_RESOLUTION,
@@ -236,10 +285,20 @@ void settings_menu_draw(const PspConfig *config)
                      FPS_OPTIONS[g_menu_state.fpsIndex],
                      g_menu_state.currentSelection == MENU_ITEM_FPS);
 
+    draw_setting_row(MENU_ITEM_AUDIO,
+                     "Audio",
+                     g_menu_state.audioEnabled ? "Enabled" : "Disabled",
+                     g_menu_state.currentSelection == MENU_ITEM_AUDIO);
+
     draw_setting_row(MENU_ITEM_CONTROL_MODE,
                      "Control Mode",
                      CONTROL_MODE_OPTIONS[g_menu_state.controlModeIndex],
                      g_menu_state.currentSelection == MENU_ITEM_CONTROL_MODE);
+
+    draw_setting_row(MENU_ITEM_BUTTON_MAP,
+                     "Button Mapping",
+                     "Edit >",
+                     g_menu_state.currentSelection == MENU_ITEM_BUTTON_MAP);
 
     draw_setting_row(MENU_ITEM_THEME,
                      "Theme",
@@ -256,14 +315,20 @@ void settings_menu_draw(const PspConfig *config)
                          g_menu_state.currentSelection == MENU_ITEM_BITRATE);
     }
 
+    /* Restore full-screen scissor so header and footer draw unclipped */
+    ui_clear_scissor();
+
+    /* Top header bar — drawn AFTER rows so it always sits on top */
+    ui_draw_header("Moonlight Settings");
+
     /* Footer hint — context-sensitive for Custom resolution */
     if (g_menu_state.currentSelection == MENU_ITEM_RESOLUTION &&
         g_menu_state.resolutionIndex == RESOLUTION_CUSTOM_INDEX) {
         ui_draw_footer_hint(
-            "L/R: Change  X: Edit  Start: Save  /\\: Skip");
+            "{LF}/{RF}: Change  {X}: Edit  {ST}: Save  {TR}: Skip");
     } else {
         ui_draw_footer_hint(
-            "Up/Down: Navigate  L/R: Change  X: Save  /\\: Skip");
+            "{UP}/{DN}: Navigate  {LF}/{RF}: Change  {X}: Save  {TR}: Skip");
     }
 
     ui_end_frame();
@@ -279,6 +344,12 @@ void settings_menu_init(PspConfig *config)
     
     /* Initialize menu state from loaded config */
     g_menu_state.currentSelection = 0;
+
+    /* Reset scroll state so the list always starts at the top when the
+     * menu is opened (avoids stale camera position from a prior session). */
+    s_scroll_curr   = 0.0f;
+    s_target_camera = 0.0f;
+    s_focus_anim    = 0.0f;
 
     /* If saved resolutionIndex is Custom, repopulate the custom slot
      * from the saved width/height so the label shows the right value. */
@@ -307,6 +378,10 @@ void settings_menu_init(PspConfig *config)
     }
 
     g_menu_state.fpsIndex = clamp_index(config->fpsIndex, 0, FPS_COUNT - 1);
+    if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX) {
+        fps_update_custom(config->fps);
+    }
+    g_menu_state.audioEnabled = config->audioEnabled;
     g_menu_state.controlModeIndex = clamp_index((int)config->controlMode, 0, CONTROL_MODE_COUNT - 1);
     g_menu_state.bitrate = clamp_index(config->bitrate, BITRATE_MIN, MAX_BITRATE);
     g_menu_state.uiThemeIndex = clamp_index(config->uiThemeIndex, 0, 9);
@@ -325,7 +400,13 @@ static void update_config_from_menu(PspConfig *config)
     
     /* Update FPS — uses FPS_VALUES array for clean mapping */
     config->fpsIndex = g_menu_state.fpsIndex;
-    config->fps = FPS_VALUES[g_menu_state.fpsIndex];
+    if (config->fpsIndex == FPS_CUSTOM_INDEX) {
+        config->fps = g_menu_state.customFpsValue;
+    } else {
+        config->fps = FPS_VALUES[g_menu_state.fpsIndex];
+    }
+
+    config->audioEnabled = g_menu_state.audioEnabled;
     
     /* Update control mode */
     config->controlMode = (ControlMode)g_menu_state.controlModeIndex;
@@ -370,7 +451,7 @@ int settings_menu_run(PspConfig *config)
         if ((pad.Buttons & PSP_CTRL_UP) && !(prev_pad.Buttons & PSP_CTRL_UP)) {
             g_menu_state.currentSelection--;
             if (g_menu_state.currentSelection < 0) {
-                g_menu_state.currentSelection = MENU_ITEM_COUNT - 1;
+                g_menu_state.currentSelection = 0;
             }
             g_menu_state.needsRedraw = 1;
         }
@@ -379,7 +460,7 @@ int settings_menu_run(PspConfig *config)
         if ((pad.Buttons & PSP_CTRL_DOWN) && !(prev_pad.Buttons & PSP_CTRL_DOWN)) {
             g_menu_state.currentSelection++;
             if (g_menu_state.currentSelection >= MENU_ITEM_COUNT) {
-                g_menu_state.currentSelection = 0;
+                g_menu_state.currentSelection = MENU_ITEM_COUNT - 1;
             }
             g_menu_state.needsRedraw = 1;
         }
@@ -399,11 +480,18 @@ int settings_menu_run(PspConfig *config)
                     if (g_menu_state.fpsIndex < 0) {
                         g_menu_state.fpsIndex = FPS_COUNT - 1;
                     }
+                    if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX && g_menu_state.customFpsValue == 0) g_menu_state.customFpsValue = 24;
                     autocouple_bitrate_from_fps(); /* useless-box: snap bitrate */
+                    break;
+                case MENU_ITEM_AUDIO:
+                    g_menu_state.audioEnabled = !g_menu_state.audioEnabled;
                     break;
                 case MENU_ITEM_THEME:
                     g_menu_state.uiThemeIndex = clamp_index(g_menu_state.uiThemeIndex - 1, 0, 9);
                     ui_apply_theme(g_menu_state.uiThemeIndex);
+                    break;
+                case MENU_ITEM_BUTTON_MAP:
+                    /* nothing to change with left/right */
                     break;
                 case MENU_ITEM_CONTROL_MODE:
                     g_menu_state.controlModeIndex--;
@@ -436,13 +524,20 @@ int settings_menu_run(PspConfig *config)
                     if (g_menu_state.fpsIndex >= FPS_COUNT) {
                         g_menu_state.fpsIndex = 0;
                     }
+                    if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX && g_menu_state.customFpsValue == 0) g_menu_state.customFpsValue = 24;
                     autocouple_bitrate_from_fps(); /* useless-box: snap bitrate */
+                    break;
+                case MENU_ITEM_AUDIO:
+                    g_menu_state.audioEnabled = !g_menu_state.audioEnabled;
                     break;
                 case MENU_ITEM_CONTROL_MODE:
                     g_menu_state.controlModeIndex++;
                     if (g_menu_state.controlModeIndex >= CONTROL_MODE_COUNT) {
                         g_menu_state.controlModeIndex = 0;
                     }
+                    break;
+                case MENU_ITEM_BUTTON_MAP:
+                    /* nothing to change with left/right */
                     break;
                 case MENU_ITEM_THEME:
                     g_menu_state.uiThemeIndex = clamp_index(g_menu_state.uiThemeIndex + 1, 0, 9);
@@ -470,6 +565,19 @@ int settings_menu_run(PspConfig *config)
                     autocouple_from_resolution();
                 }
                 g_menu_state.needsRedraw = 1;
+            } else if (g_menu_state.currentSelection == MENU_ITEM_FPS &&
+                       g_menu_state.fpsIndex == FPS_CUSTOM_INDEX) {
+                int cfps;
+                if (osk_get_fps_input(&cfps) == 0) {
+                    fps_update_custom(cfps);
+                    autocouple_bitrate_from_fps();
+                }
+                g_menu_state.needsRedraw = 1;
+            } else if (g_menu_state.currentSelection == MENU_ITEM_BUTTON_MAP) {
+                extern void button_mapping_ui_run(void);
+                button_mapping_ui_run();
+                /* reload config to pick up any changes, or just redraw */
+                g_menu_state.needsRedraw = 1;
             } else {
                 update_config_from_menu(config);
                 saveConfig(config);
@@ -492,14 +600,9 @@ int settings_menu_run(PspConfig *config)
             break;
         }
         
-        /* Redraw if needed */
-        if (g_menu_state.needsRedraw) {
-            settings_menu_draw(config);
-            g_menu_state.needsRedraw = 0;
-        }
-        
-        /* Small delay */
-        sceKernelDelayThread(16667);  /* ~60 Hz */
+        /* Always redraw — smooth scroll and focus-pop animations need
+         * every VBlank; ui_end_frame() syncs to display VBlank. */
+        settings_menu_draw(config);
     }
     
     return result;

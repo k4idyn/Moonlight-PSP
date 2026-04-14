@@ -56,7 +56,7 @@ int exit_dialog_run(void)
             (float)(panel_y + 45), UI_COL_TEXT_DIM,
             "All streams will be closed.");
 
-        ui_draw_footer_hint("[X] Exit  [O] Stay");
+        ui_draw_footer_hint("{X}: Exit  {O}: Stay");
         ui_end_frame();
 
         /* ---- Input ---- */

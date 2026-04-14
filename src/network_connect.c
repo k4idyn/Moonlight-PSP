@@ -79,7 +79,7 @@ extern PspConfig g_psp_config;
 #define RTSP_BUF_SIZE       4096
 #define SDP_BUF_SIZE        2048
 #define RTSP_CONNECT_TIMEOUT_MS 10000
-#define RTSP_RECV_TIMEOUT_MS    15000
+#define RTSP_RECV_TIMEOUT_MS    5000
 #define RTSP_CONNECT_MAX_RETRIES 3
 
 /* RTSP CSeq counter (increments per request) */
@@ -95,6 +95,7 @@ char g_video_ping_payload[17]   = {0};   /* X-SS-Ping-Payload from video SETUP (
 /* Audio stream parameters — for audio ping thread */
 int  g_audio_server_port        = 48000;
 char g_audio_ping_payload[17]   = {0};
+int  g_audio_rtsp_ok            = 0;   /* set to 1 when RTSP SETUP audio succeeds */
 
 /* Control stream parameters — for ENet handshake */
 int  g_control_server_port      = 47999;
@@ -103,6 +104,7 @@ unsigned char g_remote_input_key[16] = {0};
 int g_remote_input_key_valid = 0;
 
 static int g_rtsp_encrypted = 0;
+static int g_rtsp_last_resp_encrypted = 0;  /* Was last recv an encrypted frame? */
 static uint32_t g_rtsp_enc_tx_seq = 0;
 static mbedtls_gcm_context g_rtsp_gcm_ctx;
 
@@ -114,6 +116,11 @@ static int g_encryption_supported = 0;
 /* avRiKeyId — first 4 bytes of the AV decryption IV for audio packets.
  * Set during /launch or /resume from the locally generated rikeyid. */
 unsigned int g_av_ri_key_id = 0;
+
+/* Whether audio AES-CBC encryption was negotiated with the server.
+ * Set to 1 only if both the server and client agree on SS_ENC_AUDIO (bit 1).
+ * When 0, audio RTP payloads are raw Opus and must NOT be decrypted. */
+int g_audio_encryption_enabled = 0;
 
 /* Local UDP bind IP — always empty for real PSP hardware (INADDR_ANY). */
 char g_local_bind_ip[16] = {0};
@@ -918,7 +925,6 @@ extern const char *game_grid_ui_get_selected_title(void);
 static int prompt_existing_session_action(void)
 {
     int selection = 0;
-    int auto_frames = 0;  /* auto-resume after timeout */
 
     while (1) {
         UIEvent evt = ui_process_input();
@@ -929,12 +935,10 @@ static int prompt_existing_session_action(void)
         case UI_EVT_LEFT:
         case UI_EVT_UP:
             selection = 0;
-            auto_frames = 0;  /* reset on user input */
             break;
         case UI_EVT_RIGHT:
         case UI_EVT_DOWN:
             selection = 1;
-            auto_frames = 0;
             break;
         case UI_EVT_SELECT:
         case UI_EVT_START:
@@ -943,11 +947,6 @@ static int prompt_existing_session_action(void)
             return -1;
         default:
             break;
-        }
-
-        /* Auto-resume existing session after ~2 seconds (120 frames at 60fps) */
-        if (++auto_frames >= 120) {
-            return 0;  /* Resume */
         }
 
         memset(&resume_btn, 0, sizeof(resume_btn));
@@ -976,7 +975,7 @@ static int prompt_existing_session_action(void)
                               "Resume it, or stop it and start a new one.");
         ui_draw_button(&resume_btn);
         ui_draw_button(&quit_btn);
-        ui_draw_footer_hint("Left/Right:Choose  X:Confirm  O:Back");
+        ui_draw_footer_hint("{LF}/{RF}: Choose  {X}: Confirm  {O}: Back");
         ui_end_frame();
     }
 }
@@ -1083,6 +1082,9 @@ static int sunshine_launch_session(int target_appid)
     }
     g_av_ri_key_id = (unsigned int)rikeyid;
 
+    pair_log("[LAUNCH] rikeyid=%d (0x%08X) g_av_ri_key_id=%u (0x%08X) &g_av_ri_key_id=%p\n",
+             rikeyid, (unsigned int)rikeyid, g_av_ri_key_id, g_av_ri_key_id, (void *)&g_av_ri_key_id);
+
     /* ------------------------------------------------------------------
      * Step C: If an app is already running, show Resume / Quit popup.
      * Stop the stream_connect render thread first to avoid two threads
@@ -1092,6 +1094,8 @@ static int sunshine_launch_session(int target_appid)
         pair_log("[LAUNCH] existing session detected (currentgame=%d)\n",
                  current_game);
 
+        stream_connect_stop();
+
         int user_choice = prompt_existing_session_action();
 
         if (user_choice == -1) {
@@ -1099,6 +1103,8 @@ static int sunshine_launch_session(int target_appid)
             pair_log("[LAUNCH] user cancelled session action\n");
             return -1;
         }
+
+        stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
 
         if (user_choice == 0) {
             /* Resume existing session — send /resume instead of /launch */
@@ -1168,8 +1174,10 @@ static int sunshine_launch_session(int target_appid)
                 pair_log("[CANCEL] request failed, proceeding anyway\n");
             }
 
-            /* Wait for Sunshine to release sockets/encoder */
-            sceKernelDelayThread(3000 * 1000);
+            /* Wait for Sunshine to release sockets/encoder.
+             * 6s is needed — 3s was too short and caused RTSP ANNOUNCE
+             * ECONNRESET (errno 104) after cancel+relaunch. */
+            sceKernelDelayThread(6000 * 1000);
             current_game = 0;
         }
     }
@@ -1492,6 +1500,9 @@ static int rtsp_send_and_recv(int sock, const char *request,
     int header_end_pos = -1;
     int content_length = -1;
     u32 start_ms;
+    u32 body_recv_ms = 0;  /* When DESCRIBE body first received (for secondary timeout) */
+
+    g_rtsp_last_resp_encrypted = 0;
 
     /* Send the request on blocking socket and handle partial writes. */
     nb = 0;
@@ -1527,8 +1538,23 @@ static int rtsp_send_and_recv(int sock, const char *request,
         encrypted_buf[7] = (unsigned char)(g_rtsp_enc_tx_seq);
         memcpy(encrypted_buf + 8, tag, 16);
 
-        ret = sceNetInetSend(sock, encrypted_buf, plaintext_len + 24, 0);
-        if (ret < 0) return ret;
+        /* Send encrypted frame in MSS-sized chunks (MTU safety,
+         * matching moonlight-common-c sendMtuSafe). */
+        {
+            int total_to_send = plaintext_len + 24;
+            int bytes_sent = 0;
+            while (bytes_sent < total_to_send) {
+                int chunk = total_to_send - bytes_sent;
+                if (chunk > 536) chunk = 536;  /* TCPv4 MSS */
+                ret = sceNetInetSend(sock, encrypted_buf + bytes_sent, chunk, 0);
+                if (ret <= 0) {
+                    pair_log("[RTSP] encrypted send failed at %d/%d (errno %d)\n",
+                             bytes_sent, total_to_send, sceNetInetGetErrno());
+                    return -1;
+                }
+                bytes_sent += ret;
+            }
+        }
     } else {
         req_len = (int)strlen(request);
         sent = 0;
@@ -1552,7 +1578,7 @@ static int rtsp_send_and_recv(int sock, const char *request,
         }
     }
 
-    pspDebugScreenPrintf("rtsp: sent %d bytes\n", ret);
+    /* Removed debug screen printf — interferes with GU rendering */
 
     /* Receive the response (non-blocking with timeout). */
     nb = 1;
@@ -1599,6 +1625,7 @@ static int rtsp_send_and_recv(int sock, const char *request,
                             memcpy(response, dec_buf, (size_t)len);
                             total_recv = len;
                             response[total_recv] = '\0';
+                            g_rtsp_last_resp_encrypted = 1;
                             break;
                         }
                     }
@@ -1631,6 +1658,19 @@ static int rtsp_send_and_recv(int sock, const char *request,
                     }
                 } else if (!strstr(request, "DESCRIBE ")) {
                     break;
+                } else {
+                    /* DESCRIBE with no Content-Length: the server may not
+                     * close the TCP connection promptly (especially if it
+                     * doesn't do encrypted RTSP).  Use a 2-second secondary
+                     * timeout after receiving the first body data. */
+                    if (body_recv_ms == 0) {
+                        body_recv_ms = sceKernelGetSystemTimeLow() / 1000;
+                    }
+                    if ((sceKernelGetSystemTimeLow() / 1000) - body_recv_ms > 2000) {
+                        pair_log("[RTSP] DESCRIBE body timeout (no Content-Length), accepting %d bytes\n",
+                                 total_recv);
+                        break;
+                    }
                 }
             }
         }
@@ -1651,6 +1691,20 @@ static int rtsp_send_and_recv(int sock, const char *request,
     }
 
     response[total_recv] = '\0';
+
+    /* Drain any remaining data (e.g. server FIN) to prevent RST on close.
+     * moonlight-common-c reads until recv returns 0 (FIN); we break early
+     * after decrypting the encrypted response.  Without draining, close()
+     * on a socket with unread FIN can send RST, potentially causing the
+     * server to reject the next TCP connection. */
+    if (g_rtsp_last_resp_encrypted) {
+        char drain_buf[64];
+        int drain_ret;
+        sceKernelDelayThread(10 * 1000);  /* 10ms for FIN to arrive */
+        do {
+            drain_ret = sceNetInetRecv(sock, drain_buf, sizeof(drain_buf), 0);
+        } while (drain_ret > 0);
+    }
 
     if (header_end_pos >= 0 && content_length >= 0) {
         if (total_recv < header_end_pos + content_length) {
@@ -2013,6 +2067,7 @@ static int rtsp_setup_stream(int sock, const char *stream_id)
         if (audio_thread_reserve_client_port(&prepared_port) == 0 && prepared_port > 0) {
             client_port_lo = (int)prepared_port;
             client_port_hi = (int)prepared_port + 1;
+            pair_log("[RTSP] audio client_port=%d (reserved socket)\n", client_port_lo);
         } else {
             pair_log("[RTSP] ERROR: audio pre-bind failed; cannot continue RTSP SETUP\n");
             return -1;
@@ -2221,6 +2276,8 @@ static int rtsp_announce(int sock, int enc_enabled)
         {
             int announce_video_port = g_video_client_port > 0 ?
                                       g_video_client_port : MOONLIGHT_VIDEO_PORT;
+            unsigned short announce_audio_port = 0;
+            audio_thread_reserve_client_port(&announce_audio_port);
 
 
 
@@ -2272,7 +2329,7 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "a=x-nv-audio.surround.numChannels:2\r\n"
                 "a=x-nv-audio.surround.channelMask:3\r\n"
                 "a=x-nv-audio.surround.AudioQuality:0\r\n"
-                "a=x-nv-aqos.packetDuration:5\r\n"
+                "a=x-nv-aqos.packetDuration:20\r\n"
                 /* --- Transport: ENet reliable UDP, no qWAVE DSCP --- */
                 "a=x-nv-general.useReliableUdp:1\r\n"
                 "a=x-nv-aqos.qosTrafficType:0\r\n"
@@ -2318,7 +2375,10 @@ static int rtsp_announce(int sock, int enc_enabled)
                 /* --- Media line --- */
                 "m=video %d\r\n"
                 "a=rtpmap:96 H264/90000\r\n"
-                "a=fmtp:96 packetization-mode=1;profile-level-id=%s\r\n",
+                "a=fmtp:96 packetization-mode=1;profile-level-id=%s\r\n"
+                /* --- Audio media line (tells Sunshine where to send audio) --- */
+                "m=audio %d\r\n"
+                "a=rtpmap:97 opus/48000/2\r\n",
                 CLIENT_VERSION,
                 stream_w, stream_h, stream_fps,
                 packet_size,
@@ -2329,7 +2389,8 @@ static int rtsp_announce(int sock, int enc_enabled)
                 bitrate_kbps, bitrate_kbps,
                 bitrate_kbps,
                 announce_video_port,
-                profile_level_id);
+                profile_level_id,
+                (int)announce_audio_port);
             }
 
             if (sdp_len >= (int)sizeof(sdp_payload))
@@ -2509,6 +2570,7 @@ int rtsp_session(void)
 
     g_rtsp_session_id[0] = '\0';
     rtsp_cseq = 1;
+    g_rtsp_enc_tx_seq = 0;  /* Reset encryption sequence for fresh RTSP attempt */
     g_video_client_port = 0;
     g_video_server_ip[0] = '\0';
     g_video_ping_payload[0] = '\0';
@@ -2534,6 +2596,15 @@ int rtsp_session(void)
         ret = rtsp_options(sock);
         sceNetInetClose(sock); sock = -1;
         if (ret < 0) goto rtsp_fail;
+    }
+
+    /* Auto-detect: if server responded plaintext to our encrypted OPTIONS,
+     * it likely does not implement encrypted RTSP.  Switch to plaintext
+     * for all subsequent commands to avoid 12s DESCRIBE timeouts and
+     * SETUP ECONNRESET (errno 104) from the server. */
+    if (g_rtsp_encrypted && !g_rtsp_last_resp_encrypted) {
+        pair_log("[RTSP] server responded plaintext — disabling RTSP encryption\n");
+        g_rtsp_encrypted = 0;
     }
 
     sceKernelDelayThread(100 * 1000);
@@ -2567,27 +2638,38 @@ int rtsp_session(void)
         pair_log("[RTSP] encryptionSupported=%d\n", g_encryption_supported);
     }
 
+    pair_log("[RTSP] DESCRIBE done, delaying 100ms before SETUP...\n");
     sceKernelDelayThread(100 * 1000);
 
-    /* 3a. SETUP audio */
+    /* 3a. SETUP audio (non-fatal — video continues if audio SETUP fails) */
+    g_audio_rtsp_ok = 0;
+    pair_log("[RTSP] connecting for SETUP audio...\n");
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_VIDEO);
     sock = rtsp_connect();
-    if (sock < 0) { ret = -1; goto rtsp_fail; }
-    ret = rtsp_setup_stream(sock, g_audio_stream_id);
-    sceNetInetClose(sock); sock = -1;
-    if (ret < 0) {
-        pair_log("[RTSP] SETUP audio failed, retrying...\n");
-        sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
-        if (sock < 0) { ret = -1; goto rtsp_fail; }
+    if (sock < 0) {
+        pair_log("[RTSP] WARN: audio connect failed, continuing without audio\n");
+    } else {
         ret = rtsp_setup_stream(sock, g_audio_stream_id);
         sceNetInetClose(sock); sock = -1;
-        if (ret < 0) goto rtsp_fail;
+        if (ret < 0) {
+            pair_log("[RTSP] SETUP audio failed, retrying...\n");
+            sceKernelDelayThread(500 * 1000);
+            sock = rtsp_connect();
+            if (sock >= 0) {
+                ret = rtsp_setup_stream(sock, g_audio_stream_id);
+                sceNetInetClose(sock); sock = -1;
+            }
+        }
+        if (ret >= 0) {
+            g_audio_rtsp_ok = 1;
+            ret = audio_thread_start_ping_only();
+            if (ret < 0) pair_log("[RTSP] WARN: audio ping failed\n");
+        } else {
+            pair_log("[RTSP] WARN: audio SETUP failed after retry, continuing without audio\n");
+        }
     }
 
-    ret = audio_thread_start_ping_only();
-    if (ret < 0) pair_log("[RTSP] WARN: audio ping failed\n");
-
+    pair_log("[RTSP] SETUP audio done, delaying 50ms before SETUP video...\n");
     sceKernelDelayThread(50 * 1000);
 
     /* 3b. SETUP video */
@@ -2626,7 +2708,14 @@ int rtsp_session(void)
 
     /* 4. ANNOUNCE */
     {
-        int enc_to_use = g_encryption_supported ? 1 : 0;
+        /* Negotiate encryption: only enable video encryption (bit 0).
+         * The PSP client does NOT implement SS_ENC_CONTROL_V2 (bit 2) —
+         * requesting it causes the server to ECONNRESET on RTSP PLAY.
+         * Track audio encryption separately for the audio recv loop. */
+        int enc_to_use = (g_encryption_supported & 1) ? 1 : 0;  /* SS_ENC_VIDEO only */
+        g_audio_encryption_enabled = (g_encryption_supported & 2) ? 1 : 0;
+        pair_log("[RTSP] enc_to_use=%d (audio_enc=%d)\n",
+                 enc_to_use, g_audio_encryption_enabled);
         sock = rtsp_connect();
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_announce(sock, enc_to_use);
@@ -2642,7 +2731,7 @@ int rtsp_session(void)
         }
     }
 
-    sceKernelDelayThread(50 * 1000);
+    sceKernelDelayThread(1000 * 1000);  /* 1s: let server settle after ANNOUNCE */
 
     /* Note: intraRefresh:1 is in SDP but only works for HEVC on Sunshine.
      * For H.264, IDR requests are the only way to get keyframes.
@@ -2673,14 +2762,25 @@ int rtsp_session(void)
                  g_video_server_ip, g_video_server_port);
     }
 
+    /* Prime audio endpoint — mirrors video burst so Sunshine locks onto
+     * the client audio port immediately after PLAY. */
+    if (g_audio_rtsp_ok) {
+        if (audio_thread_send_ping_burst() == 0) {
+            pair_log("[RTSP] sent initial audio ping burst to %s:%d\n",
+                     g_video_server_ip, g_audio_server_port);
+        }
+    }
+
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_READY);
     sceKernelDelayThread(100 * 1000);
 
     pair_log("[RTSP] session established successfully\n");
+    diag_log_flush();
     return 0;
 
 rtsp_fail:
     if (sock >= 0) sceNetInetClose(sock);
+    diag_log_flush();
     return ret;
 }
 
@@ -3445,13 +3545,25 @@ int network_connect_all(void)
     }
 
     /*--- Step 2: RTSP Session -----------------------------------------------*/
+    /* Give the server a moment to finish setting up the RTSP listener after
+     * /launch.  500ms is enough — longer delays waste time on slow WiFi. */
+    sceKernelDelayThread(500 * 1000);
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
     ret = rtsp_session();
     if (ret < 0)
     {
-        /* RTSP failed — retry once before giving up.  WiFi packet loss
-         * can cause RTSP TCP connections to time out intermittently. */
-        pair_log("[RTSP] attempt 1 failed, retrying after 2s...\n");
+        /* RTSP failed — retry with increasing backoff.  WiFi packet loss
+         * can cause RTSP TCP connections to time out, and after a
+         * CANCEL+LAUNCH the server may need several seconds to reset
+         * its RTSP listener. */
+        pair_log("[RTSP] attempt 1 failed, retrying after 1s...\n");
+        sceKernelDelayThread(1000 * 1000);
+        stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
+        ret = rtsp_session();
+    }
+    if (ret < 0)
+    {
+        pair_log("[RTSP] attempt 2 failed, retrying after 2s...\n");
         sceKernelDelayThread(2000 * 1000);
         stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
         ret = rtsp_session();

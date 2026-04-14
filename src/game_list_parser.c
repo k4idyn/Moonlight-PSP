@@ -280,14 +280,28 @@ int game_list_fetch(GameList *gameList)
     snprintf(url, sizeof(url), "/applist?uniqueid=%s&uuid=%s",
              client_identity_get_uid(), client_identity_get_uuid());
     
-    /* Use the mbedTLS HTTPS client (defined in network_connect.c) */
+    /* Use the mbedTLS HTTPS client (defined in network_connect.c).
+     * Retry up to 3 times on TLS/HTTP failure — the PSP's TLS stack
+     * occasionally fails the first handshake (-0x7280 = SSL_CONN_EOF). */
     extern int https_launch_get(const char *host, int port, const char *path,
                                 char *response, int response_size);
-    ret = https_launch_get(gameList->hostIp, 47984, url, recv_buf, HTTP_RECV_BUFFER_SIZE - 1);
-    if (ret < 0) {
-        pspDebugScreenPrintf("game_list_fetch: HTTP request failed (%d)\n", ret);
-        free(recv_buf);
-        return ret;
+    {
+        int attempts;
+        for (attempts = 0; attempts < 3; attempts++) {
+            if (attempts > 0) {
+                pspDebugScreenPrintf("game_list_fetch: retry %d/3...\n", attempts + 1);
+                sceKernelDelayThread(2000 * 1000); /* 2s between retries */
+            }
+            ret = https_launch_get(gameList->hostIp, 47984, url, recv_buf, HTTP_RECV_BUFFER_SIZE - 1);
+            if (ret >= 0 && strlen(recv_buf) > 0)
+                break; /* success */
+            pspDebugScreenPrintf("game_list_fetch: attempt %d failed (%d)\n", attempts + 1, ret);
+        }
+        if (ret < 0 || strlen(recv_buf) == 0) {
+            pspDebugScreenPrintf("game_list_fetch: HTTP request failed after %d attempts (%d)\n", attempts, ret);
+            free(recv_buf);
+            return (ret < 0) ? ret : -1;
+        }
     }
 
     /* https_launch_get returns 0 on success; derive actual length from buffer */

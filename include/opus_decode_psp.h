@@ -25,8 +25,22 @@ int opus_psp_init(int sample_rate, int channels, int streams, int coupled_stream
 int opus_psp_decode(const unsigned char *opus_data, int opus_len,
                     int16_t *pcm_out, int frame_size);
 
+/* Decode using Opus in-band FEC.  Call with the CURRENT packet's data
+ * to recover the PREVIOUS lost packet using embedded forward error
+ * correction.  The Opus encoder embeds a low-bitrate copy of the
+ * previous frame's audio in each packet.  When a gap is detected,
+ * call this with the next-received packet to reconstruct the lost one.
+ * Returns number of decoded samples per channel, or negative on error */
+int opus_psp_decode_fec(const unsigned char *opus_data, int opus_len,
+                        int16_t *pcm_out, int frame_size);
+
 /* Shutdown and free decoder */
 void opus_psp_shutdown(void);
+
+/* Return the frame size (samples per channel) of the last successfully
+ * decoded packet.  Used to invoke PLC with the correct frame duration.
+ * Returns 240 (5 ms @ 48 kHz) until the first successful decode. */
+int opus_psp_last_frame_size(void);
 
 #ifdef __cplusplus
 }

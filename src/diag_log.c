@@ -42,6 +42,10 @@ static char  s_buf[LOG_BUF_SIZE];
 static int   s_buf_pos = 0;
 static int   s_first_write = 1;  /* truncate log on first write each load */
 
+/* ---------- time-guarded flush ---------- */
+#define FLUSH_TIME_GUARD_US  2000000  /* flush if >2 seconds since last */
+static u32   s_last_flush_us = 0;
+
 /* ---------- thread safety ---------- */
 static SceUID s_sem = -1;
 
@@ -82,6 +86,7 @@ static void flush_locked(void)
     write_to_path(LOG_PATH_MS);
 
     s_buf_pos = 0;
+    s_last_flush_us = sceKernelGetSystemTimeLow();
 }
 
 /* ---------- public API ---------- */
@@ -127,9 +132,21 @@ void diag_log_write(const char *tag, const char *fmt, ...)
     memcpy(s_buf + s_buf_pos, line, (size_t)len);
     s_buf_pos += len;
 
-    /* proactive flush when buffer is getting full */
-    if (s_buf_pos >= FLUSH_THRESH) {
-        flush_locked();
+    /* Threshold flush: keep logs flowing without per-write ms0: I/O.
+     * Per-write flushing caused catastrophic WiFi/ms0: DMA contention
+     * on PSP — TCP SYN-ACK packets were missed, adding 5+ second
+     * delays to RTSP connects and causing PLAY timeouts.
+     *
+     * Time-guard: flush if >2s since last flush even if below threshold,
+     * so diagnostic data is never more than 2s stale. */
+    {
+        u32 now_us = sceKernelGetSystemTimeLow();
+        if (s_buf_pos >= FLUSH_THRESH ||
+            (s_buf_pos > 0 && (now_us - s_last_flush_us) > FLUSH_TIME_GUARD_US))
+        {
+            flush_locked();
+            s_last_flush_us = now_us;
+        }
     }
 
     sceKernelSignalSema(s_sem, 1);

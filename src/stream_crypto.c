@@ -161,14 +161,29 @@ int stream_crypto_decrypt_audio(unsigned char *payload, int payload_len,
         return -1;
     }
 
-    /* Construct per-packet IV: BE32(ri_key_id + rtp_seq) in bytes [0..3],
-     * bytes [4..15] = 0.  This matches moonlight-common-c AudioStream.c. */
+    /* Construct per-packet IV matching moonlight-common-c AudioStream.c:
+     *   avRiKeyId = integer rikeyid value  (same as g_av_ri_key_id)
+     *   ivSeq     = BE32(avRiKeyId + seq)  // sum, then big-endian bytes
+     *   memcpy(iv, &ivSeq, 4)              // first 4 bytes of 16-byte IV
+     * Net result: iv[0..3] = BE(riKeyId + seq), bytes [4..15] = 0. */
     iv_val = ri_key_id + (unsigned int)rtp_seq;
     iv[0] = (unsigned char)(iv_val >> 24);
     iv[1] = (unsigned char)(iv_val >> 16);
     iv[2] = (unsigned char)(iv_val >>  8);
     iv[3] = (unsigned char)(iv_val);
     memset(iv + 4, 0, 12);
+
+    /* Diagnostic: log IV details for first few packets */
+    {
+        static int audio_dec_log = 0;
+        if (audio_dec_log < 3) {
+            crypto_log("[CRYPTO] audio IV: rikeyid=0x%08X +seq=%u = 0x%08X iv=[%02X %02X %02X %02X] len=%d\n",
+                       ri_key_id,
+                       (unsigned int)rtp_seq, iv_val,
+                       iv[0], iv[1], iv[2], iv[3], payload_len);
+            audio_dec_log++;
+        }
+    }
 
     ret = mbedtls_aes_crypt_cbc(&s_aes_ctx, MBEDTLS_AES_DECRYPT,
                                  (size_t)payload_len,

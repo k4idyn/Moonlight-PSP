@@ -2,13 +2,13 @@
 
 # PSP Moonlight
 
-**v0.2.0-beta · Asymmetric Dual-Core Software H.264 Streaming Client for Sony PlayStation Portable**
+**v0.2.1-beta · Asymmetric Dual-Core Software H.264 Streaming Client for Sony PlayStation Portable**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
 [![Status](https://img.shields.io/badge/status-beta-yellow)](#known-issues)
-[![Release](https://img.shields.io/badge/release-v0.2.0--beta-orange)](#changelog)
+[![Release](https://img.shields.io/badge/release-v0.2.1--beta-orange)](#changelog)
 
 </div>
 
@@ -20,7 +20,7 @@ This is a **complete architectural rewrite** of the original [moonlight-psp-core
 
 This version is a ground-up custom RTSP/RTP/FEC/H.264/VFPU pipeline with zero dependency on `moonlight-common-c`. It was developed internally and never published in alpha form. **v0.2.0-beta is the first public release of the working decoder.**
 
-> **Status (2026-04-11):** Beta. Connects, pairs, fetches game library, receives video, decodes H.264, and outputs RGBA via the VFPU Media Engine. Full end-to-end streaming confirmed on real PSP-1000 hardware at 15–18 fps. Audio, input forwarding, FEC recovery, and watchdog auto-restart are all live.
+> **Status (2026-04-13):** Beta. Connects, pairs, fetches game library, receives video, decodes H.264, and outputs RGBA via the VFPU Media Engine. Full end-to-end streaming confirmed on real PSP-1000 hardware at 10–18 fps. Audio streaming with Opus decode, input forwarding, custom button mapping, FEC recovery, and watchdog auto-restart are all live.
 
 ---
 
@@ -33,12 +33,12 @@ Main CPU (Allegrex @ 333 MHz)        Media Engine (ME @ 222 MHz)
 ─────────────────────────────         ──────────────────────────
 UDP receive / RTP reassembly          YUV420P → RGBA8888 via VFPU
 Reed-Solomon FEC repair               (runs concurrently with decode)
-FFmpeg libavcodec H.264 decode
+OpenH264 H.264 decode (low-latency)   Zero-delay mode at sub-native res
 Control stream + input forward
-Opus stereo audio decode
+Opus stereo audio with PLC recovery
 ```
 
-The ME executes a fully vectorised YUV→RGBA conversion in VFPU. While the main CPU is decoding the next frame in FFmpeg, the ME is converting the previous frame's YUV output — throughput equals `max(decode_time, convert_time)` rather than their sum. The ME helper kernel module (`moonlight_me_helper.prx`) bootstraps the ME core and provides `InitME`/`KillME` exports.
+The ME executes a fully vectorised YUV→RGBA conversion in VFPU. While the main CPU is decoding the next frame in OpenH264, the ME is converting the previous frame's YUV output — throughput equals `max(decode_time, convert_time)` rather than their sum. The ME helper kernel module (`moonlight_me_helper.prx`) bootstraps the ME core and provides `InitME`/`KillME` exports.
 
 ---
 
@@ -51,13 +51,16 @@ The ME executes a fully vectorised YUV→RGBA conversion in VFPU. While the main
 | Game list + icon cache | ✅ Working | Server-side PNG icons, SD cache |
 | RTSP session / AES-GCM setup | ✅ Working | Sunshine Gen7 protocol |
 | UDP video receive + FEC | ✅ Working | Reed-Solomon, up to 66% parity |
-| H.264 decode (FFmpeg) | ✅ Working | Baseline Profile, CAVLC |
+| H.264 decode (OpenH264) | ✅ Working | Baseline + CABAC capable, CAVLC preferred |
 | VFPU YUV→RGBA (Media Engine) | ✅ Working | >99.9% ME success rate |
-| Opus stereo audio (48 kHz) | ✅ Working | Fixed-point Silk+CELT |
+| Opus stereo audio (48 kHz) | ✅ Working | Fixed-point Silk+CELT, PLC + volume ducking |
+| Audio enable/disable toggle | ✅ Working | Settings menu option |
 | Controller input forward | ✅ Working | All PSP buttons mapped |
-| Dual-mode watchdog + auto-restart | ✅ Working | Recovers from ME hang and RTP stall |
-| Sustained multi-frame streaming | ✅ Working | 15–18 fps @ 480×272, 180s clean |  
-| Deblocking filter | ❌ Not yet | ME bandwidth limited |
+| Custom button mapping | ✅ Working | L2/R2, right stick, L3/R3 remappable |
+| Dual-mode watchdog + auto-restart | ✅ Working | 5-credit soft/hard recovery model |
+| WiFi keepalive (active streaming) | ✅ Working | Prevents server-side stream stall |
+| Sustained multi-frame streaming | ✅ Working | 10–18 fps @ 480×272, 120s+ clean |
+| Deblocking filter | ❌ Disabled | Skipped for decode speed on PSP |
 | Double-buffered tearless output | ❌ Not yet | Planned post-beta |
 
 ---
@@ -68,13 +71,15 @@ All testing was on a real **PSP-1000** (not PPSSPP). Sunshine host, 2.4 GHz 802.
 
 | Metric | Result |
 |---|---|
-| FPS sustained | **15–18 fps** at 480×272, 500 kbps |
+| FPS sustained (480×272@15fps) | **10–18 fps** at 480×272, 500 kbps |
+| FPS sustained (256×144@30fps) | **17 fps** at 256×144, 500 kbps |
 | ME YUV→RGBA | ~31 µs/frame (>99.9% on ME, <0.1% CPU fallback) |
-| FFmpeg decode time | 20–50 ms/frame depending on macroblock complexity |
-| Full 3-minute run | ✅ No freeze, no stall, no kernel panic |
+| OpenH264 decode time | 36–80 ms/frame at 480×272 |
+| Audio underrun rate | **0.0–0.5%** (with PLC + volume ducking) |
+| Full 2-minute run | ✅ No freeze, no stall, no kernel panic |
+| WiFi stability | ✅ 100% signal, 0 disconnects (keepalive active) |
 | Button input confirmed | ✅ All PSP buttons registered on host |
-| FEC recoveries per session | 2000+ at 500 kbps — expected, not a problem |
-| Zero-artifact screenshots | **25/25 clean** — zero mosaic, zero corruption |
+| FEC recoveries per session | 13+ successful, 33 unrecoverable (WiFi loss) |
 
 ---
 
@@ -92,7 +97,7 @@ All testing was on a real **PSP-1000** (not PPSSPP). Sunshine host, 2.4 GHz 802.
 ### Build Toolchain
 - [pspdev/psptoolchain](https://github.com/pspdev/psptoolchain) (`psp-gcc 4.3.5`)
 - GNU Make
-- PSP-specific FFmpeg cross-compiled for MIPS/PSP
+- Custom OpenH264 PSP port (decoder-only, single-threaded, low-latency)
 
 ---
 
@@ -162,7 +167,7 @@ moonlight-psp/
 ├── lib/                        # Pre-built PSP static libraries (intraFont, etc.)
 ├── moonlight_me_helper/        # Media Engine kernel PRX (VFPU recon worker)
 ├── src/
-│   ├── ffmpeg_decode.c         # FFmpeg H.264 decode + ME YUV→RGBA dispatch
+│   ├── openh264_decode.cpp     # OpenH264 H.264 decode + ME YUV→RGBA dispatch
 │   ├── sw_decoder_thread.c     # Decoder thread + dual-mode watchdog
 │   ├── rtp_reassembly.c        # RTP frame assembly
 │   ├── rtp_fec.c               # Reed-Solomon FEC repair
@@ -171,7 +176,8 @@ moonlight-psp/
 │   └── ...                     # Network, UI, crypto, audio
 ├── third_party/
 │   ├── mbedtls/                # mbedTLS 2.28 (TLS 1.2, AES-GCM, RSA, ECDH)
-│   └── opus/                   # libopus 1.4 (fixed-point Silk+CELT)
+│   ├── opus/                   # libopus 1.4 (fixed-point Silk+CELT)
+│   └── openh264/               # OpenH264 (decoder-only, PSP port)
 ├── Makefile
 └── PARAM.SFO
 ```
@@ -184,20 +190,21 @@ moonlight-psp/
 |---|---|---|---|
 | mbedTLS | 2.28.x | Apache 2.0 | TLS 1.2, AES-GCM, RSA, ECDH |
 | libopus | 1.4 | BSD 3-Clause | Opus audio decode |
-| FFmpeg (PSP) | custom | LGPL | H.264 libavcodec |
+| OpenH264 (PSP port) | custom | BSD 2-Clause | H.264 decode (low-latency) |
 | intraFont-G | — | Attribution | PSP UI font |
 | PSPSDK | community | BSD | PSP system APIs |
 
-mbedTLS and libopus are vendored in `third_party/` for reproducible builds.
+mbedTLS, libopus, and OpenH264 are vendored in `third_party/` for reproducible builds.
 
 ---
 
 ## Known Issues
 
-- **No deblocking filter:** Blockiness visible at ≤300 kbps. Workaround: use ≥500 kbps. Requires ME bandwidth that's currently allocated to YUV→RGBA.
+- **Deblocking disabled:** Compile-time disabled (`PSP_SKIP_DEBLOCKING`) for decode speed. Block artifacts visible at ≤300 kbps. Workaround: use ≥500 kbps.
 - **No double buffering:** Display buffer swap is single-buffered. Tearing is visible during fast lateral movement. Fix planned.
-- **15–18 fps ceiling on PSP-1000:** The Allegrex+ME can decode faster in isolation; the practical ceiling is the RTP/FEC processing overhead. PSP-2000/3000 may do slightly better.
-- **802.11b packet loss:** The PSP's Wi-Fi is 802.11b-era. FEC handles routine loss; sustained >30% packet loss will cause visible stutter until IDR recovery fires.
+- **10–18 fps at 480×272:** Decode time averages ~50ms at full resolution; frame budget is 66ms at 15fps. Spikes can cause occasional frame drops.
+- **802.11b packet loss:** The PSP's Wi-Fi is 802.11b-era. ~37% audio packet loss typical. FEC and PLC handle routine loss; sustained loss causes audible static despite volume ducking.
+- **Audio PLC static:** At high packet loss rates, consecutive PLC frames produce audible artifacts. Volume ducking reduces but doesn't eliminate this.
 - **ME crash recovery (rare):** Occasional ME timeout on first stream connect. Auto-recovery re-initializes ME within ~100ms; no manual restart required.  
 
 See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for full details.
@@ -206,7 +213,9 @@ See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for full details.
 
 ## Version History
 
-**v0.2.0-beta (this release)** — First public beta. Complete ground-up rewrite. Custom pipeline, no `moonlight-common-c`, no `sceMpeg`. Full end-to-end streaming confirmed on real hardware.
+**v0.2.1-beta (this release)** — OpenH264 decoder (replaced FFmpeg), first-time audio streaming with Opus decode, custom button mapping UI, WiFi keepalive during streaming, PLC volume ducking, and revamped settings menu.
+
+**v0.2.0-beta** — First public beta. Complete ground-up rewrite. Custom pipeline, no `moonlight-common-c`, no `sceMpeg`. Full end-to-end streaming confirmed on real hardware.
 
 **[moonlight-psp-core](https://github.com/k4idyn/Moonlight-PSP) v0.1.0.1–v0.1.0.3-alpha** — The original public project. Used `moonlight-common-c`, ENet, and `sceMpegAvcDecode`. Got as far as RTSP handshake stabilization and library cleanup. Never decoded a frame — the `sceMpeg` ringbuffer model requires MPEG-PS framing which is incompatible with Moonlight's RTP stream model, and `moonlight-common-c` assumes POSIX threading that can't be mapped cleanly to `sceKernel`. Archived. Nothing from that codebase carries into this one.
 

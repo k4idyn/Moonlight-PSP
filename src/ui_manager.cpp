@@ -32,6 +32,7 @@
 #include "ui_manager.h"
 #include "diag_log.h"
 #include "shared.h"
+#include "btn_icons.h"
 
 /* Font handles (PGF) */
 static intraFont *s_font_sans  = NULL; /* flash0:/font/ltn0.pgf (Standard) */
@@ -99,8 +100,8 @@ void ui_apply_theme(int index) {
 
 extern "C" {
 
-/* GU command list — 64 KB is ample for 2D UI rendering                    */
-#define GU_LIST_WORDS   (64 * 1024 / 4)
+/* GU command list — 256 KB is safer for high-vertex rounded rects           */
+#define GU_LIST_WORDS   (256 * 1024 / 4)
 
 #define UI_COL_BORDER      0xFF383838u   /* Subtle border                     */
 #define UI_COL_BORDER_FOC  0xFFFFFFFFu   /* Bright white — focused element    */
@@ -399,7 +400,6 @@ int ui_manager_init(void)
         s_font_serif = intraFontLoad("flash0:/font/ltn1.pgf", INTRAFONT_CACHE_ASCII);
         s_font_small = intraFontLoad("flash0:/font/ltn8.pgf", INTRAFONT_CACHE_ASCII);
         if (!s_font_sans) s_font_sans = s_font_small;
-        if (!s_font_sans) s_font_sans = intraFontLoad("flash0:/font/jpn0.pgf", 0);
     }
 
     /* Step 4: Close the temporary command list */
@@ -663,6 +663,21 @@ void ui_set_blend(int enable)
     } else {
         sceGuDisable(GU_BLEND);
     }
+}
+
+void ui_set_scissor(int x, int y, int w, int h)
+{
+    /* sceGuScissor takes (x1, y1, x2, y2) stop-coordinates, not dimensions.
+     * Convert (x, y, width, height) → (x, y, x+w, y+h) so the scissor rect
+     * correctly spans from (x,y) to (x+w, y+h). */
+    sceGuScissor(x, y, x + w, y + h);
+    sceGuEnable(GU_SCISSOR_TEST);
+}
+
+void ui_clear_scissor(void)
+{
+    sceGuScissor(0, 0, UI_SCREEN_W, UI_SCREEN_H);
+    sceGuEnable(GU_SCISSOR_TEST);
 }
 
 /*
@@ -1085,7 +1100,7 @@ float ui_draw_text_medium(float x, float y, u32 color, const char *text)
         return bmf_draw(x, y, color, text, 1.2f);
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-    intraFontSetStyle(s_font, 0.40f, color, 0, INTRAFONT_ALIGN_LEFT);
+    intraFontSetStyle(s_font, 0.41f, color, 0, INTRAFONT_ALIGN_LEFT);
     intraFontActivate(s_font);
     float nx = intraFontPrint(s_font, x, y, text);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
@@ -1157,8 +1172,75 @@ void ui_draw_header(const char *title)
 /*
  * --- WHAT THIS DOES ---
  * Draw the footer bar at the bottom of the 480x272 screen (y=252..271).
- * Shows a semi-transparent band with white button-hint text.
+ * Shows a semi-transparent band with button-hint text that supports
+ * embedded PSP button bitmap sprites via {X}, {O}, {SQ}, {TR}, {L}, {R},
+ * {ST}, {SE}, {UP}, {DN}, {LF}, {RF}, {DP}, {AN}, {AU}, {AD}, {AL}, {AR}
+ * tokens.  Unrecognised tokens are passed through as plain text.
  */
+
+/* Badge button-type indices — 16x16 RGBA textures from btn_icons.h (Xelu CC0) */
+#define BTN_BADGE_X    0   /* Cross     (PS Vita)         */
+#define BTN_BADGE_O    1   /* Circle    (PS Vita)         */
+#define BTN_BADGE_SQ   2   /* Square    (PS Vita)         */
+#define BTN_BADGE_TR   3   /* Triangle  (PS Vita)         */
+#define BTN_BADGE_L    4   /* L bumper  (PS Vita)         */
+#define BTN_BADGE_R    5   /* R bumper  (PS Vita)         */
+#define BTN_BADGE_ST   6   /* Start     (PS Move)         */
+#define BTN_BADGE_SE   7   /* Select    (PS Move)         */
+#define BTN_BADGE_UP   8   /* D-pad up  (PS3)             */
+#define BTN_BADGE_DN   9   /* D-pad down (PS3)            */
+#define BTN_BADGE_LF   10  /* D-pad left (PS3)            */
+#define BTN_BADGE_RF   11  /* D-pad right (PS3)           */
+#define BTN_BADGE_DP   12  /* D-pad full  (PS3)           */
+#define BTN_BADGE_AN   13  /* Analog nub  (Oculus Remote) */
+#define BTN_BADGE_AUP  14  /* Analog up                   */
+#define BTN_BADGE_ADN  15  /* Analog down                 */
+#define BTN_BADGE_ALF  16  /* Analog left                 */
+#define BTN_BADGE_ARF  17  /* Analog right                */
+#define BTN_BADGE_CNT  18
+
+/*
+ * draw_btn_badge — render one PSP button icon as a 16x16 textured sprite.
+ * Returns x immediately after the icon (x + 16 + 2) for text chaining.
+ * Source textures are embedded in btn_icons.h (Xelu CC0 button prompt pack).
+ */
+static float draw_btn_badge(float x, float y, int btn)
+{
+    if (btn < 0 || btn >= BTN_BADGE_CNT) return x;
+
+    const unsigned char *tex = s_btn_textures[btn];
+    /* Start/Select: render wider (24x14) to reflect oval pill shape */
+    int render_w = 16;
+    int render_h = 16;
+    int bx = (int)x + 1;                              /* 1px left margin */
+    int by = (int)(y - (float)render_h * 0.74f);      /* icon position relative to text baseline */
+
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 16, 16, 16, tex);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuEnable(GU_TEXTURE_2D);
+
+    typedef struct { float u, v, x, y, z; } BtnV;
+    BtnV *v = (BtnV *)sceGuGetMemory(2 * sizeof(BtnV));
+    if (v) {
+        v[0].u = 0.0f;  v[0].v = 0.0f;
+        v[0].x = (float)bx;              v[0].y = (float)by;              v[0].z = 0.0f;
+        v[1].u = 16.0f; v[1].v = 16.0f;
+        v[1].x = (float)(bx + render_w); v[1].y = (float)(by + render_h); v[1].z = 0.0f;
+        sceGuDrawArray(GU_SPRITES,
+                       GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+                       2, NULL, v);
+    }
+    sceGuDisable(GU_TEXTURE_2D);
+    return x + (float)render_w + 3.0f;  /* 1px left + icon + 2px right gap */
+}
+
 void ui_draw_footer_hint(const char *hint_text)
 {
     /* Drop shadow beneath footer for depth */
@@ -1168,9 +1250,134 @@ void ui_draw_footer_hint(const char *hint_text)
     /* Modern Floating Glass Footer (Wii Rounded) */
     ui_draw_rect_rounded(6, 244, UI_SCREEN_W - 12, 22, 10, 0xCC181818u);
     ui_set_blend(0);
-    if (hint_text) {
-        ui_draw_text_medium(18.0f, 259.0f, UI_COL_TEXT_DIM, hint_text);
+
+    if (!hint_text) return;
+
+    float px = 18.0f;
+    float py = 259.0f;
+    const char *p = hint_text;
+    char seg[80];
+
+    while (*p) {
+        if (*p == '{') {
+            const char *end = p + 1;
+            while (*end && *end != '}') ++end;
+            if (*end == '}') {
+                char tok[8];
+                int tlen = (int)(end - p - 1);
+                if (tlen > 0 && tlen < (int)sizeof(tok)) {
+                    int k;
+                    for (k = 0; k < tlen; ++k) tok[k] = p[1 + k];
+                    tok[tlen] = '\0';
+                    int btn = -1;
+                    if (tok[0]=='X'  && !tok[1])             btn = BTN_BADGE_X;
+                    else if (tok[0]=='O'  && !tok[1])        btn = BTN_BADGE_O;
+                    else if (tok[0]=='S' && tok[1]=='Q' && !tok[2]) btn = BTN_BADGE_SQ;
+                    else if (tok[0]=='T' && tok[1]=='R' && !tok[2]) btn = BTN_BADGE_TR;
+                    else if (tok[0]=='L'  && !tok[1])        btn = BTN_BADGE_L;
+                    else if (tok[0]=='R'  && !tok[1])        btn = BTN_BADGE_R;
+                    else if (tok[0]=='S' && tok[1]=='T' && !tok[2]) btn = BTN_BADGE_ST;
+                    else if (tok[0]=='S' && tok[1]=='E' && !tok[2]) btn = BTN_BADGE_SE;
+                    else if (tok[0]=='U' && tok[1]=='P' && !tok[2]) btn = BTN_BADGE_UP;
+                    else if (tok[0]=='D' && tok[1]=='N' && !tok[2]) btn = BTN_BADGE_DN;
+                    else if (tok[0]=='L' && tok[1]=='F' && !tok[2]) btn = BTN_BADGE_LF;
+                    else if (tok[0]=='R' && tok[1]=='F' && !tok[2]) btn = BTN_BADGE_RF;
+                    else if (tok[0]=='D' && tok[1]=='P' && !tok[2]) btn = BTN_BADGE_DP;
+                    else if (tok[0]=='A' && tok[1]=='N' && !tok[2]) btn = BTN_BADGE_AN;
+                    else if (tok[0]=='A' && tok[1]=='U' && !tok[2]) btn = BTN_BADGE_AUP;
+                    else if (tok[0]=='A' && tok[1]=='D' && !tok[2]) btn = BTN_BADGE_ADN;
+                    else if (tok[0]=='A' && tok[1]=='L' && !tok[2]) btn = BTN_BADGE_ALF;
+                    else if (tok[0]=='A' && tok[1]=='R' && !tok[2]) btn = BTN_BADGE_ARF;
+                    if (btn >= 0) {
+                        px = draw_btn_badge(px, py, btn);
+                        p = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        /* Copy up to next '{' or end of string */
+        const char *next = p;
+        while (*next && *next != '{') ++next;
+        int seglen = (int)(next - p);
+        if (seglen > 0) {
+            if (seglen >= (int)sizeof(seg)) seglen = (int)sizeof(seg) - 1;
+            int j;
+            for (j = 0; j < seglen; ++j) seg[j] = p[j];
+            seg[seglen] = '\0';
+            /* Footer text: 0.42f (one step larger than medium) and
+             * no upward offset so text sits slightly lower than icons */
+            sceGuEnable(GU_BLEND);
+            sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+            intraFontSetStyle(s_font, 0.42f, UI_COL_TEXT_DIM, 0, INTRAFONT_ALIGN_LEFT);
+            intraFontActivate(s_font);
+            px = intraFontPrint(s_font, px, py, seg);
+            sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+            sceGuDisable(GU_BLEND);
+            intraFontSetStyle(s_font, 0.45f, UI_COL_TEXT, 0, INTRAFONT_ALIGN_LEFT);
+        }
+        p = next;
     }
+}
+
+float ui_draw_text_inline(float x, float y, u32 col, const char *text)
+{
+    if (!text) return x;
+    float px = x;
+    const char *p = text;
+    char seg[80];
+
+    while (*p) {
+        if (*p == '{') {
+            const char *end = p + 1;
+            while (*end && *end != '}') ++end;
+            if (*end == '}') {
+                char tok[8];
+                int tlen = (int)(end - p - 1);
+                if (tlen > 0 && tlen < (int)sizeof(tok)) {
+                    int k;
+                    for (k = 0; k < tlen; ++k) tok[k] = p[1 + k];
+                    tok[tlen] = '\0';
+                    int btn = -1;
+                    if (tok[0]=='X'  && !tok[1])             btn = BTN_BADGE_X;
+                    else if (tok[0]=='O'  && !tok[1])        btn = BTN_BADGE_O;
+                    else if (tok[0]=='S' && tok[1]=='Q' && !tok[2]) btn = BTN_BADGE_SQ;
+                    else if (tok[0]=='T' && tok[1]=='R' && !tok[2]) btn = BTN_BADGE_TR;
+                    else if (tok[0]=='L'  && !tok[1])        btn = BTN_BADGE_L;
+                    else if (tok[0]=='R'  && !tok[1])        btn = BTN_BADGE_R;
+                    else if (tok[0]=='S' && tok[1]=='T' && !tok[2]) btn = BTN_BADGE_ST;
+                    else if (tok[0]=='S' && tok[1]=='E' && !tok[2]) btn = BTN_BADGE_SE;
+                    else if (tok[0]=='U' && tok[1]=='P' && !tok[2]) btn = BTN_BADGE_UP;
+                    else if (tok[0]=='D' && tok[1]=='N' && !tok[2]) btn = BTN_BADGE_DN;
+                    else if (tok[0]=='L' && tok[1]=='F' && !tok[2]) btn = BTN_BADGE_LF;
+                    else if (tok[0]=='R' && tok[1]=='F' && !tok[2]) btn = BTN_BADGE_RF;
+                    else if (tok[0]=='D' && tok[1]=='P' && !tok[2]) btn = BTN_BADGE_DP;
+                    else if (tok[0]=='A' && tok[1]=='N' && !tok[2]) btn = BTN_BADGE_AN;
+                    else if (tok[0]=='A' && tok[1]=='U' && !tok[2]) btn = BTN_BADGE_AUP;
+                    else if (tok[0]=='A' && tok[1]=='D' && !tok[2]) btn = BTN_BADGE_ADN;
+                    else if (tok[0]=='A' && tok[1]=='L' && !tok[2]) btn = BTN_BADGE_ALF;
+                    else if (tok[0]=='A' && tok[1]=='R' && !tok[2]) btn = BTN_BADGE_ARF;
+                    if (btn >= 0) {
+                        px = draw_btn_badge(px, y, btn);
+                        p = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        const char *next = p;
+        while (*next && *next != '{') ++next;
+        int seglen = (int)(next - p);
+        if (seglen > 0) {
+            if (seglen >= (int)sizeof(seg)) seglen = (int)sizeof(seg) - 1;
+            int j;
+            for (j = 0; j < seglen; ++j) seg[j] = p[j];
+            seg[seglen] = '\0';
+            px = ui_draw_text_medium(px, y, col, seg);
+        }
+        p = next;
+    }
+    return px;
 }
 
 /*

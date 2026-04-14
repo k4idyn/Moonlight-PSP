@@ -43,6 +43,18 @@ int osk_get_ip_input(char *out_ip, int max_len);
  */
 int osk_get_resolution_input(int *out_width, int *out_height);
 
+/*
+ * osk_get_fps_input - Show a keypad for entering a custom FPS.
+ *
+ * @out_fps  Receives parsed FPS (>0, <=120).
+ *
+ * Returns:
+ *   0   on success
+ *  -1   user cancelled
+ *  -3   invalid FPS entered
+ */
+int osk_get_fps_input(int *out_fps);
+
 #ifdef __cplusplus
 }
 #endif

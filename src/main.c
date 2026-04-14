@@ -61,6 +61,10 @@ volatile unsigned int g_remote_buttons = 0;
  * Set to 1 to pause, 0 to resume. Logged address at startup. */
 volatile int g_decode_paused = 0;
 
+/* Remote exit request — pspsh pokew 1 to immediately exit stream back to menu.
+ * Avoids needing to hold Start+Select for 500ms, which is impossible via pokew. */
+volatile unsigned int g_remote_exit_request = 0;
+
 /* External declarations */
 extern int  wifi_connect(void);
 extern void wifi_disconnect(void);
@@ -139,6 +143,7 @@ int main(int argc, char *argv[]) {
     ret = scePowerSetClockFrequency(333, 333, 166);
     diag_log_write("MAIN", "[REMOTE] g_remote_buttons at 0x%08X\n", (unsigned int)&g_remote_buttons);
     diag_log_write("MAIN", "[REMOTE] g_decode_paused at 0x%08X\n", (unsigned int)&g_decode_paused);
+    diag_log_write("MAIN", "[REMOTE] g_remote_exit_request at 0x%08X\n", (unsigned int)&g_remote_exit_request);
     diag_log_flush();  /* Force flush so automation can read addresses immediately */
     /* No-op legacy log_open removed */
     sceDisplaySetMode(0, 480, 272);
@@ -172,14 +177,34 @@ host_select_loop:
     skip_rescan = 0;
     while (1) { if (renderHostDiscoveryList() >= 0) { selected_host = host_discovery_get_selected(); break; } }
     if (!selected_host) { halt_with_error("Host Selection", -1); return -1; }
-    strncpy(selected_host_ip, selected_host->ip, 15);
+    snprintf(selected_host_ip, sizeof(selected_host_ip), "%s", selected_host->ip);
     network_set_target_host(selected_host_ip);
     diag_log_write("UI", "TRANSITION host_selected ip=%s t=%u\n", selected_host_ip, sceKernelGetSystemTimeLow() / 1000);
     config_add_manual_host(selected_host_ip, selected_host->mac);
 
     LOG("[STEP 4] Connecting to %s...\n", selected_host_ip);
     diag_log_write("UI", "TRANSITION connect_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
-    ret = network_connect_all();
+    { /* Connection with auto-retry: after cancel+relaunch the server's
+       * RTSP listener may not be ready yet.  One automatic retry with a
+       * 5-second backoff avoids dropping the user back to host select. */
+        int connect_attempts = 0;
+        const int MAX_CONNECT_ATTEMPTS = 2;
+        while (1) {
+            ret = network_connect_all();
+            connect_attempts++;
+            if (ret >= 0) break;
+            if (connect_attempts >= MAX_CONNECT_ATTEMPTS) break;
+            LOG("[STEP 4] Connection attempt %d failed (%d), retrying in 5s...\n",
+                connect_attempts, ret);
+            diag_log_write("MAIN", "Connection attempt %d failed (%d), retrying...\n",
+                           connect_attempts, ret);
+            network_me_shutdown();
+            control_stream_stop();
+            audio_thread_shutdown();
+            rtsp_session_close();
+            sceKernelDelayThread(5000 * 1000);
+        }
+    }
     diag_log_write("UI", "TRANSITION connect_done ret=%d t=%u\n", ret, sceKernelGetSystemTimeLow() / 1000);
     if (ret < 0) {
         LOG("[STEP 4] Connection failed (%d)\n", ret);
@@ -191,12 +216,17 @@ host_select_loop:
     }
     host_discovery_shutdown();
     const char *ph = network_get_paired_host();
-    if (ph) { strncpy(g_psp_config.pairedHostIp, ph, 15); saveConfig(&g_psp_config); }
+    if (ph) { snprintf(g_psp_config.pairedHostIp, sizeof(g_psp_config.pairedHostIp), "%s", ph); saveConfig(&g_psp_config); }
 
     extern unsigned char g_remote_input_key[16];
     stream_crypto_init(g_remote_input_key);
-    diag_log_write("MAIN", "Initializing audio thread...\n");
-    audio_thread_init(selected_host_ip);
+    extern int g_audio_rtsp_ok;
+    if (g_audio_rtsp_ok) {
+        diag_log_write("MAIN", "Initializing audio thread...\n");
+        audio_thread_init(selected_host_ip);
+    } else {
+        diag_log_write("MAIN", "Skipping audio init (RTSP audio SETUP failed)\n");
+    }
 
     diag_log_write("MAIN", "Initializing shared memory (375KB)...\n");
     memset(&g_shared, 0, sizeof(g_shared));
@@ -312,8 +342,9 @@ host_select_loop:
         static u32 s_fps_last_us = 0;
         static int s_fps_frame_count = 0;
         static float s_display_fps = 0.0f;
+        static int s_latency_avg_ms = 0;
 
-        /* CABAC warning takes highest priority — custom FFmpeg port CAN
+        /* CABAC warning takes highest priority — OpenH264 CAN
          * decode CABAC data, so frames arrive and would bypass the old
          * else-if chain.  Show warning immediately and block all display. */
         if (decoder_is_cabac_detected()) {
@@ -358,7 +389,20 @@ host_select_loop:
             s_disp_count++;
             s_idle_count = 0;  /* Reset idle counter — stream is active */
             s_fps_frame_count++;
-            /* Compute display FPS every second */
+            /* Per-frame decode-to-display latency (rolling average) */
+            {
+                u32 disp_us = sceKernelGetSystemTimeLow();
+                if (g_last_frame_decode_us > 0) {
+                    int frame_lat = (int)((disp_us - g_last_frame_decode_us) / 1000);
+                    if (frame_lat >= 0 && frame_lat < 9999) {
+                        /* Exponential moving average: alpha=0.1 (90% history, 10% new) */
+                        static float s_lat_ema = 0.0f;
+                        s_lat_ema = s_lat_ema * 0.9f + (float)frame_lat * 0.1f;
+                        s_latency_avg_ms = (int)(s_lat_ema + 0.5f);
+                    }
+                }
+            }
+            /* Compute display FPS every second + feed HUD stats */
             {
                 u32 now_us = sceKernelGetSystemTimeLow();
                 u32 elapsed = now_us - s_fps_last_us;
@@ -366,12 +410,10 @@ host_select_loop:
                     s_display_fps = (float)s_fps_frame_count * 1000000.0f / (float)elapsed;
                     s_fps_frame_count = 0;
                     s_fps_last_us = now_us;
-                    /* Feed HUD with live stats — latency is decode-to-display pipeline time */
+                    /* Feed HUD with smoothed latency and FPS */
                     {
                         HudStats hs;
-                        u32 disp_us = sceKernelGetSystemTimeLow();
-                        hs.latency_ms = (g_last_frame_decode_us > 0) ? (int)((disp_us - g_last_frame_decode_us) / 1000) : 0;
-                        if (hs.latency_ms < 0 || hs.latency_ms > 9999) hs.latency_ms = 0;
+                        hs.latency_ms = s_latency_avg_ms;
                         hs.fps = s_display_fps;
                         hud_update_stats(&hs);
                     }
@@ -390,7 +432,7 @@ host_select_loop:
             if ((s_disp_count % 900) == 0 && s_disp_count > 0) {
                 if (s_watchdog_restarts > 0) {
                     s_watchdog_restarts--;
-                    diag_log_write("MAIN", "WATCHDOG: credit restored (%d/3 used)",
+                    diag_log_write("MAIN", "WATCHDOG: credit restored (%d/5 used)",
                                    s_watchdog_restarts);
                 }
                 s_mode_b_soft_count = 0;
@@ -412,12 +454,12 @@ host_select_loop:
                 ui_draw_text_centered(0.0f, 480.0f, 125.0f, UI_COL_TEXT,
                                       g_wifi_reconnecting ? "WiFi Reconnecting..." : "Connection Lost");
                 ui_draw_text_centered(0.0f, 480.0f, 150.0f, UI_COL_TEXT_DIM,
-                                      "Start+Select to return to menu");
+                                      "Hold Start+Select to return to menu");
             }
 
             /* Decode watchdog — two modes:
-             * MODE A: FFmpeg infinite loop — g_decode_active_us stuck >3s
-             *         FULL RESTART: kill thread, abandon FFmpeg, reinit.
+             * MODE A: OpenH264 infinite loop — g_decode_active_us stuck >3s
+             *         FULL RESTART: kill thread, abandon decoder, reinit.
              * MODE B: No frames for >5s (idle >300) — likely WiFi packet
              *         loss preventing IDR reception.  SOFT RECOVERY: flush
              *         ring + request IDR without burning a restart slot.
@@ -426,16 +468,16 @@ host_select_loop:
             {
                 extern volatile u32 g_decode_active_us;
 
-                /* Mode A: FFmpeg hung mid-decode (>3 seconds) — only case
+                /* Mode A: OpenH264 hung mid-decode (>3 seconds) — only case
                  * that truly needs a thread restart */
-                if (s_watchdog_restarts < 3) {
+                if (s_watchdog_restarts < 5) {
                     u32 active = g_decode_active_us;
                     if (active != 0) {
                         u32 now_us = sceKernelGetSystemTimeLow();
                         u32 elapsed = now_us - active;
                         if (elapsed > 3000000) {
                             s_watchdog_restarts++;
-                            diag_log_write("MAIN", "WATCHDOG-A: ffmpeg hung %u ms -- restart #%d",
+                            diag_log_write("MAIN", "WATCHDOG-A: decoder hung %u ms -- restart #%d",
                                            (unsigned)(elapsed / 1000), s_watchdog_restarts);
                             sw_decoder_thread_force_restart();
                             control_stream_request_idr();
@@ -445,8 +487,13 @@ host_select_loop:
                 }
 
                 /* Mode B: No frames for ~5s — soft recovery (IDR burst).
-                 * Does NOT consume a restart slot.  Repeats every 5s. */
-                if (s_idle_count > 300 && (s_idle_count % 300) < 2) {
+                 * Does NOT consume a restart slot.  Repeats every 5s. 
+                 * After force_restart with no progress, back off to 10s
+                 * to avoid flooding Sunshine when the problem is server-side. */
+                {
+                    static int s_force_restart_no_progress = 0;
+                    int backoff_interval = (s_force_restart_no_progress > 0) ? 600 : 300;
+                    if (s_idle_count > (unsigned)backoff_interval && (s_idle_count % (unsigned)backoff_interval) < 2) {
                     extern volatile int g_decoder_alive_counter;
                     static int s_last_alive_count = 0;
                     int alive_now = g_decoder_alive_counter;
@@ -454,11 +501,17 @@ host_select_loop:
                     s_mode_b_soft_count++;
                     diag_log_write("MAIN", "WATCHDOG-B: no frames for %u idles -- soft recovery #%d (IDR burst) alive=%d",
                                    (unsigned)s_idle_count, s_mode_b_soft_count, alive_now);
-                    /* Burst 3 IDR requests to improve chances of getting through WiFi loss */
-                    control_stream_request_idr();
-                    sceKernelDelayThread(10000); /* 10ms gap */
-                    control_stream_request_idr();
-                    sceKernelDelayThread(10000);
+                    /* Reset g_idr_fully_decoded so (1) IDR requests are not
+                     * suppressed, and (2) rtp_reassembly dedup allows fresh
+                     * frames through even if frame_id wraps/jumps.
+                     * moonlight-common-c has no such flag on its IDR path. */
+                    {
+                        extern volatile int g_idr_fully_decoded;
+                        g_idr_fully_decoded = 0;
+                    }
+                    /* Single IDR request (rate limiter ensures delivery).
+                     * Reduced from 3-burst to 1 to prevent Sunshine from
+                     * being overwhelmed by rapid IDR requests on lossy WiFi. */
                     control_stream_request_idr();
 
                     /* After 3 soft recoveries with no progress, escalate to
@@ -467,7 +520,7 @@ host_select_loop:
                      * frames (REF-SKIP returning -4 or waiting for SPS
                      * returning -5), it's alive — don't destroy the context
                      * and lose SPS/PPS state.  Just keep requesting IDRs. */
-                    if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 3) {
+                    if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
                         if (alive_now == s_last_alive_count) {
                             /* Decoder truly stuck — alive counter not advancing */
                             s_watchdog_restarts++;
@@ -477,15 +530,18 @@ host_select_loop:
                             control_stream_request_idr();
                             s_idle_count = 0;
                             s_mode_b_soft_count = 0;
+                            s_force_restart_no_progress++;
                         } else {
                             /* Decoder alive (processing frames, just no display output).
                              * Reset soft count so we don't immediately re-escalate. */
                             diag_log_write("MAIN", "WATCHDOG-B: decoder alive (counter %d->%d), skipping restart",
                                            s_last_alive_count, alive_now);
                             s_mode_b_soft_count = 0;
+                            s_force_restart_no_progress = 0;
                         }
                     }
                     s_last_alive_count = alive_now;
+                    }
                 }
 
                 /* Mode C: Decoder confirmed dead — thread creation failed
@@ -528,6 +584,48 @@ host_select_loop:
             if (progress > 99.0f) progress = 99.0f;
             ui_draw_progress_bar(40, 172, 400, 8, progress, 100.0f, NULL);
             ui_end_frame_no_swap();
+
+            /* Mode D: Video never started — server may be in broken encoder
+             * state (e.g. after stale session cancel+relaunch), ignoring IDR
+             * requests.  Escalating recovery:
+             * Phase 1 (10s): IDR burst to shake loose a key frame
+             * Phase 2 (15s): Full pipeline restart + IDR
+             * Phase 3 (20s): Tear down entire session, return to menu for
+             *                fresh reconnect (creates new server encoder) */
+            {
+                u32 wait_elapsed_ms = sceKernelGetSystemTimeLow() / 1000 - stream_wait_start;
+                static int s_mode_d_phase = 0;
+
+                if (wait_elapsed_ms > 20000 && s_mode_d_phase < 3) {
+                    s_mode_d_phase = 3;
+                    diag_log_write("MAIN", "WATCHDOG-D: no video for %u ms — full session reconnect",
+                                   (unsigned)wait_elapsed_ms);
+                    diag_log_flush();
+                    abort_stream_to_menu();
+                    memset(&g_shared, 0, sizeof(g_shared));
+                    video_started = 0;
+                    s_mode_d_phase = 0;
+                    skip_rescan = 0;
+                    goto host_select_loop;
+                } else if (wait_elapsed_ms > 15000 && s_mode_d_phase < 2) {
+                    s_mode_d_phase = 2;
+                    diag_log_write("MAIN", "WATCHDOG-D: no video for %u ms — pipeline restart + IDR",
+                                   (unsigned)wait_elapsed_ms);
+                    sw_decoder_thread_force_restart();
+                    control_stream_request_idr();
+                    sceKernelDelayThread(10000);
+                    control_stream_request_idr();
+                } else if (wait_elapsed_ms > 10000 && s_mode_d_phase < 1) {
+                    s_mode_d_phase = 1;
+                    diag_log_write("MAIN", "WATCHDOG-D: no video for %u ms — IDR burst",
+                                   (unsigned)wait_elapsed_ms);
+                    control_stream_request_idr();
+                    sceKernelDelayThread(10000);
+                    control_stream_request_idr();
+                    sceKernelDelayThread(10000);
+                    control_stream_request_idr();
+                }
+            }
         }
         /* When video_started but no new frame: do nothing here.
          * The PSP display controller keeps showing the last-swapped
@@ -537,13 +635,40 @@ host_select_loop:
 
         sceCtrlPeekBufferPositive(&pad, 1);
         pad.Buttons |= g_remote_buttons;  /* inject; cleared after input_poll_and_send */
-        /* Start+Select combo = exit stream back to menu (skip when decode paused for testing) */
-        if (!g_decode_paused && (pad.Buttons & PSP_CTRL_START) && (pad.Buttons & PSP_CTRL_SELECT)) {
-            diag_log_write("INP", "Start+Select exit combo detected\n");
+
+        /* Remote exit request — single pokew triggers immediate stream exit */
+        if (g_remote_exit_request) {
+            diag_log_write("INP", "Remote exit request detected\n");
+            g_remote_exit_request = 0;
             abort_stream_to_menu();
             memset(&g_shared, 0, sizeof(g_shared));
             skip_rescan = 0;
             goto host_select_loop;
+        }
+
+        /* Start+Select combo = exit stream back to menu (skip when decode paused for testing).
+         * Both buttons must be held simultaneously for >=500ms to prevent
+         * accidental triggers regardless of press order (Select→Start or Start→Select). */
+        {
+            static u32 s_combo_start_us = 0;
+            int combo_held = !g_decode_paused
+                             && (pad.Buttons & PSP_CTRL_START)
+                             && (pad.Buttons & PSP_CTRL_SELECT);
+            if (combo_held) {
+                u32 now_us = sceKernelGetSystemTimeLow();
+                if (s_combo_start_us == 0) {
+                    s_combo_start_us = now_us;
+                } else if ((now_us - s_combo_start_us) >= 500000) {
+                    diag_log_write("INP", "Start+Select exit combo detected\n");
+                    s_combo_start_us = 0;
+                    abort_stream_to_menu();
+                    memset(&g_shared, 0, sizeof(g_shared));
+                    skip_rescan = 0;
+                    goto host_select_loop;
+                }
+            } else {
+                s_combo_start_us = 0;
+            }
         }
         {
             int hud_ret = hud_handle_input(pad.Buttons);
@@ -554,7 +679,14 @@ host_select_loop:
                 me_running = 0;
                 continue;
             }
-            if (hud_ret == 1) break; /* Quit */
+            if (hud_ret == 1) {
+                /* HUD Quit: full teardown + return to host menu (NOT sceKernelExitGame) */
+                diag_log_write("MAIN", "HUD Quit selected — returning to host menu\n");
+                abort_stream_to_menu();
+                memset(&g_shared, 0, sizeof(g_shared));
+                skip_rescan = 0;
+                goto host_select_loop;
+            }
         }
         /* input_poll_and_send moved to before display (G-1) */
         g_remote_buttons = 0;  /* clear after all consumers */
@@ -573,9 +705,8 @@ host_select_loop:
             sceDisplayWaitVblankStart();
         }
         /* Only yield CPU when idle (no frame displayed).  When rendering,
-         * display_frame_finish() already waits for VBlank which provides
-         * natural frame pacing.  The old 1ms delay wasted 6% of frame
-         * budget at 60fps. */
+         * display_frame_finish() swaps immediately (no VBlank wait) to
+         * maximize throughput — the 1ms idle yield prevents spinning. */
         if (!frame) {
             sceKernelDelayThread(1000);
         }
@@ -599,6 +730,6 @@ static int callback_thread(SceSize args, void *argp) {
     return 0;
 }
 static void setup_callbacks(void) {
-    SceUID thid = sceKernelCreateThread("update_thread", callback_thread, 0x11, 0xFA0, 0, NULL);
+    SceUID thid = sceKernelCreateThread("update_thread", callback_thread, 0x20, 0xFA0, 0, NULL);
     if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
 }

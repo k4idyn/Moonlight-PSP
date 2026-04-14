@@ -63,7 +63,7 @@ PSP Moonlight streams from a Sunshine server. Configure Sunshine for optimal PSP
 | Setting | Value | Why |
 |---|---|---|
 | **Video Codec** | H.264 | Only codec the PSP can decode |
-| **Encoder Profile** | Baseline | PSP FFmpeg build only supports Baseline |
+| **Encoder Profile** | Baseline | PSP OpenH264 build supports Baseline (CABAC capable but CAVLC preferred) |
 | **Entropy Coding** | CAVLC | CABAC is not supported — CAVLC only |
 | **Resolution** | 480×272 | Native PSP LCD resolution |
 | **Frame Rate** | 15 fps | Optimal for PSP-1000 (17.9 fps peak) |

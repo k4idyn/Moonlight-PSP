@@ -28,14 +28,14 @@ OBJS = src/main.o src/network_connect.o src/network_me.o \
        src/display_gpu.o src/input.o src/rtp_reassembly.o src/rtp_fec.o src/rs.o src/host_discovery.o \
        src/settings_menu.o src/config.o src/hud.o src/stream_session.o src/game_list_parser.o \
        src/signal_strength.o src/safety_buffer.o src/audio_thread.o src/power_handler.o \
-       src/moonlight_stubs.o src/ui_manager.o src/game_grid_ui.o src/pairing_pin_ui.o \
+       src/moonlight_stubs.o src/ui_manager.o src/button_mapping_ui.o src/game_grid_ui.o src/pairing_pin_ui.o \
        src/netconf_ui.o src/osk_input.o src/stream_connect_ui.o src/wol.o src/exit_dialog.o \
        src/diag_log.o \
        src/crypto_lite.o src/psp_mbedtls_entropy.o \
        src/stream_crypto.o src/client_identity.o src/icon_cache.o src/control_stream.o \
        src/opus_decode_psp.o \
        src/me.o moonlight_me_helper/MediaEngine.o \
-       src/ffmpeg_decode.o \
+       src/openh264_decode.o \
        $(MBEDTLS_OBJS) $(OPUS_ALL_OBJS)
 
 # ============================================================================
@@ -113,11 +113,19 @@ OPUS_SILK_FIX_OBJS = $(addprefix opus_f_, $(addsuffix .o, $(OPUS_SILK_FIX_NAMES)
 OPUS_ALL_OBJS      = $(OPUS_SRC_OBJS) $(OPUS_CELT_OBJS) $(OPUS_SILK_OBJS) $(OPUS_SILK_FIX_OBJS)
 
 # ============================================================================
+# OpenH264 (PSP decoder-only port)
+# ============================================================================
+OPENH264_ROOT    = third_party/openh264
+OPENH264_LIB     = $(OPENH264_ROOT)/libopenh264_dec_psp.a
+OPENH264_INCDIR  = -I$(OPENH264_ROOT)
+
+# ============================================================================
 # Compiler Flags
 # ============================================================================
 CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(MBEDTLS_CFLAGS) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
+           $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 
 CC  = psp-gcc
@@ -126,12 +134,12 @@ CXX = psp-g++
 INCDIR  = include $(PSP_PREFIX)/include/oslib/intraFont $(PSP_PREFIX)/include
 LIBDIR  = lib $(PSP_PREFIX)/lib
 
-LIBS = -lavcodec -lavutil \
+LIBS = $(OPENH264_LIB) \
        -lintraFont -lpsprtc -lpspwlan \
        -lpspgum -lpspgu -lpspge -lpsppower \
        -lpspdebug -lpspdisplay -lpspctrl -lpspsdk -lc -lpng -lz -lm \
        -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver \
-       -lpsputility -lpspuser -lpspaudio -lpsphttp
+       -lpsputility -lpspuser -lpspaudio -lpsphttp -lstdc++
 
 # ============================================================================
 # Targets
@@ -153,9 +161,13 @@ src/psp_mbedtls_entropy.o: src/psp_mbedtls_entropy.c
 src/opus_decode_psp.o: src/opus_decode_psp.c
 	$(CC) $(CFLAGS) $(OPUS_CFLAGS) -c -o $@ $<
 
-# FFmpeg headers trigger -Wparentheses in GCC 4.3.5 — suppress only for this TU
-src/ffmpeg_decode.o: src/ffmpeg_decode.c
-	$(CC) -std=gnu99 $(CFLAGS) -Wno-parentheses -c -o $@ $<
+# OpenH264 decoder wrapper (C++ TU, needs openh264 include paths)
+src/openh264_decode.o: src/openh264_decode.cpp $(OPENH264_LIB)
+	$(CXX) $(CXXFLAGS) $(OPENH264_INCDIR) -Iinclude -I$(PSPSDK)/include -I$(PSP_PREFIX)/include/oslib/intraFont -I$(PSP_PREFIX)/include -c -o $@ $<
+
+# Build OpenH264 PSP static library if not already built
+$(OPENH264_LIB):
+	$(MAKE) -C $(OPENH264_ROOT) -f Makefile.psp
 
 $(OPUS_SRC_OBJS): opus_s_%.o: $(OPUS_ROOT)/src/%.c
 	$(CC) $(CFLAGS) $(OPUS_CFLAGS) -c -o $@ $<
@@ -179,7 +191,7 @@ src/%.o: src/%.c
 # Defined BEFORE build.mak include to avoid duplicate-target warning.
 $(TARGET).elf: $(OBJS) $(EXPORT_OBJ)
 	$(AR) rcs _all_objs.a $(OBJS)
-	$(LINK.c) _all_objs.a $(EXPORT_OBJ) $(LIBS) -o $@
+	$(CXX) -G0 _all_objs.a $(EXPORT_OBJ) $(addprefix -L,$(LIBDIR)) $(LIBS) -o $@
 	$(FIXUP) $@
 
 include $(PSPSDK)/lib/build.mak

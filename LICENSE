@@ -8,7 +8,7 @@ of this license document, but changing it is not allowed.
 Copyright (C) 2026 PSP Moonlight Contributors
 
 PSP Moonlight — a Moonlight game streaming client for the Sony PlayStation Portable.
-Custom asymmetric dual-core H.264 decode pipeline (FFmpeg + VFPU/ME).
+Custom asymmetric dual-core H.264 decode pipeline (OpenH264 + VFPU/ME).
 Tested on real PSP hardware. No warranty. For the scene.
 
 This program is free software: you can redistribute it and/or modify
@@ -34,4 +34,4 @@ Third-party components (vendored in third_party/):
   libopus 1.4      — BSD 3-Clause License
   intraFont-G      — see lib/ for attribution
 
-FFmpeg (PSP cross-compiled) — LGPL 2.1+
+OpenH264 (PSP custom port) — BSD 2-Clause

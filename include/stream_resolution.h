@@ -12,7 +12,7 @@
  *
  * NOTE: sw_decode_pipeline.h retains compile-time SW_FRAME_* defines
  * for the decommissioned CAVLC pipeline's static struct sizing.
- * The active FFmpeg path uses g_stream_res exclusively.
+ * The active OpenH264 path uses g_stream_res exclusively.
  */
 
 #ifndef STREAM_RESOLUTION_H
@@ -60,7 +60,7 @@ extern StreamResolution g_stream_res;
  * @width:  Stream width from config (will be clamped to mod-16)
  * @height: Stream height from config (will be clamped to mod-16)
  *
- * Must be called before ffmpeg_pipeline_init() and sw_pipeline_init().
+ * Must be called before oh264_pipeline_init() and sw_pipeline_init().
  */
 void stream_resolution_init(int width, int height);
 

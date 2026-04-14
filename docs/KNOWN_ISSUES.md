@@ -1,16 +1,16 @@
 # Known Issues
 
-_PSP Moonlight v0.2.0-beta_
+_PSP Moonlight v0.2.1-beta_
 
-This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in v0.2.0-beta.
+This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in v0.2.1-beta.
 
 ---
 
 ## Critical / Active Blockers
 
-### No deblocking filter
-**Status:** Not implemented  
-**Impact:** At bitrates below ~500 kbps, decoded frames show visible 8×8 block boundaries. Not a correctness bug — the H.264 spec treats deblocking as optional for Baseline Profile. The VFPU has enough headroom to run it post-reconstruction but it hasn't been implemented yet. Workaround: use ≥500 kbps.
+### Deblocking filter disabled
+**Status:** Compile-time disabled (`PSP_SKIP_DEBLOCKING`)  
+**Impact:** At bitrates below ~500 kbps, decoded frames show visible 8×8 block boundaries. Deblocking is disabled via compile flag for ~15% decode speed improvement. The H.264 spec treats deblocking as optional for Baseline Profile. Workaround: use ≥500 kbps.
 
 ### No display double-buffering
 **Status:** Not implemented  
@@ -18,7 +18,7 @@ This document tracks confirmed bugs, hardware limitations, and fixed issues. All
 
 ### 30 fps ceiling (network-bound)
 **Status:** By design at current architecture  
-**Impact:** RTP/FEC/reassembly processing overhead on the main CPU limits practical sustained frame rate to ~15–18 fps on PSP-1000 at 500 kbps. Internal decode speed (FFmpeg + VFPU) can sustain 40+ fps; the bottleneck is network processing.  
+**Impact:** RTP/FEC/reassembly processing overhead on the main CPU limits practical sustained frame rate to ~15–18 fps on PSP-1000 at 500 kbps. Internal decode speed (OpenH264 + VFPU) can sustain 40+ fps; the bottleneck is network processing.  
 **Run 073 data:** At 30 fps target, actual delivery was 7.8 fps with constant ring overflow (1023/1024). Decoder itself capable of 40.6 fps.  
 **Mitigation:** Lower resolution (368×208) reduces RTP packet count and improves network throughput.
 
@@ -38,12 +38,28 @@ Passing `0x48xxxxxx` (uncached alias) to ME code causes a bus error and ME halt.
 ### WiFi degradation during active streaming
 802.11b packet loss increases over time during streaming sessions, particularly after 40–45 seconds of continuous RTP traffic. Observed consistently across test runs. FEC absorbs most loss but burst losses trigger IDR recovery cycles. Use a strong 2.4 GHz signal or 802.11g.
 
+### Audio PLC static at high packet loss
+**Status:** Partially mitigated  
+**Impact:** When WiFi drops >3 consecutive audio packets, PLC (Packet Loss Concealment) generates synthetic audio that sounds like static. Volume ducking (87.5% → 68.75% → 50%) reduces but doesn't eliminate the artifact. At ~37% WiFi packet loss (typical for 802.11b), PLC generates ~14% of audio timeline as synthetic frames.  
+**Mitigation:** PLC threshold increased from 25ms to 45ms to reduce false positives. Volume ducking fades PLC output. Further improvement would require increasing `packetDuration` from 20ms to 40ms (halving packet count) but requires buffer resize.
+
 ---
+
+## Fixed (included in v0.2.1-beta)
+
+### Server-side stream stall — Fixed in v0.2.1-beta
+WiFi keepalive was disabled during streaming, causing Sunshine to time out and stop sending video after ~35 seconds. Fixed by keeping the keepalive thread active during streaming with 3-second check intervals.
+
+### Audio underruns (31% → 0%) — Fixed in v0.2.1-beta
+Audio playback thread starved due to low priority and inefficient polling. Fixed through progressive optimization: thread priority tuning (0x1A), polling backoff (500µs/1ms/2ms), ring buffer management (64 slots), and FEC recovery. Final rate: 0.0–0.5% underruns.
+
+### IDR flood during streaming — Fixed in v0.2.1-beta
+Three-part fix: (1) RTP FEC unrecoverable drops check `g_refs_corrupted` before requesting IDR, (2) RTP reassembly seq-gap frames set corruption flag, (3) control stream rate-limits IDR requests to 1/sec after initial 5 rapid-fire. Reduced IDR requests from 66+ to near-zero.
 
 ## Fixed (included in v0.2.0-beta)
 
 ### Display freeze after queue overrun (run 070) — Fixed in internal 0.3.0-alpha
-Queue overrun handler flushed RTP state but not FFmpeg's internal codec context. `avcodec_receive_frame` returned `EAGAIN` permanently, triggering an infinite overrun loop that destroyed each arriving IDR before reassembly completed. Fixed by calling `ffmpeg_pipeline_flush_buffers()` (which calls `avcodec_flush_buffers()` and clears ME state) from the overrun handler.
+Queue overrun handler flushed RTP state but not OpenH264's internal codec context. The decoder entered a permanent error state, triggering an infinite overrun loop that destroyed each arriving IDR before reassembly completed. Fixed by calling `oh264_pipeline_flush_buffers()` (which flushes the decoder and clears ME state) from the overrun handler.
 
 ### ME permanent disable after first crash — Fixed in internal 0.3.0-alpha
 ME was permanently disabled after the first timeout. Replaced with KillME+reinit+retry (up to 3 recoveries). 11/11 ME timeouts recovered in extended testing.
