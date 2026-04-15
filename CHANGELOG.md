@@ -10,6 +10,65 @@ never published; they're documented here so the commit history makes sense.
 
 ---
 
+## [0.2.2-beta] — 2026-04-14
+
+### Added — New Protocol Features
+- **Keyboard event support:** Sends keyboard key-down/key-up packets (Type 5) to host. Enables text input in streamed applications via PSP combo triggers.
+- **Scroll event support:** Sends mouse wheel scroll packets — both Gen5 (Type 0x09) and high-resolution (Type 0x33) — for scrolling in browser mode and menus.
+- **Controller arrival announcement:** Sends Type 0x37 packet announcing PSP as an Xbox controller with analog trigger capability and supported button flags.
+- **Controller battery reporting:** Sends Type 0x40 packets with PSP battery percentage and charge state (discharging/charging/full) to host, displayed in Steam overlay.
+- **RTCP receiver reports:** Network layer now sends RTCP RR feedback packets to server for bidirectional quality negotiation.
+- **Dynamic resolution scaling:** New `stream_resolution.c` — auto-scales between 4 resolution steps (256×144 → 320×192 → 368×208 → 480×272) based on EMA-smoothed decode time and packet loss with hold-off timers to prevent thrashing.
+- **Protocol comparison documentation:** Two new docs (`PROTOCOL_COMPARISON.md`, `FULL_PROTOCOL_COMPARISON.md`) mapping PSP Moonlight features against the Moonlight desktop protocol spec.
+
+### Added — Adaptive Quality System (Phase 4–5)
+- **PID-based adaptive bitrate controller:** Replaces simple RSSI threshold with composite quality score: 40% RSSI + 30% connection quality + 30% FEC recovery rate. Full PID controller (Kp/Ki/Kd) with anti-windup integral clamping and dead-zone oscillation prevention.
+- **IDR exponential backoff:** IDR requests now use 500ms → 1000ms → 2000ms → 4000ms backoff with automatic cooldown resets. Reduces IDR flood during sustained loss from hundreds to single digits.
+- **Quality hysteresis:** Requires 3 consecutive readings in same quality band before state transition, preventing oscillation on borderline WiFi.
+- **FEC predictive loss detection:** Detects WiFi burst loss patterns and pre-requests IDR frames before unrecoverable frame arrives. Selective FEC skip when >50% parity lost saves CPU.
+- **Packet prioritization:** IDR/SOF packets preferred over P-frame body and FEC during congestion for faster keyframe delivery.
+- **Dynamic SO_RCVBUF:** Socket receive buffer scales with quality — 128KB (good) → 256KB (fair) → 384KB (poor) — to absorb WiFi jitter bursts.
+- **WiFi power save disable:** Disables PSP WiFi power save mode during active streaming to eliminate 100ms+ wakeup latency spikes.
+- **Aggressive ping + burst recovery:** Faster ping interval for connection monitoring; burst ping (multiple sends × 1ms spacing) on reconnect for faster recovery.
+
+### Changed — Audio
+- **Quality-adaptive PLC thresholds:** PLC gap tolerance now adjusts with connection quality — 35ms (good) / 45ms (fair) / 60ms (poor) — reducing false-positive PLC during degraded WiFi.
+- **Dynamic audio ring depth:** Ring buffer scales with packet loss rate to absorb longer burst gaps without underrun.
+- **Audio crypto separate error tracking:** Audio crypto failures tracked independently with 100-failure threshold before fatal disconnect, preventing video crypto issues from killing audio.
+
+### Changed — Video Decode
+- **Frame pacing:** Extra VBlank wait if frame decoded <4ms ago to reduce tearing on fast-motion scenes.
+- **P-frame skip-ahead:** When decoder backlog exceeds 256 packets, scans forward to next IDR instead of decoding 85+ stale P-frames. Dramatically reduces recovery time after loss bursts.
+- **Decoder thread priority boost:** Thread priority elevated from 0x1C to 0x18, matching control stream priority for lower decode latency.
+- **Enhanced watchdog:** Credit restoration now weighted by FEC recovery rate (600/900/1200 frames). Intermediate flush at 3s before Mode B 5s timeout for graceful recovery.
+
+### Changed — UI
+- **HUD dynamic height:** HUD overlay auto-sizes based on displayed metrics instead of fixed height.
+- **HUD new metrics:** Added packet loss %, FEC recovery %, and host processing latency display to in-stream HUD.
+- **Settings menu:** Resolution/FPS selector improvements for custom resolution support.
+- **Game grid UI:** Improved tile layout and icon rendering.
+
+### Fixed
+- **Config resolution index:** Custom resolutions (anything not 480×272 or 256×144) now correctly map to `resolutionIndex=2` instead of defaulting to 0.
+- **Config FPS index rebuilder:** FPS values correctly map to `FPS_VALUES[]` array indices on INI reload, preventing mismatched FPS after config changes.
+- **RTP reassembly stats:** Additional sequence gap tracking for diagnostic accuracy.
+- **Stream connect UI:** Minor connection progress display fix.
+- **Pairing PIN UI:** Layout and interaction improvements.
+
+### Performance (480×272 @ 15fps, 500 kbps)
+| Metric | v0.2.1-beta | v0.2.2-beta |
+|---|---|---|
+| Adaptive bitrate | Threshold-based | PID controller (composite quality) |
+| IDR requests/min | ~40–100 | ~5–15 (exp backoff) |
+| FEC recovery | Basic RS | Predictive + selective skip |
+| Audio PLC | Fixed 45ms | Adaptive 35–60ms |
+| Input types | Gamepad only | Gamepad + keyboard + scroll + battery |
+| Resolution modes | Fixed | Auto-scale 4-step ladder |
+| HUD metrics | FPS, latency | +loss%, FEC%, battery, host latency |
+| Features verified | — | 31/39 ACTIVE across 8-stage test |
+
+---
+
 ## [0.2.1-beta] — 2026-04-13
 
 ### Added — New Features

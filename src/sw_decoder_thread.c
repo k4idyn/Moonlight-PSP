@@ -193,6 +193,46 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         dec_log("CB#%d hex: %s\n", s_cb_count, hex);
     }
 
+    /* P-frame skip on overload: when ring queue depth exceeds 256 packets
+     * (~85 frames at 3 pkt/frame), skip P-frames and only decode IDR/SPS/PPS.
+     * This lets the decoder "jump ahead" to the latest IDR instead of
+     * decoding 85+ stale P-frames that will be immediately discarded.
+     * Saves ~5-40ms per skipped frame of decode time on 333MHz PSP. */
+    if (g_packet_rb) {
+        u32 queued = (g_packet_rb->head + RING_BUFFER_SLOTS
+                      - g_packet_rb->tail) % RING_BUFFER_SLOTS;
+        if (queued > 256 && nal_len > 4) {
+            /* Check if this is an IDR frame: scan first few bytes for
+             * NAL type 5 (IDR) or 7 (SPS) or 8 (PPS).  Annex-B format:
+             * 00 00 00 01 <nal_unit_type & 0x1F> */
+            int is_idr = 0;
+            const u8 *p = nal_data;
+            const u8 *end = nal_data + (nal_len < 64 ? nal_len : 64);
+            while (p + 4 < end) {
+                if (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) {
+                    int nal_type = p[4] & 0x1F;
+                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
+                        is_idr = 1;
+                        break;
+                    }
+                }
+                p++;
+            }
+            if (!is_idr) {
+                static u32 s_pskip_count = 0;
+                s_pskip_count++;
+                if (s_pskip_count <= 3 || (s_pskip_count % 50) == 0) {
+                    dec_log("P-SKIP: q=%u skipping P-frame #%u (len=%d) waiting for IDR\n",
+                            (unsigned)queued, s_pskip_count, nal_len);
+                }
+                return;  /* skip this P-frame */
+            } else {
+                /* IDR arrived while queue was overloaded — log recovery */
+                dec_log("P-SKIP: IDR arrived, resuming decode (q=%u)\n", (unsigned)queued);
+            }
+        }
+    }
+
 #ifdef MOONLIGHT_DEBUG_DUMP
     /* Debug-only raw dump: first frame >5KB (likely IDR) to ms0:/raw_dump.h264.
      * This captures data BEFORE CAVLC parsing so we can hex-inspect the full
@@ -484,7 +524,9 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     g_dec_running = 1;
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             0x1C,        /* Priority 28: same as audio, above old 32 */
+                                             0x18,        /* Priority 24: boosted to match control stream
+                                                           * for lowest decode latency.  Trades control
+                                                           * responsiveness for faster frame delivery. */
                                              128 * 1024,  /* 128KB stack for VFPU recon */
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
@@ -497,7 +539,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     sceKernelStartThread(g_dec_thread_id, 0, NULL);
 
     g_decoder_ready = 1;
-    dec_log("Decoder init OK (sw_pipeline active)\n");
+    dec_log("Decoder init OK (sw_pipeline active, priority=0x18 boosted)\n");
     return 0;
 }
 
@@ -669,7 +711,7 @@ void sw_decoder_thread_force_restart(void)
     g_dec_running = 1;
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             0x1C,
+                                             0x18,
                                              128 * 1024,
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);

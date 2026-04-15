@@ -79,4 +79,31 @@ int control_stream_send_fec_status(unsigned int frame_index,
                                    unsigned char  multi_fec_idx,
                                    unsigned char  multi_fec_cnt);
 
+/* ── Connection Quality Monitoring ─────────────────────────────────
+ * Aggregates FEC stats, packet loss, and RSSI into a single quality
+ * indicator for the HUD and adaptive bitrate controller. */
+
+typedef enum {
+    CONN_QUALITY_EXCELLENT = 0,   /* <1% loss, strong RSSI */
+    CONN_QUALITY_GOOD      = 1,   /* 1-3% loss, decent RSSI */
+    CONN_QUALITY_FAIR      = 2,   /* 3-8% loss, moderate RSSI */
+    CONN_QUALITY_POOR      = 3,   /* 8-15% loss, weak RSSI */
+    CONN_QUALITY_CRITICAL  = 4    /* >15% loss, very weak RSSI */
+} ConnQuality;
+
+typedef struct {
+    ConnQuality quality;          /* current quality assessment */
+    unsigned int loss_rate_pct;   /* packet loss % (0-100, scaled x10 for 0.1% precision) */
+    unsigned int fec_recovery_pct;/* FEC recovery success % (0-100) */
+    unsigned int avg_rtt_us;      /* average round-trip estimate in microseconds */
+    unsigned int frames_per_sec;  /* decoded frames per second */
+    unsigned int bw_estimate_bps; /* estimated bandwidth in bytes/sec */
+} ConnQualityState;
+
+/*
+ * control_stream_get_quality - Get current connection quality assessment.
+ * Returns a snapshot of the aggregated quality metrics.
+ */
+ConnQualityState control_stream_get_quality(void);
+
 #endif /* CONTROL_STREAM_H */

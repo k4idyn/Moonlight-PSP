@@ -251,12 +251,14 @@ void display_frame(void *frame_data)
     int tex_stride = g_stream_res.initialized ? g_stream_res.stride : ((src_w > 512) ? 1024 : 512);
 
     /* RESTORE GU STATE AFTER POTENTIAL HUD/UI MODIFICATION
-     * The HUD uses intraFont which corrupts TexScale, TexOffset, Mode, Disable Blending, etc. */
+     * The HUD uses intraFont which corrupts TexScale, TexOffset, Mode, Disable Blending, etc.
+     * Complete restoration prevents color corruption and visual artifacts between frames. */
     sceGuEnable(GU_TEXTURE_2D);
     sceGuTexOffset(0.0f, 0.0f);
     sceGuTexScale(1.0f, 1.0f);
     sceGuColor(0xFFFFFFFF); /* Ensure no tint is applied */
     sceGuDisable(GU_BLEND); /* Video frames shouldn't be blended */
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST); /* Reset filter — set per-pass below */
 
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
@@ -303,16 +305,23 @@ void display_frame(void *frame_data)
 }
 
 /* ------------------------------------------------------------------ *
- * display_frame_finish - Swap buffers (immediate, no VBlank wait)
+ * display_frame_finish - Swap buffers with VBlank sync
  *
  * Call AFTER hud_render() so HUD composites before the swap.
- * Removed VBlank sync to maximize frame throughput — at 15fps
- * actual decode rate on PSP, waiting for 60Hz VBlank wastes up
- * to 16ms per frame (50% of decode budget).  Tearing is invisible
- * at 256x144 resolution with GPU bilinear upscale.
+ *
+ * ALWAYS waits for VBlank before swap.  At 15-30fps decode rate the
+ * PSP LCD refresh (60Hz) has 2-4 VBlanks between decoded frames, so
+ * the sync cost is negligible.  During idle loops (no decoded frame)
+ * VBlank naturally throttles the swap rate to 60Hz and prevents the
+ * rapid buffer-flip that caused HUD text to flash on/off.
+ *
+ * Previously VBlank was removed entirely ("adaptive" every-other-frame
+ * was also insufficient because idle loops ran at ~1kHz, causing
+ * unsynced swaps 1ms after each VBlank-synced one).
  * ------------------------------------------------------------------ */
 void display_frame_finish(void)
 {
+    sceDisplayWaitVblankStart();
     s_frame_buffer = sceGuSwapBuffers();
 }
 

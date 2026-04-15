@@ -15,6 +15,8 @@
 
 #include "signal_strength.h"
 #include "diag_log.h"
+#include "control_stream.h"
+#include "rtp_fec.h"
 
 /* GU UI owns the framebuffer during normal runtime; avoid direct debug-screen writes. */
 #define pspDebugScreenPrintf(...) ((void)0)
@@ -124,6 +126,22 @@ void signal_strength_init(int base_bitrate_kbps)
     g_signal_state.icon_show_time = 0;
     g_signal_state.last_check_time = sceKernelGetSystemTimeLow();
 
+    /* PID controller: target 70% quality setpoint (balanced for 802.11b) */
+    g_signal_state.pid_error_prev = 0;
+    g_signal_state.pid_integral = 0;
+    g_signal_state.pid_target_quality = 70;
+
+    /* Phase 4: Adaptive bitrate controller init */
+    g_signal_state.adapt_consecutive_drops = 0;
+    g_signal_state.adapt_last_green_time = 0;
+    g_signal_state.adapt_in_recovery = 0;
+    g_signal_state.adapt_prev_bitrate = base_bitrate_kbps;
+    g_signal_state.rssi_history_idx = 0;
+    g_signal_state.rssi_history_count = 0;
+    g_signal_state.jitter_idx = 0;
+    g_signal_state.jitter_count = 0;
+    g_signal_state.current_trend = SIGNAL_TREND_STABLE;
+
     g_initialized = 1;
 
     pspDebugScreenPrintf("signal: initialized (base bitrate: %d kbps)\n",
@@ -134,7 +152,8 @@ int signal_strength_update(void)
 {
     u32 current_time;
     int signal_percent;
-    int bitrate_delta;
+    int composite_quality;
+    int error, derivative, pid_output, delta_kbps;
 
     if (!g_initialized)
         return g_signal_state.current_bitrate;
@@ -149,76 +168,273 @@ int signal_strength_update(void)
 
     g_signal_state.last_check_time = current_time;
 
-    /* Read current signal strength */
+    /* ── Multi-signal composite quality (0-100) ────────────────────
+     * Blend RSSI with FEC loss/recovery stats and connection quality
+     * for a more accurate picture than RSSI alone. Weights:
+     *   RSSI: 40%  — physical layer signal
+     *   Connection quality: 30% — FEC-based transport assessment
+     *   FEC recovery rate: 30% — RS codec effectiveness
+     * All values are 0-100 scale. */
     signal_percent = read_signal_percent();
     g_signal_state.signal_percent = signal_percent;
 
-    /* Periodic signal strength log for diagnostics */
-    g_signal_log_counter++;
-    if (g_signal_log_counter >= SIGNAL_LOG_INTERVAL) {
-        diag_log_write("SIG", "signal=%d%% bitrate=%dkbps (base=%d)\n",
-                       signal_percent, g_signal_state.current_bitrate,
-                       g_signal_state.base_bitrate);
-        g_signal_log_counter = 0;
+    /* Phase 4: Record RSSI into history for trend detection */
+    g_signal_state.rssi_history[g_signal_state.rssi_history_idx] = signal_percent;
+    g_signal_state.rssi_history_idx =
+        (g_signal_state.rssi_history_idx + 1) % SIGNAL_RSSI_HISTORY_SIZE;
+    if (g_signal_state.rssi_history_count < SIGNAL_RSSI_HISTORY_SIZE)
+        g_signal_state.rssi_history_count++;
+
+    /* Phase 4: Compute signal trend from RSSI history + jitter */
+    if (g_signal_state.rssi_history_count >= 4) {
+        int recent_avg = 0, older_avg = 0;
+        int recent_n = 0, older_n = 0;
+        int half = g_signal_state.rssi_history_count / 2;
+        int ti;
+        for (ti = 0; ti < g_signal_state.rssi_history_count; ti++) {
+            int tidx = (g_signal_state.rssi_history_idx
+                        - g_signal_state.rssi_history_count + ti
+                        + SIGNAL_RSSI_HISTORY_SIZE) % SIGNAL_RSSI_HISTORY_SIZE;
+            if (ti < half) {
+                older_avg += g_signal_state.rssi_history[tidx];
+                older_n++;
+            } else {
+                recent_avg += g_signal_state.rssi_history[tidx];
+                recent_n++;
+            }
+        }
+        if (older_n > 0) older_avg /= older_n;
+        if (recent_n > 0) recent_avg /= recent_n;
+        {
+            u32 avg_jitter = 0;
+            if (g_signal_state.jitter_count > 0) {
+                u32 jsum = 0;
+                int ji;
+                for (ji = 0; ji < g_signal_state.jitter_count; ji++)
+                    jsum += g_signal_state.jitter_samples[ji];
+                avg_jitter = jsum / (u32)g_signal_state.jitter_count;
+            }
+            {
+                SignalTrend prev_trend = g_signal_state.current_trend;
+                if (recent_avg > older_avg + 5 && avg_jitter < 50000)
+                    g_signal_state.current_trend = SIGNAL_TREND_IMPROVING;
+                else if (recent_avg < older_avg - 5 || avg_jitter > 100000)
+                    g_signal_state.current_trend = SIGNAL_TREND_DEGRADING;
+                else
+                    g_signal_state.current_trend = SIGNAL_TREND_STABLE;
+                if (g_signal_state.current_trend != prev_trend) {
+                    pspDebugScreenPrintf("[PHASE4-WIFI] trend: %s\n",
+                        g_signal_state.current_trend == SIGNAL_TREND_IMPROVING ? "IMPROVING" :
+                        g_signal_state.current_trend == SIGNAL_TREND_DEGRADING ? "DEGRADING" : "STABLE");
+                    diag_log_write("SIG", "[PHASE4-WIFI] trend: %s (recent=%d older=%d jitter=%u)\n",
+                        g_signal_state.current_trend == SIGNAL_TREND_IMPROVING ? "IMPROVING" :
+                        g_signal_state.current_trend == SIGNAL_TREND_DEGRADING ? "DEGRADING" : "STABLE",
+                        recent_avg, older_avg, avg_jitter);
+                }
+            }
+        }
     }
 
-    /* Adjust bitrate based on signal strength */
-    if (signal_percent < SIGNAL_FAIR)
     {
-        /* Signal below 40%: Drop bitrate by 50 kbps */
-        bitrate_delta = BITRATE_DROP_KBPS;
+        ConnQualityState cq = control_stream_get_quality();
+        int cq_score;
+        int fec_score;
 
-        /* Apply bitrate reduction */
-        g_signal_state.current_bitrate -= bitrate_delta;
-
-        /* Enforce minimum bitrate floor */
-        if (g_signal_state.current_bitrate < BITRATE_MIN_KBPS)
-        {
-            g_signal_state.current_bitrate = BITRATE_MIN_KBPS;
+        /* Map ConnQuality enum to 0-100 scale */
+        switch (cq.quality) {
+            case CONN_QUALITY_EXCELLENT: cq_score = 100; break;
+            case CONN_QUALITY_GOOD:      cq_score = 75;  break;
+            case CONN_QUALITY_FAIR:      cq_score = 50;  break;
+            case CONN_QUALITY_POOR:      cq_score = 25;  break;
+            case CONN_QUALITY_CRITICAL:  cq_score = 0;   break;
+            default:                     cq_score = 50;  break;
         }
 
-        /* Show Wi-Fi warning icon */
+        /* FEC recovery percentage is already 0-100 */
+        fec_score = (int)cq.fec_recovery_pct;
+
+        /* Weighted composite: RSSI 40% + conn quality 30% + FEC recovery 30% */
+        composite_quality = (signal_percent * 40 + cq_score * 30 + fec_score * 30) / 100;
+    }
+
+    /* ── PID controller ────────────────────────────────────────────
+     * error = target - actual (positive = quality below target → reduce bitrate)
+     * Negative output = reduce bitrate, positive output = increase bitrate */
+    error = composite_quality - g_signal_state.pid_target_quality;
+
+    /* Integral accumulation with anti-windup clamping */
+    g_signal_state.pid_integral += error;
+    {
+        int windup = 0;
+        if (g_signal_state.pid_integral > PID_INTEGRAL_MAX) {
+            g_signal_state.pid_integral = PID_INTEGRAL_MAX;
+            windup = 1;
+        }
+        if (g_signal_state.pid_integral < PID_INTEGRAL_MIN) {
+            g_signal_state.pid_integral = PID_INTEGRAL_MIN;
+            windup = -1;
+        }
+        if (windup != 0) {
+            static u32 s_windup_count = 0;
+            s_windup_count++;
+            if (s_windup_count <= 3 || (s_windup_count % 30) == 0)
+                diag_log_write("SIG", "PID integral windup %s (clamped to %d) [#%u]\n",
+                               windup > 0 ? "MAX" : "MIN",
+                               g_signal_state.pid_integral, s_windup_count);
+        }
+    }
+
+    /* Derivative (change in error) */
+    derivative = error - g_signal_state.pid_error_prev;
+    g_signal_state.pid_error_prev = error;
+
+    /* PID output in fixed-point (kbps * PID_SCALE) */
+    pid_output = (PID_KP * error) +
+                 (PID_KI * g_signal_state.pid_integral / PID_SCALE) +
+                 (PID_KD * derivative);
+
+    /* Convert to kbps delta */
+    delta_kbps = pid_output / PID_SCALE;
+
+    /* Anti-jitter: clamp maximum change per update */
+    if (delta_kbps > PID_MAX_DELTA_KBPS)
+        delta_kbps = PID_MAX_DELTA_KBPS;
+    if (delta_kbps < -PID_MAX_DELTA_KBPS)
+        delta_kbps = -PID_MAX_DELTA_KBPS;
+
+    /* Apply delta */
+    g_signal_state.current_bitrate += delta_kbps;
+
+    /* Clamp to valid range */
+    if (g_signal_state.current_bitrate < BITRATE_MIN_KBPS) {
+        g_signal_state.current_bitrate = BITRATE_MIN_KBPS;
+        {
+            static u32 s_min_clamp_count = 0;
+            s_min_clamp_count++;
+            if (s_min_clamp_count <= 3 || (s_min_clamp_count % 30) == 0)
+                diag_log_write("SIG", "bitrate hit MIN floor %dkbps [#%u]\n",
+                               BITRATE_MIN_KBPS, s_min_clamp_count);
+        }
+    }
+    if (g_signal_state.current_bitrate > g_signal_state.base_bitrate) {
+        g_signal_state.current_bitrate = g_signal_state.base_bitrate;
+        {
+            static u32 s_max_clamp_count = 0;
+            s_max_clamp_count++;
+            if (s_max_clamp_count <= 3 || (s_max_clamp_count % 30) == 0)
+                diag_log_write("SIG", "bitrate hit MAX ceiling %dkbps [#%u]\n",
+                               g_signal_state.base_bitrate, s_max_clamp_count);
+        }
+    }
+
+    /* ── Phase 4: Adaptive Bitrate Overlay ────────────────────────
+     * Fast-drop on consecutive drops, slow-recover when green,
+     * dynamic ceiling, dead-zone to prevent oscillation. */
+    {
+        int adapt_ceiling;
+        int adapt_floor = BITRATE_MIN_KBPS;
+
+        /* Dynamic ceiling: min(4000, signal_quality * 50) */
+        adapt_ceiling = composite_quality * ADAPT_CEILING_QUALITY_MULT;
+        if (adapt_ceiling > ADAPT_CEILING_MAX_KBPS)
+            adapt_ceiling = ADAPT_CEILING_MAX_KBPS;
+        if (adapt_ceiling < adapt_floor)
+            adapt_ceiling = adapt_floor;
+
+        /* Fast-drop: 3+ consecutive unrecoverable → halve bitrate */
+        if (g_signal_state.adapt_consecutive_drops >= ADAPT_FAST_DROP_THRESHOLD) {
+            int halved = g_signal_state.current_bitrate / 2;
+            if (halved < adapt_floor) halved = adapt_floor;
+            if (halved < g_signal_state.current_bitrate) {
+                pspDebugScreenPrintf("[PHASE4-ADAPT] fast-drop: %d->%d kbps\n",
+                                    g_signal_state.current_bitrate, halved);
+                diag_log_write("SIG", "[PHASE4-ADAPT] fast-drop: %d -> %d kbps (drops=%d)\n",
+                               g_signal_state.current_bitrate, halved,
+                               g_signal_state.adapt_consecutive_drops);
+                g_signal_state.current_bitrate = halved;
+            }
+            g_signal_state.adapt_consecutive_drops = 0;
+            g_signal_state.adapt_in_recovery = 0;
+            g_signal_state.adapt_last_green_time = 0;
+        }
+
+        /* Slow-recover: +25kbps/s when all signals green for 5s */
+        if (composite_quality >= SIGNAL_GOOD &&
+            g_signal_state.adapt_consecutive_drops == 0) {
+            if (g_signal_state.adapt_last_green_time == 0)
+                g_signal_state.adapt_last_green_time = current_time;
+            if ((current_time - g_signal_state.adapt_last_green_time)
+                >= ADAPT_GREEN_HOLDOFF_US) {
+                int old_br = g_signal_state.current_bitrate;
+                g_signal_state.current_bitrate += ADAPT_SLOW_RECOVER_KBPS;
+                if (!g_signal_state.adapt_in_recovery) {
+                    pspDebugScreenPrintf("[PHASE4-ADAPT] slow-recover start\n");
+                    diag_log_write("SIG", "[PHASE4-ADAPT] slow-recover: %d -> %d kbps\n",
+                                   old_br, g_signal_state.current_bitrate);
+                    g_signal_state.adapt_in_recovery = 1;
+                }
+            }
+        } else {
+            g_signal_state.adapt_last_green_time = 0;
+            if (g_signal_state.adapt_in_recovery) {
+                diag_log_write("SIG", "[PHASE4-ADAPT] recovery paused (q=%d drops=%d)\n",
+                               composite_quality, g_signal_state.adapt_consecutive_drops);
+                g_signal_state.adapt_in_recovery = 0;
+            }
+        }
+
+        /* IDR avoidance: proactive reduction when quality trending down */
+        if (g_signal_state.current_trend == SIGNAL_TREND_DEGRADING) {
+            int reduction = g_signal_state.current_bitrate / 10;
+            if (reduction < 25) reduction = 25;
+            g_signal_state.current_bitrate -= reduction;
+            pspDebugScreenPrintf("[PHASE4-ADAPT] IDR-avoid: -%d kbps\n", reduction);
+        }
+
+        /* Dead-zone: +/-15% stability band */
+        {
+            int prev = g_signal_state.adapt_prev_bitrate;
+            int diff = g_signal_state.current_bitrate - prev;
+            int threshold = (prev * ADAPT_DEADZONE_PCT) / 100;
+            if (threshold < 10) threshold = 10;
+            if (diff > -threshold && diff < threshold && diff != 0) {
+                g_signal_state.current_bitrate = prev;
+            } else {
+                g_signal_state.adapt_prev_bitrate = g_signal_state.current_bitrate;
+            }
+        }
+
+        /* Final clamp to adaptive floor/ceiling */
+        if (g_signal_state.current_bitrate < adapt_floor)
+            g_signal_state.current_bitrate = adapt_floor;
+        if (g_signal_state.current_bitrate > adapt_ceiling)
+            g_signal_state.current_bitrate = adapt_ceiling;
+        if (g_signal_state.current_bitrate > g_signal_state.base_bitrate)
+            g_signal_state.current_bitrate = g_signal_state.base_bitrate;
+    }
+
+    /* ── WiFi icon management ──────────────────────────────────────
+     * Show icon when composite quality is poor */
+    if (composite_quality < SIGNAL_FAIR) {
         g_signal_state.wifi_icon_visible = 1;
         g_signal_state.icon_show_time = current_time;
-
-        pspDebugScreenPrintf("signal: weak (%d%%) - bitrate: %d kbps\n",
-                             signal_percent, g_signal_state.current_bitrate);
-    }
-    else if (signal_percent >= SIGNAL_GOOD)
-    {
-        /* Signal above 60%: Gradually recover bitrate */
-        if (g_signal_state.current_bitrate < g_signal_state.base_bitrate)
-        {
-            /* Recover at 50 kbps per check */
-            g_signal_state.current_bitrate += BITRATE_MAX_RECOVERY;
-
-            /* Don't exceed base bitrate */
-            if (g_signal_state.current_bitrate > g_signal_state.base_bitrate)
-            {
-                g_signal_state.current_bitrate = g_signal_state.base_bitrate;
-            }
-        }
-
-        /* Hide Wi-Fi icon after timeout */
-        if (g_signal_state.wifi_icon_visible)
-        {
-            if ((current_time - g_signal_state.icon_show_time) >= ICON_DISPLAY_DURATION_US)
-            {
-                g_signal_state.wifi_icon_visible = 0;
-            }
+    } else if (g_signal_state.wifi_icon_visible) {
+        if ((current_time - g_signal_state.icon_show_time) >= ICON_DISPLAY_DURATION_US) {
+            g_signal_state.wifi_icon_visible = 0;
         }
     }
-    else
-    {
-        /* Signal between 40-60%: Maintain current bitrate */
-        /* Still check icon timeout */
-        if (g_signal_state.wifi_icon_visible)
-        {
-            if ((current_time - g_signal_state.icon_show_time) >= ICON_DISPLAY_DURATION_US)
-            {
-                g_signal_state.wifi_icon_visible = 0;
-            }
-        }
+
+    /* Periodic logging */
+    g_signal_log_counter++;
+    if (g_signal_log_counter >= SIGNAL_LOG_INTERVAL) {
+        diag_log_write("SIG", "PID: rssi=%d%% cq=%d%% fec=%d%% composite=%d%% err=%d I=%d delta=%dkbps bitrate=%dkbps\n",
+                       signal_percent,
+                       (int)(control_stream_get_quality().quality),
+                       (int)(control_stream_get_quality().fec_recovery_pct),
+                       composite_quality, error,
+                       g_signal_state.pid_integral / PID_SCALE,
+                       delta_kbps, g_signal_state.current_bitrate);
+        g_signal_log_counter = 0;
     }
 
     return g_signal_state.current_bitrate;
@@ -252,4 +468,40 @@ void signal_strength_shutdown(void)
 {
     g_initialized = 0;
     memset(&g_signal_state, 0, sizeof(g_signal_state));
+}
+
+/*============================================================================
+ * Phase 4: Adaptive Bitrate + WiFi Trend API
+ *============================================================================*/
+
+SignalTrend signal_strength_get_trend(void)
+{
+    if (!g_initialized)
+        return SIGNAL_TREND_STABLE;
+    return g_signal_state.current_trend;
+}
+
+void signal_strength_report_frame_drop(void)
+{
+    if (!g_initialized)
+        return;
+    g_signal_state.adapt_consecutive_drops++;
+}
+
+void signal_strength_report_frame_ok(void)
+{
+    if (!g_initialized)
+        return;
+    g_signal_state.adapt_consecutive_drops = 0;
+}
+
+void signal_strength_report_jitter(u32 delta_us)
+{
+    if (!g_initialized)
+        return;
+    g_signal_state.jitter_samples[g_signal_state.jitter_idx] = delta_us;
+    g_signal_state.jitter_idx =
+        (g_signal_state.jitter_idx + 1) % SIGNAL_JITTER_HISTORY_SIZE;
+    if (g_signal_state.jitter_count < SIGNAL_JITTER_HISTORY_SIZE)
+        g_signal_state.jitter_count++;
 }

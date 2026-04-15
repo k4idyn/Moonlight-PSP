@@ -37,17 +37,15 @@ static u32 __attribute__((aligned(16))) hud_display_list[16 * 1024 / 4];
 
 /* HUD dimensions and positioning */
 #define HUD_WIDTH           200
-#define HUD_HEIGHT          100
 #define HUD_X               (FRAME_WIDTH - HUD_WIDTH - 10)  /* Top-right */
 #define HUD_Y               10
 #define HUD_PADDING         8
 #define HUD_LINE_HEIGHT     16
 
 /* Menu item indices */
-#define MENU_ITEM_STATS     0
-#define MENU_ITEM_PAUSE     1
-#define MENU_ITEM_QUIT      2
-#define MENU_ITEM_COUNT     3
+#define MENU_ITEM_PAUSE     0
+#define MENU_ITEM_QUIT      1
+#define MENU_ITEM_COUNT     2
 
 /*============================================================================
  * Vertex structures
@@ -70,8 +68,9 @@ typedef struct {
  * Internal State
  *============================================================================*/
 
-static HudStats g_stats = { 0, 0.0f };     /* Current statistics (latency, fps) */
+static HudStats g_stats = { 0, 0.0f, 0.0f, 0.0f, 0, 0 };     /* Current statistics (latency, fps) */
 static int g_hud_visible = 0;               /* HUD visibility flag */
+static int g_hud_cooldown = 0;              /* Frames to suppress input after toggle */
 static int g_selected_item = 0;             /* Currently selected menu item */
 static int g_initialized = 0;               /* Initialization flag */
 
@@ -141,20 +140,41 @@ void hud_render(void)
     if (!g_initialized || !g_hud_visible)
         return;
 
-    /* Begin HUD rendering */
+    /* Begin HUD rendering in its own GU context */
     sceGuStart(GU_DIRECT, hud_display_list);
 
-    /* --- WHAT THIS DOES ---
-     * Draw the HUD panel using UIManager helpers inside the existing
-     * GU frame started by the caller (display_frame context).
-     * Single rounded rect for polished look without excessive GPU cost.
-     * Alpha blending is enabled for the semi-transparent panel.
-     */
+    /* Re-establish clean 2D state — display_frame() leaves GU configured
+     * for 3D textured video blitting.  Without this reset, rect/text
+     * drawing produces jittery/chaotic output on real hardware. */
+    sceGuScissor(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuDisable(GU_CULL_FACE);
+    sceGuDisable(GU_STENCIL_TEST);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuDisable(GU_TEXTURE_2D);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuShadeModel(GU_FLAT);
+    sceGuOffset(2048 - (FRAME_WIDTH / 2), 2048 - (FRAME_HEIGHT / 2));
+    sceGuViewport(2048, 2048, FRAME_WIDTH, FRAME_HEIGHT);
+
     ui_set_blend(1);
-    /* Single shadow offset (cheap simple rect) */
-    ui_draw_rect(HUD_X + 2, HUD_Y + 2, HUD_WIDTH, HUD_HEIGHT, 0x30000000);
-    /* Panel background — semi-transparent dark with rounded corners */
-    ui_draw_rect_rounded(HUD_X, HUD_Y, HUD_WIDTH, HUD_HEIGHT, 6, HUD_BG_COLOR);
+    /* Compute panel height dynamically based on content:
+     * 5 stat lines + optional Host line + separator + 2 menu items + padding
+     * Without Host: 8 + 20 + 72 + 6 + 32 + 8 = 146
+     * With Host:    146 + 18 = 164                                           */
+    {
+        int hud_height = HUD_PADDING                               /* top pad  */
+                       + (HUD_LINE_HEIGHT + 4)                     /* Latency  */
+                       + 4 * (HUD_LINE_HEIGHT + 2)                 /* FPS..Bat */
+                       + 6                                         /* separator*/
+                       + MENU_ITEM_COUNT * HUD_LINE_HEIGHT         /* menu     */
+                       + HUD_PADDING;                              /* bot pad  */
+        if (g_stats.host_proc_ms > 0)
+            hud_height += HUD_LINE_HEIGHT + 2;                     /* Host ln  */
+        /* Panel background — semi-transparent dark with rounded corners */
+        ui_draw_rect_rounded(HUD_X, HUD_Y, HUD_WIDTH, hud_height, 6, HUD_BG_COLOR);
+    }
     ui_set_blend(0);
 
     /* Draw title */
@@ -167,15 +187,33 @@ void hud_render(void)
 
     snprintf(buf, sizeof(buf), "FPS: %.1f", g_stats.fps);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
-    y_offset += HUD_LINE_HEIGHT + 8;
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    snprintf(buf, sizeof(buf), "Loss: %.1f%%", g_stats.packet_loss_pct);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    snprintf(buf, sizeof(buf), "FEC: %.1f%%", g_stats.fec_recovery_pct);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    snprintf(buf, sizeof(buf), "Battery: %d%%", g_stats.battery_pct);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    if (g_stats.host_proc_ms > 0) {
+        snprintf(buf, sizeof(buf), "Host: %dms", g_stats.host_proc_ms);
+        draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+        y_offset += HUD_LINE_HEIGHT + 2;
+    }
+    y_offset += 6;
 
     /* Draw menu items using UIManager text */
     for (i = 0; i < MENU_ITEM_COUNT; i++) {
         u32 color = (i == g_selected_item) ? HUD_HIGHLIGHT_COLOR : HUD_TEXT_COLOR;
         const char *label;
         if (i == MENU_ITEM_QUIT) label = "Quit";
-        else if (i == MENU_ITEM_PAUSE) label = "Pause";
-        else label = "Stats";
+        else label = "Pause";
         /* Highlight the selected row */
         if (i == g_selected_item) {
             /* Accent-colored rounded pill highlight (matches settings card style) */
@@ -214,6 +252,14 @@ int hud_handle_input(u32 buttons)
     if (!g_initialized)
         return 0;
 
+    /* Cooldown: suppress all input for a few frames after toggle to prevent
+     * the R+Up combo from leaking as an Up D-pad press to Sunshine. */
+    if (g_hud_cooldown > 0) {
+        g_hud_cooldown--;
+        g_prev_buttons = buttons;
+        return 0;
+    }
+
     /* Toggle HUD on R+Up combo (PSP_CTRL_NOTE is kernel-mode only and
      * invisible to user-mode sceCtrlPeekBufferPositive).  Both R-trigger and
      * D-pad Up must be pressed together; the combo is debounced so it only
@@ -225,6 +271,7 @@ int hud_handle_input(u32 buttons)
         if (combo_held && !combo_prev) {
             g_hud_visible = !g_hud_visible;
             combo_toggled = 1;
+            g_hud_cooldown = 4;  /* Suppress input for 4 frames (~67ms) */
             diag_log_write("HUD", "Toggle %s (btn=0x%08X)\n",
                            g_hud_visible ? "ON" : "OFF", buttons);
             if (g_hud_visible) {
@@ -276,7 +323,9 @@ int hud_handle_input(u32 buttons)
 
 int hud_is_visible(void)
 {
-    return g_hud_visible;
+    /* Also report visible during cooldown so main.c suppresses
+     * input_poll_and_send — prevents R+Up leak to Sunshine. */
+    return g_hud_visible || (g_hud_cooldown > 0);
 }
 
 void hud_shutdown(void)

@@ -16,6 +16,10 @@
 typedef struct {
     int   latency_ms;       /* Current latency in milliseconds */
     float fps;              /* Display frames per second */
+    float packet_loss_pct;  /* Video packet loss percentage */
+    float fec_recovery_pct; /* FEC recovery success percentage */
+    int   battery_pct;      /* PSP battery percentage (0-100) */
+    int   host_proc_ms;     /* Host-side encode latency in ms */
 } HudStats;
 
 /*============================================================================

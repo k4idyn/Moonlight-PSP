@@ -249,6 +249,18 @@ void settings_menu_draw(const PspConfig *config)
      * wait for VBlank so the user sees a tear-free render.
      */
 
+    /* Frame-delta compensation for consistent animation speed */
+    static u32 s_last_anim_us = 0;
+    u32 now_us = sceKernelGetSystemTimeLow();
+    float dt = 1.0f;
+    if (s_last_anim_us != 0) {
+        u32 elapsed = now_us - s_last_anim_us;
+        dt = (float)elapsed / 16667.0f;
+        if (dt > 4.0f) dt = 4.0f;
+        if (dt < 0.1f) dt = 0.1f;
+    }
+    s_last_anim_us = now_us;
+
     /* Bounded step-ladder camera: scroll ONLY when cursor hits visible edge.
      * While currentSelection stays within [camera, camera+4], camera is fixed.
      * Pushing past either edge advances the camera exactly 1 slot. */
@@ -260,9 +272,9 @@ void settings_menu_draw(const PspConfig *config)
     }
 
     /* Focus pop animation: lerps toward current selection for item scale-up */
-    s_focus_anim  += ((float)g_menu_state.currentSelection - s_focus_anim)  * 0.20f;
+    s_focus_anim  += ((float)g_menu_state.currentSelection - s_focus_anim)  * 0.20f * dt;
     /* Smooth scroll: camera lerps toward target each VBlank (continuous draw loop) */
-    s_scroll_curr += (s_target_camera - s_scroll_curr) * 0.15f;
+    s_scroll_curr += (s_target_camera - s_scroll_curr) * 0.15f * dt;
 
     ui_begin_frame();
 

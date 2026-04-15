@@ -38,6 +38,8 @@
 #include "stream_crypto.h"
 #include "moonlight_proto.h"
 #include "client_identity.h"
+#include "rtp_fec.h"
+#include "rtp_reassembly.h"
 
 PSP_MODULE_INFO("PSPMoonlight", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
@@ -92,6 +94,7 @@ extern int  sw_decoder_thread_init(FrameRingBuffer *frame_rb);
 extern void sw_decoder_thread_shutdown(void);
 extern void sw_decoder_thread_force_restart(void);
 extern int  decoder_is_cabac_detected(void);
+extern void oh264_pipeline_flush_buffers(void);
 extern int  safety_buffer_init(void);
 extern void safety_buffer_shutdown(void);
 extern void input_init(int sock);
@@ -385,7 +388,30 @@ host_select_loop:
 
         if (frame) {
             if (!video_started) { diag_log_write("MAIN", "First video frame displayed\n"); diag_log_flush(); s_fps_last_us = sceKernelGetSystemTimeLow(); }
-            video_started = 1; display_frame(frame);
+            video_started = 1;
+
+            /* ── Frame pacing ───────────────────────────────────────
+             * If the frame was decoded very recently (< 4 ms ago), it
+             * arrived late in the vblank cycle.  Displaying it now
+             * risks tearing.  Wait one extra vblank so GU can swap
+             * cleanly.  This trades ~16 ms latency for smooth cadence. */
+            {
+                static u32 s_pace_count = 0;
+                u32 decode_ts = g_last_frame_decode_us;
+                if (decode_ts > 0) {
+                    u32 age_us = sceKernelGetSystemTimeLow() - decode_ts;
+                    if (age_us < 4000) {
+                        sceDisplayWaitVblankStart();
+                        s_pace_count++;
+                        if (s_pace_count <= 3 || (s_pace_count % 500) == 0) {
+                            diag_log_write("PACE", "held frame: age=%uus total=%u\n",
+                                           age_us, s_pace_count);
+                        }
+                    }
+                }
+            }
+
+            display_frame(frame);
             s_disp_count++;
             s_idle_count = 0;  /* Reset idle counter — stream is active */
             s_fps_frame_count++;
@@ -410,11 +436,36 @@ host_select_loop:
                     s_display_fps = (float)s_fps_frame_count * 1000000.0f / (float)elapsed;
                     s_fps_frame_count = 0;
                     s_fps_last_us = now_us;
-                    /* Feed HUD with smoothed latency and FPS */
-                    {
+                    /* Feed HUD with smoothed latency and FPS — only
+                     * gather expensive stats when the HUD is visible
+                     * to avoid unnecessary overhead during streaming. */
+                    if (hud_is_visible()) {
                         HudStats hs;
                         hs.latency_ms = s_latency_avg_ms;
                         hs.fps = s_display_fps;
+
+                        /* Packet loss and FEC stats from RTP layer */
+                        {
+                            RtpVideoStats vs;
+                            rtp_get_video_stats(&vs);
+                            u32 total = vs.packets_received + vs.packets_failed;
+                            if (total > 0)
+                                hs.packet_loss_pct = (float)vs.packets_failed * 100.0f / (float)total;
+                            else
+                                hs.packet_loss_pct = 0.0f;
+                            if (vs.recovery_attempts > 0)
+                                hs.fec_recovery_pct = (float)vs.packets_recovered * 100.0f / (float)vs.recovery_attempts;
+                            else
+                                hs.fec_recovery_pct = 0.0f;
+                        }
+
+                        /* Battery from PSP hardware */
+                        hs.battery_pct = scePowerGetBatteryLifePercent();
+                        if (hs.battery_pct < 0) hs.battery_pct = 0;
+
+                        /* Host processing latency from Sunshine headers */
+                        hs.host_proc_ms = (int)(g_host_processing_us / 1000);
+
                         hud_update_stats(&hs);
                     }
                 }
@@ -427,15 +478,30 @@ host_select_loop:
                                (unsigned)g_shared.frame_ring.tail);
             }
             /* Watchdog credit restoration: stream is healthy (displaying frames).
-             * Every ~15s of active frames, restore one restart slot.
-             * This allows future recovery if packet loss hits again later. */
-            if ((s_disp_count % 900) == 0 && s_disp_count > 0) {
-                if (s_watchdog_restarts > 0) {
-                    s_watchdog_restarts--;
-                    diag_log_write("MAIN", "WATCHDOG: credit restored (%d/5 used)",
-                                   s_watchdog_restarts);
+             * Phase 5: Weight by decode success rate:
+             *   >90%% FEC recovery → restore every ~10s (600 frames)
+             *   <70%% FEC recovery → restore every ~20s (1200 frames)
+             *   default → every ~15s (900 frames) */
+            {
+                static int s_credit_counter = 0;
+                s_credit_counter++;
+                {
+                    ConnQualityState cq = control_stream_get_quality();
+                    int restore_threshold = 900;
+                    if (cq.fec_recovery_pct > 90)
+                        restore_threshold = 600;
+                    else if (cq.fec_recovery_pct < 70)
+                        restore_threshold = 1200;
+                    if (s_credit_counter >= restore_threshold) {
+                        s_credit_counter = 0;
+                        if (s_watchdog_restarts > 0) {
+                            s_watchdog_restarts--;
+                            diag_log_write("MAIN", "[PHASE5-WDG] credit restored (%d/5 used, fec=%u%%)",
+                                           s_watchdog_restarts, (unsigned)cq.fec_recovery_pct);
+                        }
+                        s_mode_b_soft_count = 0;
+                    }
                 }
-                s_mode_b_soft_count = 0;
             }
         } else if (video_started) {
             s_idle_count++;
@@ -468,22 +534,53 @@ host_select_loop:
             {
                 extern volatile u32 g_decode_active_us;
 
-                /* Mode A: OpenH264 hung mid-decode (>3 seconds) — only case
-                 * that truly needs a thread restart */
+                /* Mode A: OpenH264 hung mid-decode — only case
+                 * that truly needs a thread restart.
+                 * Phase 5: Dynamic timeout — 5s when bitrate < 300kbps
+                 * (large IDR frames take longer at low bitrate).
+                 * Try pipeline flush before full restart. */
                 if (s_watchdog_restarts < 5) {
                     u32 active = g_decode_active_us;
                     if (active != 0) {
                         u32 now_us = sceKernelGetSystemTimeLow();
                         u32 elapsed = now_us - active;
-                        if (elapsed > 3000000) {
-                            s_watchdog_restarts++;
-                            diag_log_write("MAIN", "WATCHDOG-A: decoder hung %u ms -- restart #%d",
-                                           (unsigned)(elapsed / 1000), s_watchdog_restarts);
-                            sw_decoder_thread_force_restart();
-                            control_stream_request_idr();
-                            s_idle_count = 0;
+                        u32 wdg_timeout_us = 3000000; /* 3s default */
+                        {
+                            int br_kbps = signal_strength_get_bitrate();
+                            if (br_kbps > 0 && br_kbps < 300)
+                                wdg_timeout_us = 5000000; /* 5s for low bitrate */
+                        }
+                        if (elapsed > wdg_timeout_us) {
+                            /* Phase 5: Try pipeline flush before full restart */
+                            diag_log_write("MAIN", "[PHASE5-WDG] Mode A flush attempt (hung %u ms, timeout %u ms)",
+                                           (unsigned)(elapsed / 1000), (unsigned)(wdg_timeout_us / 1000));
+                            oh264_pipeline_flush_buffers();
+                            sceKernelDelayThread(100000); /* 100ms settle */
+                            active = g_decode_active_us;
+                            if (active != 0) {
+                                elapsed = sceKernelGetSystemTimeLow() - active;
+                                if (elapsed > wdg_timeout_us) {
+                                    s_watchdog_restarts++;
+                                    diag_log_write("MAIN", "WATCHDOG-A: decoder hung %u ms -- restart #%d",
+                                                   (unsigned)(elapsed / 1000), s_watchdog_restarts);
+                                    sw_decoder_thread_force_restart();
+                                    control_stream_request_idr();
+                                    s_idle_count = 0;
+                                }
+                            }
                         }
                     }
+                }
+
+                /* Phase 5: Mode B intermediate flush at ~3s before IDR at 5s */
+                {
+                    static int s_phase5_flush_done = 0;
+                    if (s_idle_count >= 180 && s_idle_count < 182 && !s_phase5_flush_done) {
+                        diag_log_write("MAIN", "[PHASE5-WDG] Mode B intermediate flush at 3s");
+                        oh264_pipeline_flush_buffers();
+                        s_phase5_flush_done = 1;
+                    }
+                    if (s_idle_count < 10) s_phase5_flush_done = 0;
                 }
 
                 /* Mode B: No frames for ~5s — soft recovery (IDR burst).
@@ -598,6 +695,13 @@ host_select_loop:
 
                 if (wait_elapsed_ms > 20000 && s_mode_d_phase < 3) {
                     s_mode_d_phase = 3;
+                    /* Phase 5: Send graceful termination before abort */
+                    diag_log_write("MAIN", "[PHASE5-WDG] Mode D graceful termination before abort");
+                    {
+                        extern void LiStopConnection(void);
+                        LiStopConnection();
+                        sceKernelDelayThread(100000); /* 100ms for server ack */
+                    }
                     diag_log_write("MAIN", "WATCHDOG-D: no video for %u ms — full session reconnect",
                                    (unsigned)wait_elapsed_ms);
                     diag_log_flush();
@@ -704,9 +808,10 @@ host_select_loop:
         } else {
             sceDisplayWaitVblankStart();
         }
-        /* Only yield CPU when idle (no frame displayed).  When rendering,
-         * display_frame_finish() swaps immediately (no VBlank wait) to
-         * maximize throughput — the 1ms idle yield prevents spinning. */
+        /* Always yield CPU when no frame is ready.  display_frame_finish()
+         * waits for VBlank (60Hz), so the loop is naturally paced when
+         * displaying.  The idle yield prevents CPU spinning at 100%
+         * between decoded frames. */
         if (!frame) {
             sceKernelDelayThread(1000);
         }

@@ -124,11 +124,24 @@ static void check_corruption(const char *loc) {
 
 static void update_animations(void) {
     /* Standard Wii-style Center Selection:
-     * The scroll point is exactly the current integer selection index. */
+     * The scroll point is exactly the current integer selection index.
+     * Frame-delta compensated so animation speed is consistent
+     * regardless of actual frame rate (dropped VBlanks, CPU stalls). */
+    static u32 s_last_anim_us = 0;
+    u32 now_us = sceKernelGetSystemTimeLow();
+    float dt = 1.0f; /* default to 1.0 (60Hz assumption) on first frame */
+    if (s_last_anim_us != 0) {
+        u32 elapsed = now_us - s_last_anim_us;
+        dt = (float)elapsed / 16667.0f; /* ratio to 60Hz frame interval */
+        if (dt > 4.0f) dt = 4.0f;      /* clamp to prevent huge jumps */
+        if (dt < 0.1f) dt = 0.1f;      /* clamp lower bound */
+    }
+    s_last_anim_us = now_us;
+
     float target_scroll = (float)s_selected;
 
-    s_state.scroll_curr += (target_scroll - s_state.scroll_curr) * 0.15f;
-    s_state.focus_anim  += ((float)s_selected - s_state.focus_anim) * 0.20f;
+    s_state.scroll_curr += (target_scroll - s_state.scroll_curr) * 0.15f * dt;
+    s_state.focus_anim  += ((float)s_selected - s_state.focus_anim) * 0.20f * dt;
 }
 
 static int tile_screen_pos(int idx, int *out_x, int *out_y)

@@ -48,6 +48,9 @@ extern void rtp_frame_complete_callback(const u8 *nal_data, int nal_len);
 extern volatile unsigned int g_last_good_frame;
 /* g_idr_fully_decoded declared in decode_flags.h */
 
+/* Host processing latency from Sunshine frame headers (microseconds) */
+volatile u32 g_host_processing_us = 0;
+
 /*--------------------------------------------------------------------------
  * NAL Unit Helpers
  *--------------------------------------------------------------------------*/
@@ -198,6 +201,22 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         if (payload_len >= 1) {
             if (payload[0] == 0x01) {
                 header_skip = 8;
+                /* Parse host processing latency from Sunshine type-0x01 header.
+                 * Bytes 4-7 contain the host encode duration in microseconds (LE32). */
+                if (payload_len >= 8) {
+                    u32 host_us = (u32)payload[4]
+                                | ((u32)payload[5] << 8)
+                                | ((u32)payload[6] << 16)
+                                | ((u32)payload[7] << 24);
+                    g_host_processing_us = host_us;
+                    {
+                        static int hpl_log = 0;
+                        if (hpl_log < 5 || (hpl_log % 1000) == 0) {
+                            RTP_LOG("host_proc_us=%u fid=%u\n", host_us, frame_id);
+                        }
+                        hpl_log++;
+                    }
+                }
             } else if (payload[0] == (u8)0x81) {
                 header_skip = 44;
             } else if (payload_len >= 4 && payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 1) {

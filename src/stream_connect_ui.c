@@ -117,7 +117,7 @@ void stream_connect_start(void)
 
     s_thread_id = sceKernelCreateThread("connect_ui",
                                         connect_render_thread,
-                                        0x18,     /* priority */
+                                        0x1A,     /* priority: lower than decoder (0x18) */
                                         0x4000,   /* 16 KB stack */
                                         PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                         NULL);

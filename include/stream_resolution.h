@@ -64,6 +64,50 @@ extern StreamResolution g_stream_res;
  */
 void stream_resolution_init(int width, int height);
 
+/*============================================================================
+ * Phase 4: Smart Resolution Scaling
+ *============================================================================*/
+
+/* Resolution steps (all mod-16 aligned for H.264 macroblock compatibility) */
+#define RES_STEP_COUNT  4
+#define RES_STEP_0_W    256
+#define RES_STEP_0_H    144
+#define RES_STEP_1_W    320
+#define RES_STEP_1_H    176
+#define RES_STEP_2_W    368
+#define RES_STEP_2_H    208
+#define RES_STEP_3_W    480
+#define RES_STEP_3_H    272
+
+/* Thresholds for resolution scaling decisions */
+#define RES_DECODE_DROP_MS     200  /* avg decode > this -> step down */
+#define RES_DECODE_RECOVER_MS  50   /* avg decode < this -> step up */
+#define RES_LOSS_DROP_PCT      15   /* sustained loss > this -> step down */
+#define RES_LOSS_RECOVER_PCT   2    /* sustained loss < this -> step up */
+#define RES_RECOVER_HOLDOFF_US (30 * 1000 * 1000) /* 30s stable before step up */
+
+typedef struct {
+    int current_step;       /* 0..RES_STEP_COUNT-1 */
+    int target_width;       /* current target width */
+    int target_height;      /* current target height */
+    u32 last_change_time;   /* timestamp of last resolution change */
+    u32 recover_start_time; /* timestamp when recovery conditions first met */
+    int decode_avg_ms;      /* running average decode time */
+    int loss_avg_pct;       /* running average loss percentage */
+    int initialized;
+} ResolutionScaler;
+
+extern ResolutionScaler g_res_scaler;
+
+/* Initialize resolution scaler (starts at max step) */
+void resolution_scaler_init(void);
+
+/* Update scaler with current metrics. Returns 1 if resolution changed. */
+int resolution_scaler_update(int decode_time_ms, int loss_rate_pct);
+
+/* Get current target resolution */
+void resolution_scaler_get_current(int *out_w, int *out_h);
+
 #ifdef __cplusplus
 }
 #endif

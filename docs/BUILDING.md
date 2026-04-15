@@ -1,6 +1,6 @@
 # Building PSP Moonlight
 
-_v0.2.0-beta_
+_v0.2.2-beta_
 
 This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
 
@@ -60,11 +60,15 @@ To set permanently: **Settings → System → About → Advanced system settings
 
 Included with the pspdev toolchain (`make.exe` in the bin directory).
 
-### 3. PSP-port of FFmpeg
+### 3. OpenH264 (PSP cross-compiled)
 
-`ffmpeg_decode.c` links against PSP-cross-compiled `libavcodec`. The pre-compiled `.a` files
-must be present in a location accessible to the linker. See the [FFmpeg PSP port](https://github.com/pspdev/psp-ports)
-build instructions, or download a pre-built package and install into your `$PSPDEV/psp/lib`.
+`openh264_decode.cpp` links against PSP-cross-compiled OpenH264 (`libopenh264.a`). The pre-compiled
+static library must be present in `$PSPDEV/psp/lib`. Build OpenH264 from source for the PSP MIPS
+target, or download a pre-built package.
+
+> **Note:** The legacy FFmpeg decode path (`legacy/ffmpeg_decode.c`) is no longer built by default.
+> If you need the FFmpeg path for comparison, see the `legacy/` directory and its original build
+> instructions in the [FFmpeg PSP port](https://github.com/pspdev/psp-ports).
 
 ---
 
@@ -98,12 +102,11 @@ make
 Expected output (abbreviated):
 ```
   CC   src/main.c
-  CC   src/ffmpeg_decode.c
-  CC   src/sw_cavlc.c
-  CC   src/sw_vfpu_recon.c
+  CXX  src/openh264_decode.cpp
   CC   src/sw_me_worker.c
-  CC   src/sw_decode_orchestrator.c
   CC   src/sw_decoder_thread.c
+  CC   src/stream_resolution.c
+  CC   src/signal_strength.c
   ...
   LD   moonlight.elf
   STRIP moonlight.prx
@@ -181,4 +184,4 @@ cd moonlight_me_helper && make clean
 | `make[1]: *** [moonlight.elf] Error 1` | Duplicate target warning from build.mak | Harmless — check if `EBOOT.PBP` was produced |
 | `PRX > 2 MB` | Object files not stripped | Run `psp-strip moonlight.prx` manually |
 | Black screen on PSP | ME helper PRX not found | Confirm both files are in the same XMB directory |
-| `avcodec.h: No such file` | FFmpeg PSP port not installed | Build/install psp-ports FFmpeg into `$PSPDEV/psp` |
+| `avcodec.h: No such file` | Legacy FFmpeg path referenced | Legacy path no longer built by default; see `legacy/` |

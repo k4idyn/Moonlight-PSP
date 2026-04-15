@@ -34,8 +34,13 @@
 #include "diag_log.h"
 #include "settings_menu.h"
 #include "config.h"
+#include "control_stream.h"
 
 #include <pspiofilemgr.h>
+
+#include <pspdebug.h>
+/* GU UI owns the framebuffer during normal runtime; avoid direct debug-screen writes. */
+#define pspDebugScreenPrintf(...) ((void)0)
 
 extern PspConfig g_psp_config;
 
@@ -59,6 +64,12 @@ typedef struct {
 static AudioRingBuffer s_ring;
 static AudioStats      s_stats;
 
+/* Phase 3.5: Persistent audio stats counters for RTP stats API */
+static volatile u32 s_audio_pkts_received = 0;
+static volatile u32 s_audio_pkts_decoded  = 0;
+static volatile u32 s_audio_plc_total     = 0;
+static volatile u32 s_audio_fec_total     = 0;
+
 static SceUID  s_audio_tid  = -1;
 static int     s_audio_chan = -1;         /* SRC channel active flag (0=reserved, -1=none) */
 static int     s_udp_sock   = -1;
@@ -79,6 +90,11 @@ static unsigned short s_bound_audio_port = 0;
 #define AUDIO_STAGE_CAPACITY  (AUDIO_MAX_FRAME_SAMPLES * 2)
 static int16_t s_pcm_stage[AUDIO_STAGE_CAPACITY * AUDIO_CHANNELS];
 static int     s_pcm_stage_count = 0; /* per-channel samples currently staged */
+
+/* Phase 4: Time-stretch state — stores last good audio for gap concealment */
+static int16_t s_last_good_pcm[AUDIO_MAX_FRAME_SAMPLES * AUDIO_CHANNELS];
+static int     s_last_good_samples = 0;
+#define TSTRETCH_MAX_PLC 5  /* max consecutive PLC frames for time-stretch (100ms) */
 
 /* Static 64-byte-aligned buffer for sceAudioOutputBlocking DMA transfer.
  * Must NOT be on the stack — PSP audio DMA requires aligned addresses. */
@@ -132,9 +148,16 @@ typedef char _audio_ss_ping_size_check[(sizeof(AudioSsPing) == 20) ? 1 : -1];
 /*--------------------------------------------------------------------------
  * Ring-buffer helpers (lock-free SPSC)
  *--------------------------------------------------------------------------*/
+/* Phase 5.4: Dynamic ring depth — adjustable between 32 and AUDIO_RING_SLOTS
+ * based on connection quality. Lower depth = lower latency in good conditions. */
+static volatile u32 s_effective_ring_depth = AUDIO_RING_SLOTS;
+
+/* Phase 5.7: Separate audio crypto failure counter (threshold 100, not 30) */
+static volatile u32 s_audio_crypto_fail_count = 0;
+
 static int ring_full(void)
 {
-    return ((s_ring.head - s_ring.tail) >= AUDIO_RING_SLOTS);
+    return ((s_ring.head - s_ring.tail) >= s_effective_ring_depth);
 }
 
 static int ring_empty(void)
@@ -175,6 +198,37 @@ static int ring_pop_pcm(int16_t *dst)
     __asm__ volatile("" ::: "memory");
     s_ring.tail++;
     return 0;
+}
+
+/*--------------------------------------------------------------------------
+ * Phase 4: Simple audio time-stretch via linear interpolation.
+ *
+ * Stretches input samples by factor out_samples/in_samples (e.g. 1.3x).
+ * Integer-only linear interpolation between adjacent samples.
+ * Stereo: L/R channels interleaved, stretched independently.
+ *--------------------------------------------------------------------------*/
+static void audio_time_stretch(const int16_t *in, int in_samples,
+                               int16_t *out, int out_samples)
+{
+    int i, ch;
+    for (i = 0; i < out_samples; i++) {
+        int pos_num = i * in_samples;
+        int pos_int = pos_num / out_samples;
+        int frac_num = pos_num - pos_int * out_samples;
+        if (pos_int >= in_samples - 1) {
+            for (ch = 0; ch < AUDIO_CHANNELS; ch++)
+                out[i * AUDIO_CHANNELS + ch] = in[(in_samples - 1) * AUDIO_CHANNELS + ch];
+        } else {
+            for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
+                int a = in[pos_int * AUDIO_CHANNELS + ch];
+                int b = in[(pos_int + 1) * AUDIO_CHANNELS + ch];
+                int interp = a + ((b - a) * frac_num) / out_samples;
+                if (interp > 32767) interp = 32767;
+                if (interp < -32768) interp = -32768;
+                out[i * AUDIO_CHANNELS + ch] = (int16_t)interp;
+            }
+        }
+    }
 }
 
 /*--------------------------------------------------------------------------
@@ -585,6 +639,7 @@ static int audio_thread_func(SceSize args, void *argp)
     int time_plc_count = 0;    /* time-based PLC injections */
     int time_plc_logged = 0;
     int consec_plc = 0;        /* consecutive PLC frames (for volume ducking) */
+    int fade_in_frames = 0;    /* post-PLC fade-in counter (0 = no fade) */
     int fec_pending = 0;       /* set when gap detected; FEC decode after decrypt */
 
     while (s_running) {
@@ -642,23 +697,91 @@ static int audio_thread_func(SceSize args, void *argp)
             }
 
             /* --- Time-based PLC injection ---
-             * When no audio packet arrives within 2.25× the expected frame
-             * interval (45 ms for 20 ms frames), inject an Opus PLC frame
-             * into the ring buffer.  Raised from 25ms to 45ms to tolerate
-             * 802.11b WiFi jitter — packets arriving at 25-45ms are merely
-             * late, not lost.  Reduces false-positive PLC injections that
-             * produce audible static artifacts.
+             * When no audio packet arrives within a dynamic threshold,
+             * inject an Opus PLC frame into the ring buffer.
+             *
+             * Adaptive threshold based on connection quality:
+             *   EXCELLENT/GOOD: 35ms (tighter — detect loss faster)
+             *   FAIR:           45ms (original — tolerate WiFi jitter)
+             *   POOR/CRITICAL:  60ms (loose — WiFi is very jittery)
+             *
              * Only inject if we've already received at least one audio frame
              * (have_last_audio_seq) and the ring isn't full. */
             if (have_last_audio_seq && last_audio_recv_us != 0 && !ring_full()) {
                 u32 now_plc = sceKernelGetSystemTimeLow();
                 u32 gap_us = now_plc - last_audio_recv_us;
-                if (gap_us >= 45000) { /* 45 ms = 2.25× frame interval */
+
+                /* Dynamic PLC threshold */
+                u32 plc_threshold_us;
+                {
+                    ConnQualityState cq = control_stream_get_quality();
+                    if (cq.quality <= CONN_QUALITY_GOOD)
+                        plc_threshold_us = 35000;  /* 35ms */
+                    else if (cq.quality == CONN_QUALITY_FAIR)
+                        plc_threshold_us = 45000;  /* 45ms */
+                    else
+                        plc_threshold_us = 60000;  /* 60ms */
+
+                    /* Phase 5.4: Adjust effective ring depth based on quality */
+                    {
+                        u32 new_depth;
+                        if (cq.quality <= CONN_QUALITY_GOOD)
+                            new_depth = 32;
+                        else if (cq.quality == CONN_QUALITY_FAIR)
+                            new_depth = 48;
+                        else
+                            new_depth = AUDIO_RING_SLOTS; /* 64 */
+                        if (new_depth != s_effective_ring_depth) {
+                            audio_log("[PHASE5-ARING] depth adjusted: %u slots (quality=%d)\n",
+                                      (unsigned)new_depth, (int)cq.quality);
+                            s_effective_ring_depth = new_depth;
+                        }
+                    }
+
+                    /* Log threshold change */
+                    {
+                        static u32 s_prev_plc_threshold = 45000;
+                        if (plc_threshold_us != s_prev_plc_threshold) {
+                            audio_log("[AUDIO PLC] threshold %ums -> %ums (quality=%d)\n",
+                                      s_prev_plc_threshold / 1000,
+                                      plc_threshold_us / 1000,
+                                      (int)cq.quality);
+                            s_prev_plc_threshold = plc_threshold_us;
+                        }
+                    }
+                }
+
+                if (gap_us >= plc_threshold_us) {
                     int plc_sz = opus_psp_last_frame_size();
-                    int plc_samples = opus_psp_decode(NULL, 0,
+                    int plc_samples;
+
+                    /* Phase 4: Time-stretch for short gaps (<100ms).
+                     * Stretches last good audio by 1.3x using linear
+                     * interpolation. Sounds more natural than Opus PLC. */
+                    if (consec_plc < TSTRETCH_MAX_PLC && s_last_good_samples > 0) {
+                        int stretch_out = (s_last_good_samples * 13) / 10;
+                        if (stretch_out > AUDIO_MAX_FRAME_SAMPLES)
+                            stretch_out = AUDIO_MAX_FRAME_SAMPLES;
+                        audio_time_stretch(s_last_good_pcm, s_last_good_samples,
+                                           pcm_decode_buf, stretch_out);
+                        plc_samples = stretch_out;
+                        {
+                            static u32 s_tstretch_count = 0;
+                            s_tstretch_count++;
+                            if (s_tstretch_count <= 5 || (s_tstretch_count % 200) == 0) {
+                                pspDebugScreenPrintf("[PHASE4-TSTR] stretch %d->%d\n",
+                                                    s_last_good_samples, stretch_out);
+                                audio_log("[PHASE4-TSTR] stretch: %d -> %d samples (consec=%d) [#%u]\n",
+                                          s_last_good_samples, stretch_out, consec_plc, s_tstretch_count);
+                            }
+                        }
+                    } else {
+                        plc_samples = opus_psp_decode(NULL, 0,
                                                      pcm_decode_buf, plc_sz);
+                    }
                     if (plc_samples > 0) {
                         time_plc_count++;
+                        s_audio_plc_total++;
                         consec_plc++;
 
                         /* Volume ducking: fade PLC output to reduce static.
@@ -723,6 +846,14 @@ static int audio_thread_func(SceSize args, void *argp)
         }
         recv_count++;
         consecutive_empty = 0;  /* reset adaptive backoff on successful recv */
+        s_audio_pkts_received++;  /* Phase 3.5: audio stats */
+        /* Start fade-in ramp when transitioning from PLC to real audio.
+         * Ramp over 3 frames (60ms) to smooth the transition and
+         * prevent audible click artifacts at the PLC→real boundary. */
+        if (consec_plc > 0) {
+            audio_log("[AUDIO PLC] recovery after %d consecutive PLC frames\n", consec_plc);
+            fade_in_frames = 3;
+        }
         consec_plc = 0;         /* reset PLC volume ducking on real data */
 
         if (recv_count == 1) {
@@ -832,6 +963,7 @@ static int audio_thread_func(SceSize args, void *argp)
                                                           AUDIO_MAX_FRAME_SAMPLES);
                         if (plc_samples > 0) {
                             plc_count++;
+                            s_audio_plc_total++;
                             if (s_pcm_stage_count + plc_samples <= AUDIO_STAGE_CAPACITY) {
                                 memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
                                        pcm_decode_buf,
@@ -917,9 +1049,21 @@ static int audio_thread_func(SceSize args, void *argp)
 
             if (stream_crypto_decrypt_audio(enc_data, enc_bytes,
                                             seq, g_av_ri_key_id) != 0) {
+                /* Phase 5.7: Track audio crypto failures separately */
+                s_audio_crypto_fail_count++;
+                if (s_audio_crypto_fail_count <= 5 ||
+                    (s_audio_crypto_fail_count % 50) == 0) {
+                    audio_log("[PHASE5-ACRYPTO] audio decrypt fail #%u (threshold=%u)\n",
+                              (unsigned)s_audio_crypto_fail_count, 100u);
+                }
+                if (s_audio_crypto_fail_count >= 100) {
+                    audio_log("[PHASE5-ACRYPTO] WARNING: 100 consecutive audio decrypt failures\n");
+                    s_audio_crypto_fail_count = 0;
+                }
                 /* Decryption failed: inject PLC to fill the gap smoothly */
                 int plc_size = opus_psp_last_frame_size();
                 decoded_samples = opus_psp_decode(NULL, 0, pcm_decode_buf, plc_size);
+                s_audio_plc_total++;
                 s_stats.frames_dropped++;
                 fec_pending = 0;  /* can't do FEC without valid data */
                 goto check_decoded;
@@ -930,6 +1074,8 @@ static int audio_thread_func(SceSize args, void *argp)
              * encrypting.  After decryption the last byte = pad length
              * (1..16).  Without stripping, the extra bytes corrupt every
              * Opus frame. */
+            /* Phase 5.7: Reset audio crypto fail counter on success */
+            s_audio_crypto_fail_count = 0;
             {
                 unsigned char pad_val = enc_data[enc_bytes - 1];
                 /* Log first few PKCS#7 pad values for diagnostics */
@@ -984,6 +1130,7 @@ static int audio_thread_func(SceSize args, void *argp)
                                                   pcm_decode_buf, fec_frame_size);
             if (fec_samples > 0) {
                 fec_recover_count++;
+                s_audio_fec_total++;
                 if (s_pcm_stage_count + fec_samples <= AUDIO_STAGE_CAPACITY) {
                     memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
                            pcm_decode_buf,
@@ -1012,6 +1159,13 @@ static int audio_thread_func(SceSize args, void *argp)
         decoded_samples = opus_psp_decode(opus_data, opus_len,
                                           pcm_decode_buf, AUDIO_MAX_FRAME_SAMPLES);
 
+        /* Phase 4: Save last good decode for time-stretch gap concealment */
+        if (decoded_samples > 0 && decoded_samples <= AUDIO_MAX_FRAME_SAMPLES) {
+            memcpy(s_last_good_pcm, pcm_decode_buf,
+                   decoded_samples * AUDIO_CHANNELS * (int)sizeof(int16_t));
+            s_last_good_samples = decoded_samples;
+        }
+
         if (decoded_samples <= 0) {
             /* Log decode failures (first 5, then every 500th) */
             {
@@ -1025,6 +1179,7 @@ static int audio_thread_func(SceSize args, void *argp)
             /* Decode failed: use PLC to conceal the gap */
             int plc_size = opus_psp_last_frame_size();
             decoded_samples = opus_psp_decode(NULL, 0, pcm_decode_buf, plc_size);
+            s_audio_plc_total++;
             if (decoded_samples <= 0) {
                 s_stats.frames_dropped++;
                 continue;
@@ -1037,11 +1192,32 @@ check_decoded:
             continue;
         }
         decode_ok_count++;
+        s_audio_pkts_decoded++;
         if (decode_ok_count == 1 || decode_ok_count == 10 || (decode_ok_count % 500) == 0) {
             audio_log("[AUDIO] decode ok=%d samples=%d recv=%d drop=%d enc=%d plc=%d tplc=%d fec=%d\n",
                       decode_ok_count, decoded_samples, recv_count,
                       (int)s_stats.frames_dropped, g_audio_encryption_enabled,
                       plc_count, time_plc_count, fec_recover_count);
+        }
+
+        /* ── Post-PLC fade-in ramp ──────────────────────────────────
+         * After PLC concealment, gradually ramp volume back to 100%
+         * over 3 frames to prevent audible click at the transition.
+         * Frame 3→75%, Frame 2→87%, Frame 1→93%, then full volume. */
+        if (fade_in_frames > 0) {
+            int16_t scale;
+            int total_samps, si;
+            switch (fade_in_frames) {
+                case 3:  scale = 24576; break; /* 75% */
+                case 2:  scale = 28672; break; /* 87.5% */
+                case 1:  scale = 30720; break; /* 93.75% */
+                default: scale = 32767; break;
+            }
+            total_samps = decoded_samples * AUDIO_CHANNELS;
+            for (si = 0; si < total_samps; si++) {
+                pcm_decode_buf[si] = (int16_t)((pcm_decode_buf[si] * scale) >> 15);
+            }
+            fade_in_frames--;
         }
 
         /* Accumulate decoded samples into the staging buffer, then flush
@@ -1283,4 +1459,16 @@ void audio_thread_get_stats(AudioStats *out)
     if (out) {
         *out = s_stats;
     }
+}
+
+/* Phase 3.5: RTP Audio Stats API */
+void rtp_get_audio_stats(RtpAudioStats *out)
+{
+    if (!out) return;
+    out->packets_received = s_audio_pkts_received;
+    out->packets_decoded  = s_audio_pkts_decoded;
+    out->plc_count        = s_audio_plc_total;
+    out->fec_recovered    = s_audio_fec_total;
+    out->underruns        = s_stats.underruns;
+    out->frames_played    = s_stats.frames_played;
 }

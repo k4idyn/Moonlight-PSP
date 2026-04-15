@@ -112,6 +112,7 @@ typedef struct {
     int uiThemeIndex;           /* Selected UI accent color index */
     int cabacTestMode;          /* 1 = request Main profile + CABAC in SDP (test only) */
     int audioEnabled;           /* 1 = enable streaming audio, 0 = disable for performance */
+    int disableEncryption;      /* 1 = disable AV encryption (saves ~5% CPU on 333MHz PSP) */
 } PspConfig;
 
 /*--------------------------------------------------------------------------

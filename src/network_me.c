@@ -32,6 +32,9 @@
 #include "shared.h"
 #include "moonlight_ports.h"
 #include "stream_crypto.h"
+#include "control_stream.h"
+#include "signal_strength.h"
+#include "rtp_fec.h"
 
 /* RTP packet parsing constants (for SPS detection in ring overflow handling) */
 #define NET_RTP_FIXED_HEADER_SIZE 12
@@ -93,6 +96,24 @@ static int   g_reconnect_count = 0;                /* Total reconnect attempts *
 static int   g_reconnect_success = 0;              /* Successful reconnects */
 #define WIFI_RECONNECT_COOLDOWN_US  (3 * 1000 * 1000)  /* 3s min between attempts */
 #define WIFI_RECONNECT_MAX_POLL     150                 /* 150 * 100ms = 15s timeout */
+
+/* Phase 5.2: RTCP Receiver Report state */
+static volatile u32 s_rtcp_pkts_received = 0;
+static volatile u32 s_rtcp_pkts_lost_cum = 0;
+static u32 s_rtcp_highest_seq = 0;
+static u32 s_rtcp_jitter_us = 0;        /* EWMA inter-arrival jitter (us) */
+static u32 s_rtcp_last_arrival_us = 0;
+static u32 s_rtcp_ssrc = 0;
+static u32 s_rtcp_last_seq = 0;
+static int s_rtcp_have_last_seq = 0;
+
+/* Phase 5.8: Session resume state */
+#define SESSION_STATE_ACTIVE       0
+#define SESSION_STATE_WIFI_LOST    1
+#define SESSION_STATE_RECONNECTING 2
+#define SESSION_STATE_RESUMED      3
+static volatile int s_session_state = 0; /* SESSION_STATE_ACTIVE */
+static u32 s_wifi_lost_time_us = 0;
 
 /* Forward-declared: used by wifi_try_reconnect and keepalive thread */
 static volatile int g_keepalive_running = 0;
@@ -295,7 +316,6 @@ static int network_recv_thread(SceSize args, void *argp);
 static int network_ping_thread(SceSize args, void *argp);
 void network_me_shutdown(void);
 void sw_decoder_thread_wakeup(void);
-extern void control_stream_request_idr(void);
 
 static int get_udp_local_port(unsigned short *out_port)
 {
@@ -451,7 +471,7 @@ int network_me_send_video_ping_burst(const char *server_ip,
     dst.sin_port   = htons((unsigned short)server_port);
     dst.sin_addr.s_addr = inet_addr(server_ip);
 
-    for (i = 1; i <= 3; ++i) {
+    for (i = 1; i <= 5; ++i) {
         int sent;
         int err;
 
@@ -481,7 +501,105 @@ int network_me_send_video_ping_burst(const char *server_ip,
     return sent_any ? 0 : -1;
 }
 
+/* Phase 5.6: Send a burst of pings (e.g. after WiFi reconnect) */
+static void send_ping_burst_internal(int count, const char *reason)
+{
+    struct sockaddr_in dst;
+    SsPingPkt ss_pkt;
+    char legacy_ping[] = { 0x50, 0x49, 0x4E, 0x47 };
+    int i;
+
+    if (udp_socket < 0) return;
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_len    = (uint8_t)sizeof(dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons((unsigned short)g_video_server_port);
+    dst.sin_addr.s_addr = inet_addr(g_video_server_ip);
+
+    for (i = 0; i < count; i++) {
+        if (g_video_ping_payload[0] != '\0') {
+            memcpy(ss_pkt.payload, g_video_ping_payload, 16);
+            ss_pkt.seq_be = htonl((u32)(i + 1));
+            sceNetInetSendto(udp_socket, &ss_pkt, sizeof(ss_pkt),
+                             0, (struct sockaddr *)&dst, sizeof(dst));
+        } else {
+            sceNetInetSendto(udp_socket, legacy_ping, 4,
+                             0, (struct sockaddr *)&dst, sizeof(dst));
+        }
+        sceKernelDelayThread(30 * 1000); /* 30ms between pings */
+    }
+    net_log("[PHASE5-PING] burst of %d pings sent (reason: %s)\n", count, reason);
+}
+
 /* net_log already defined at top of file via diag_log.h */
+
+/*--------------------------------------------------------------------------
+ * Phase 5.2: Send RTCP Receiver Report (RR) on video RTCP port
+ *--------------------------------------------------------------------------*/
+static void send_rtcp_rr(void)
+{
+    unsigned char buf[32];
+    u32 frac_lost = 0;
+    u32 cum_lost;
+    struct sockaddr_in rtcp_dst;
+
+    if (udp_socket_rtcp < 0 || g_video_server_ip[0] == '\0') return;
+
+    cum_lost = s_rtcp_pkts_lost_cum;
+    if (s_rtcp_pkts_received + cum_lost > 0) {
+        frac_lost = (cum_lost * 256) / (s_rtcp_pkts_received + cum_lost);
+    }
+    if (frac_lost > 255) frac_lost = 255;
+
+    /* RTCP RR header: V=2, P=0, RC=1, PT=201, length=7 */
+    buf[0]  = 0x81;  buf[1] = 201;
+    buf[2]  = 0;     buf[3] = 7;
+    /* Sender SSRC = 1 */
+    buf[4]  = 0; buf[5] = 0; buf[6] = 0; buf[7] = 1;
+    /* Report block: source SSRC */
+    buf[8]  = (u8)(s_rtcp_ssrc >> 24); buf[9]  = (u8)(s_rtcp_ssrc >> 16);
+    buf[10] = (u8)(s_rtcp_ssrc >> 8);  buf[11] = (u8)s_rtcp_ssrc;
+    /* Fraction lost + cumulative lost (24-bit) */
+    buf[12] = (u8)frac_lost;
+    buf[13] = (u8)((cum_lost >> 16) & 0xFF);
+    buf[14] = (u8)((cum_lost >> 8) & 0xFF);
+    buf[15] = (u8)(cum_lost & 0xFF);
+    /* Highest seq */
+    buf[16] = (u8)(s_rtcp_highest_seq >> 24); buf[17] = (u8)(s_rtcp_highest_seq >> 16);
+    buf[18] = (u8)(s_rtcp_highest_seq >> 8);  buf[19] = (u8)s_rtcp_highest_seq;
+    /* Jitter */
+    buf[20] = (u8)(s_rtcp_jitter_us >> 24); buf[21] = (u8)(s_rtcp_jitter_us >> 16);
+    buf[22] = (u8)(s_rtcp_jitter_us >> 8);  buf[23] = (u8)s_rtcp_jitter_us;
+    /* LSR = 0, DLSR = 0 (no SR received from server) */
+    buf[24] = 0; buf[25] = 0; buf[26] = 0; buf[27] = 0;
+    buf[28] = 0; buf[29] = 0; buf[30] = 0; buf[31] = 0;
+
+    memset(&rtcp_dst, 0, sizeof(rtcp_dst));
+    rtcp_dst.sin_len    = (uint8_t)sizeof(rtcp_dst);
+    rtcp_dst.sin_family = AF_INET;
+    rtcp_dst.sin_port   = htons((unsigned short)(g_video_server_port + 1));
+    rtcp_dst.sin_addr.s_addr = inet_addr(g_video_server_ip);
+
+    sceNetInetSendto(udp_socket_rtcp, buf, 32, 0,
+                     (struct sockaddr *)&rtcp_dst, sizeof(rtcp_dst));
+
+    net_log("[PHASE5-RTCP] sent RR: frac_lost=%u cum_lost=%u jitter=%u\n",
+            (unsigned)frac_lost, (unsigned)cum_lost, (unsigned)s_rtcp_jitter_us);
+}
+
+/*--------------------------------------------------------------------------
+ * Phase 5.5: WiFi power save management
+ *--------------------------------------------------------------------------*/
+void network_me_set_power_save(int enable)
+{
+    int ps_ret = sceUtilitySetSystemParamInt(
+        PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+        enable ? PSP_SYSTEMPARAM_WLAN_POWERSAVE_ON
+               : PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF);
+    net_log("[PHASE5-WIFIPS] power save %s (ret=%d)\n",
+            enable ? "ON" : "OFF", ps_ret);
+}
 
 /*--------------------------------------------------------------------------
  * network_me_init - Create UDP socket and spawn receive thread
@@ -692,12 +810,13 @@ static int network_ping_thread(SceSize args, void *argp)
         }
 
         /* WiFi state check every 10 pings (1 second) — detect AP disconnect.
-         * Also force reconnect after 50 consecutive SENDFAILs (~5 seconds)
+         * Also force reconnect after 100 consecutive SENDFAILs (~10 seconds)
          * to handle ENOBUFS (errno=105) where WiFi buffers are saturated
-         * but ap_state still reports connected. */
-        if ((seq % 10) == 0 || consec_sendfail == 50) {
+         * but ap_state still reports connected.  Threshold doubled from 50
+         * because ping interval was halved to 100ms. */
+        if ((seq % 10) == 0 || consec_sendfail == 100) {
             int ap_state = -1;
-            int force_reconnect = (consec_sendfail >= 50);
+            int force_reconnect = (consec_sendfail >= 100);
             sceNetApctlGetState(&ap_state);
 
             if (ap_state != 4 || force_reconnect) {
@@ -705,12 +824,34 @@ static int network_ping_thread(SceSize args, void *argp)
                         force_reconnect ? "WIFI_ENOBUFS" : "WIFI_DOWN",
                         ap_state, seq, consec_sendfail);
 
+                /* Phase 5.8: Mark session as WiFi lost */
+                if (s_session_state == SESSION_STATE_ACTIVE) {
+                    s_session_state = SESSION_STATE_WIFI_LOST;
+                    s_wifi_lost_time_us = sceKernelGetSystemTimeLow();
+                    net_log("[PHASE5-RESUME] session state: WIFI_LOST\n");
+                    /* Phase 5.5: Enable power save during WiFi recovery */
+                    network_me_set_power_save(1);
+                }
+
                 /* Attempt automatic WiFi reconnection */
                 if (!g_wifi_reconnecting) {
+                    s_session_state = SESSION_STATE_RECONNECTING;
+                    net_log("[PHASE5-RESUME] session state: RECONNECTING\n");
                     int rc = wifi_try_reconnect();
                     if (rc == 0) {
                         net_log("[PING] WiFi restored at ping#%u, resuming\n", seq);
                         consec_sendfail = 0;
+                        /* Phase 5.8: Resume session */
+                        s_session_state = SESSION_STATE_RESUMED;
+                        net_log("[PHASE5-RESUME] session state: RESUMED\n");
+                        /* Phase 5.5: Disable power save for streaming */
+                        network_me_set_power_save(0);
+                        /* Phase 5.6: Burst of 3 pings after reconnect */
+                        send_ping_burst_internal(3, "wifi_reconnect");
+                        /* Request IDR for clean video resume */
+                        control_stream_request_idr();
+                        /* Return to active state */
+                        s_session_state = SESSION_STATE_ACTIVE;
                     } else {
                         net_log("[PING] WiFi reconnect failed, will retry at next check\n");
                     }
@@ -730,7 +871,69 @@ static int network_ping_thread(SceSize args, void *argp)
             }
         }
 
-        sceKernelDelayThread(200000); /* 200 ms — reduced from 100ms to ease ENOBUFS */
+        /* Dynamic SO_RCVBUF: every 50 pings (5s at 100ms), check connection
+         * quality and enlarge the socket receive buffer when quality degrades.
+         * POOR/CRITICAL → 384KB (absorb larger IDR bursts during recovery).
+         * EXCELLENT/GOOD → scale back to 256KB to save kernel memory.
+         * Default 256KB set at init time in network_me_init(). */
+        if ((seq % 50) == 0 && udp_socket >= 0) {
+            ConnQualityState cq = control_stream_get_quality();
+            int target_rcvbuf;
+            if (cq.quality >= CONN_QUALITY_POOR) {
+                target_rcvbuf = 384 * 1024;  /* degraded: larger buffer */
+            } else {
+                target_rcvbuf = 256 * 1024;  /* good: standard buffer */
+            }
+            {
+                static int s_prev_rcvbuf = 256 * 1024;
+                if (target_rcvbuf != s_prev_rcvbuf) {
+                    net_log("[RCVBUF] %dKB -> %dKB (quality=%d)\n",
+                            s_prev_rcvbuf / 1024, target_rcvbuf / 1024,
+                            (int)cq.quality);
+                    s_prev_rcvbuf = target_rcvbuf;
+                }
+            }
+            sceNetInetSetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
+                                 &target_rcvbuf, sizeof(target_rcvbuf));
+        }
+
+        /* Phase 4: WiFi stutter compensation — proactive IDR on degrading signal */
+        if ((seq % 20) == 0) {
+            SignalTrend trend = signal_strength_get_trend();
+            if (trend == SIGNAL_TREND_DEGRADING) {
+                static u32 s_proactive_idr_count = 0;
+                s_proactive_idr_count++;
+                if (s_proactive_idr_count <= 3 || (s_proactive_idr_count % 10) == 0)
+                    net_log("[PHASE4-WIFI] signal degrading, proactive IDR #%u\n",
+                            s_proactive_idr_count);
+                control_stream_request_idr();
+            }
+        }
+
+        /* Aggressive ping: 100ms interval for faster NAT keepalive and
+         * earlier stall detection.  At 100ms, WiFi state checks fire
+         * every 10 pings (1 second) and ENOBUFS detection at 50 pings
+         * (5 seconds).  The extra 5 pings/sec cost ~100 bytes/sec
+         * overhead — negligible vs video bandwidth. */
+
+        /* Phase 5.2: Send RTCP RR every 5 seconds (50 pings at 100ms) */
+        if ((seq % 50) == 0) {
+            send_rtcp_rr();
+        }
+
+        /* Phase 5.8: Session resume timeout check */
+        if (s_session_state == SESSION_STATE_WIFI_LOST ||
+            s_session_state == SESSION_STATE_RECONNECTING) {
+            u32 lost_elapsed = sceKernelGetSystemTimeLow() - s_wifi_lost_time_us;
+            if (lost_elapsed > 10000000) { /* 10 seconds */
+                net_log("[PHASE5-RESUME] WiFi timeout 10s — aborting session\n");
+                extern volatile int g_stream_status;
+                g_stream_status = 1;
+                me_running = 0;
+            }
+        }
+
+        sceKernelDelayThread(100000); /* 100 ms — aggressive for low-latency stall detection */
     }
 
     net_log("[PING] thread exiting (me_running=%d)\n", me_running);
@@ -889,6 +1092,125 @@ static int network_recv_thread(SceSize args, void *argp)
         if ((u32)n > MAX_PACKET_SIZE)
             continue;
 
+        /* Phase 4: Jitter tracking — measure inter-packet arrival times */
+        {
+            static u32 s_last_recv_us = 0;
+            u32 recv_now = sceKernelGetSystemTimeLow();
+            if (s_last_recv_us != 0) {
+                u32 delta = recv_now - s_last_recv_us;
+                signal_strength_report_jitter(delta);
+            }
+            s_last_recv_us = recv_now;
+        }
+
+        /* Phase 5.2: Update RTCP receiver report statistics */
+        {
+            s_rtcp_pkts_received++;
+            if ((u32)n >= 12) {
+                u16 rtp_seq = (u16)((recv_buf[2] << 8) | recv_buf[3]);
+                u32 ssrc = (u32)((recv_buf[8] << 24) | (recv_buf[9] << 16) |
+                                  (recv_buf[10] << 8) | recv_buf[11]);
+                s_rtcp_ssrc = ssrc;
+                if (s_rtcp_have_last_seq) {
+                    int gap = (int)(u16)(rtp_seq - s_rtcp_last_seq) - 1;
+                    if (gap > 0 && gap < 1000)
+                        s_rtcp_pkts_lost_cum += (u32)gap;
+                }
+                if (rtp_seq > (u16)s_rtcp_highest_seq ||
+                    ((u16)s_rtcp_highest_seq > 0xF000 && rtp_seq < 0x1000)) {
+                    s_rtcp_highest_seq = rtp_seq;
+                }
+                s_rtcp_last_seq = rtp_seq;
+                s_rtcp_have_last_seq = 1;
+                /* Inter-arrival jitter EWMA (microseconds) */
+                {
+                    u32 now_us = sceKernelGetSystemTimeLow();
+                    if (s_rtcp_last_arrival_us != 0) {
+                        u32 delta = now_us - s_rtcp_last_arrival_us;
+                        int diff = (int)delta - (int)s_rtcp_jitter_us;
+                        if (diff < 0) diff = -diff;
+                        s_rtcp_jitter_us = s_rtcp_jitter_us +
+                                           ((u32)diff - s_rtcp_jitter_us + 8) / 16;
+                    }
+                    s_rtcp_last_arrival_us = now_us;
+                }
+            }
+        }
+
+        /* Phase 4: Packet priority detection for admission control.
+         * IDR (NRI=3): CRITICAL, SOF: HIGH, body: MEDIUM, FEC: LOW */
+        {
+            int pkt_priority = 1; /* default: medium */
+            if ((u32)n >= NET_RTP_FIXED_HEADER_SIZE + NET_NV_VIDEO_PKT_SIZE) {
+                int nv_off = NET_RTP_FIXED_HEADER_SIZE;
+                u8 nv_flags;
+                u32 nv_fec_info;
+                u32 nv_data_pkts;
+                u32 nv_fec_idx;
+
+                if (recv_buf[0] & NET_RTP_FLAG_EXTENSION)
+                    nv_off += 4;
+                if ((u32)n >= (u32)(nv_off + NET_NV_VIDEO_PKT_SIZE)) {
+                    nv_flags = recv_buf[nv_off + 8];
+                    nv_fec_info = (u32)recv_buf[nv_off + 12] |
+                                  ((u32)recv_buf[nv_off + 13] << 8) |
+                                  ((u32)recv_buf[nv_off + 14] << 16) |
+                                  ((u32)recv_buf[nv_off + 15] << 24);
+                    nv_data_pkts = (nv_fec_info >> 22) & 0x3FF;
+                    nv_fec_idx = (nv_fec_info >> 12) & 0x3FF;
+
+                    /* NAL NRI check for IDR detection */
+                    {
+                        int payload_off = nv_off + NET_NV_VIDEO_PKT_SIZE;
+                        if ((u32)n > (u32)(payload_off + 4)) {
+                            int nal_off = payload_off;
+                            if (recv_buf[payload_off] == 0x01)
+                                nal_off = payload_off + 8;
+                            else if ((u8)recv_buf[payload_off] == 0x81)
+                                nal_off = payload_off + 44;
+                            if ((u32)n > (u32)(nal_off + 5) &&
+                                recv_buf[nal_off] == 0x00 && recv_buf[nal_off+1] == 0x00 &&
+                                recv_buf[nal_off+2] == 0x00 && recv_buf[nal_off+3] == 0x01) {
+                                u8 nri = (recv_buf[nal_off + 4] >> 5) & 0x03;
+                                if (nri == 3) pkt_priority = 3; /* IDR */
+                            }
+                        }
+                    }
+
+                    /* SOF detection */
+                    if (nv_flags & 0x04)
+                        if (pkt_priority < 2) pkt_priority = 2;
+
+                    /* FEC parity (fec_index >= data_packets) */
+                    if (nv_data_pkts > 0 && nv_fec_idx >= nv_data_pkts)
+                        pkt_priority = 0;
+                }
+            }
+
+            /* Phase 4: Priority-based admission control */
+            {
+                u32 ring_used = (rb->head + RING_BUFFER_SLOTS - rb->tail) % RING_BUFFER_SLOTS;
+                u32 ring_pct = (ring_used * 100) / RING_BUFFER_SLOTS;
+
+                if (ring_pct > 90 && pkt_priority <= 0) {
+                    static u32 s_prio_drop_count = 0;
+                    s_prio_drop_count++;
+                    if (s_prio_drop_count <= 3 || (s_prio_drop_count % 100) == 0)
+                        net_log("[PHASE4-PRIO] dropped FEC parity (ring %u%%) [#%u]\n",
+                                ring_pct, s_prio_drop_count);
+                    continue;
+                }
+                if (ring_pct > 95 && pkt_priority <= 1) {
+                    static u32 s_prio_med_drop = 0;
+                    s_prio_med_drop++;
+                    if (s_prio_med_drop <= 3 || (s_prio_med_drop % 100) == 0)
+                        net_log("[PHASE4-PRIO] dropped P-body (ring %u%%) [#%u]\n",
+                                ring_pct, s_prio_med_drop);
+                    continue;
+                }
+            }
+        }
+
         /* Video wire format: [RTP(12+ext)][NV_VIDEO_PACKET(16)][H264 data].
          * Decryption (if any) is handled downstream in FEC/reassembly. */
 
@@ -913,6 +1235,15 @@ static int network_recv_thread(SceSize args, void *argp)
                 s_drop_count++;
                 if (s_drop_count <= 3 || (s_drop_count % 200) == 0)
                     net_log("[NET] ring FULL — dropped pkt #%u\n", s_drop_count);
+
+                /* Phase 5.3: Intermediate IDR request at 256 consecutive drops.
+                 * Don't flush the ring (unsafe while decoder alive), just
+                 * request a fresh keyframe so decoder can catch up. */
+                if (s_drop_count == 256) {
+                    net_log("[PHASE5-RING] intermediate flush at %u drops, requesting IDR\n",
+                            s_drop_count);
+                    control_stream_request_idr();
+                }
 
                 /* Emergency flush: decoder confirmed dead, ring permanently stuck.
                  * 2000 consecutive drops ≈ 6-7 seconds at 300 pkt/s.

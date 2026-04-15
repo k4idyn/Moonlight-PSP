@@ -1217,7 +1217,8 @@ static int sunshine_launch_session(int target_appid)
                      "/launch?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d&sops=%d"
                      "&rikey=%s&rikeyid=%d&localAudioPlayMode=0&additionalStates=0"
                      "&surroundAudioInfo=196610&remoteControllersBitmap=1&gcmap=1"
-                     "&corever=1&supportedVideoFormats=1&videoCapabilities=2",
+                     "&corever=1&supportedVideoFormats=1&videoCapabilities=2"
+                     "&videoEncoderSlicesPerFrame=1",
                      CLIENT_UNIQUE_ID, client_identity_get_uuid(),
                      target_appid, g_psp_config.width, g_psp_config.height, g_psp_config.fps,
                      sops_flag, ri_key_hex, rikeyid);
@@ -2711,11 +2712,21 @@ int rtsp_session(void)
         /* Negotiate encryption: only enable video encryption (bit 0).
          * The PSP client does NOT implement SS_ENC_CONTROL_V2 (bit 2) —
          * requesting it causes the server to ECONNRESET on RTSP PLAY.
-         * Track audio encryption separately for the audio recv loop. */
+         * Track audio encryption separately for the audio recv loop.
+         *
+         * When disableEncryption=1, force enc_to_use=0 and audio_enc=0
+         * to skip AES-GCM/CBC on all AV streams (~5% CPU savings on
+         * 333MHz PSP).  Control stream encryption stays active. */
         int enc_to_use = (g_encryption_supported & 1) ? 1 : 0;  /* SS_ENC_VIDEO only */
         g_audio_encryption_enabled = (g_encryption_supported & 2) ? 1 : 0;
-        pair_log("[RTSP] enc_to_use=%d (audio_enc=%d)\n",
-                 enc_to_use, g_audio_encryption_enabled);
+        if (g_psp_config.disableEncryption) {
+            enc_to_use = 0;
+            g_audio_encryption_enabled = 0;
+            pair_log("[RTSP] AV encryption DISABLED by config (control enc stays active)\n");
+        }
+        pair_log("[RTSP] enc_to_use=%d (audio_enc=%d server_supported=0x%x disableConfig=%d)\n",
+                 enc_to_use, g_audio_encryption_enabled,
+                 g_encryption_supported, g_psp_config.disableEncryption);
         sock = rtsp_connect();
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_announce(sock, enc_to_use);

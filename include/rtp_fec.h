@@ -40,4 +40,38 @@ extern volatile u16 g_fec_last_recv_data;
 extern volatile u16 g_fec_last_recv_parity;
 extern volatile u8  g_fec_last_fec_pct;
 
+/* Total video bytes received since last reset (for bandwidth estimation) */
+extern volatile u32 g_fec_total_bytes_received;
+
+/* ── Aggregate FEC recovery statistics ──────────────────────────────
+ * These counters are monotonically increasing over the session lifetime.
+ * Used by the connection quality monitor and quality dashboard HUD. */
+extern volatile u32 g_fec_packets_recovered;   /* data packets RS-recovered */
+extern volatile u32 g_fec_packets_failed;       /* RS recovery failures */
+extern volatile u32 g_fec_frames_dropped;       /* frames dropped (unrecoverable) */
+extern volatile u32 g_fec_recovery_attempts;    /* total RS recovery attempts */
+
+/* ── Phase 3.5: RTP Video Stats API ────────────────────────────────
+ * Exposes structured stats for the HUD and diagnostics. */
+typedef struct {
+    u32 packets_received;     /* total RTP video packets received */
+    u32 packets_recovered;    /* data packets RS-recovered */
+    u32 packets_failed;       /* RS recovery failures */
+    u32 frames_dropped;       /* frames dropped (unrecoverable) */
+    u32 recovery_attempts;    /* total RS recovery attempts */
+    u32 bytes_received;       /* total video bytes received */
+    u32 consecutive_drops;    /* current consecutive unrecoverable count */
+} RtpVideoStats;
+
+void rtp_get_video_stats(RtpVideoStats *out);
+
+/* ── Phase 3.6: Consecutive Drop Limit ─────────────────────────────
+ * Track consecutive unrecoverable frames. At 120 consecutive drops,
+ * force an IDR request (matches moonlight-common-c). */
+#define CONSECUTIVE_DROP_IDR_LIMIT  120
+extern volatile u32 g_consecutive_frame_drops;
+
+/* Phase 4: Predictive frame loss — returns predicted consecutive loss count */
+int rtp_fec_get_predicted_loss(void);
+
 #endif /* RTP_FEC_H */

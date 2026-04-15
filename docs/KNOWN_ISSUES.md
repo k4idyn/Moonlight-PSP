@@ -1,8 +1,8 @@
 # Known Issues
 
-_PSP Moonlight v0.2.1-beta_
+_PSP Moonlight v0.2.2-beta_
 
-This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in v0.2.1-beta.
+This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in v0.2.2-beta.
 
 ---
 
@@ -41,7 +41,29 @@ Passing `0x48xxxxxx` (uncached alias) to ME code causes a bus error and ME halt.
 ### Audio PLC static at high packet loss
 **Status:** Partially mitigated  
 **Impact:** When WiFi drops >3 consecutive audio packets, PLC (Packet Loss Concealment) generates synthetic audio that sounds like static. Volume ducking (87.5% → 68.75% → 50%) reduces but doesn't eliminate the artifact. At ~37% WiFi packet loss (typical for 802.11b), PLC generates ~14% of audio timeline as synthetic frames.  
-**Mitigation:** PLC threshold increased from 25ms to 45ms to reduce false positives. Volume ducking fades PLC output. Further improvement would require increasing `packetDuration` from 20ms to 40ms (halving packet count) but requires buffer resize.
+**Mitigation:** PLC threshold is now quality-adaptive (35ms good / 45ms fair / 60ms poor) instead of fixed 45ms. Volume ducking fades PLC output. Further improvement would require increasing `packetDuration` from 20ms to 40ms (halving packet count) but requires buffer resize.
+
+### Resolutions above 480×272
+**Status:** Hardware limitation  
+**Impact:** The PSP decode pipeline cannot sustain video at 640×360 or above. Testing confirms 640×360 shows only the initial app splash, 854×480 fails to receive any video frames, and 1280×720 is far beyond capability. The practical maximum for custom resolutions is 368×208; at 480×272 native the decoder runs near its ceiling.  
+**Mitigation:** Dynamic resolution scaling automatically steps down when decode time or loss rate exceeds thresholds.
+
+### 8 protocol features untriggered in automated testing
+**Status:** By design (edge-case scenarios)  
+**Impact:** Graceful Disconnect, IDR Suppression, P-Frame Skip, Frame Pacing, RTP Stats API, Predictive Frame Drop, Audio Crypto Sep, and Session Resume are implemented but require specific edge-case conditions (e.g., server-initiated disconnect, intra-refresh mode, deliberate crypto failure) not exercised in standard streaming tests. 31/39 features verified ACTIVE across 8-stage automated test.
+
+---
+
+## Fixed (included in v0.2.2-beta)
+
+### IDR flood with exponential backoff — Fixed in v0.2.2-beta
+IDR requests were rate-limited to 1/sec but still flooded at ~40–100/min on lossy WiFi. Replaced with exponential backoff (500ms → 1000ms → 2000ms → 4000ms) with automatic cooldown on successful frame delivery. Reduced IDR requests to ~5–15/min.
+
+### Config resolution index defaulting to 272p — Fixed in v0.2.2-beta
+Custom resolutions always mapped to `resolutionIndex=0` (480×272) on INI reload. Three bugs: (1) width-only switch missed height, (2) fpsIndex rebuilder values mismatched `FPS_VALUES[]` array, (3) INI write order incorrect. All three fixed in `config.c`.
+
+### Decode stall on P-frame backlog — Fixed in v0.2.2-beta
+When packet loss caused >256 packets to queue, decoder wasted time on stale P-frames with corrupted references. Now scans forward to next IDR/SPS/PPS instead of decoding sequentially.
 
 ---
 

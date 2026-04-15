@@ -48,6 +48,21 @@ extern volatile int me_running;
  * the server only sends small intra-refresh P-frames (~1KB each). */
 volatile int g_intra_refresh_active = 0;
 
+/* ── Connection Quality Monitoring state ─────────────────────────── */
+static ConnQualityState s_conn_quality = { CONN_QUALITY_FAIR, 0, 0, 0, 0, 0 };
+static u32 s_quality_prev_fec_recovered = 0;
+static u32 s_quality_prev_fec_failed    = 0;
+static u32 s_quality_prev_fec_dropped   = 0;
+static u32 s_quality_prev_fec_attempts  = 0;
+static u32 s_quality_prev_lgf           = 0;
+static u32 s_quality_prev_time_us       = 0;
+
+/* Phase 5.9: Quality-based BW report scaling (100=normal, 50=halve) */
+static int s_quality_bw_scale_pct = 100;
+
+/* Forward declaration (defined after control_stream_abort) */
+static void update_connection_quality(u32 estimated_bw_bps);
+
 #define ctrl_log(fmt, ...) diag_log_write("CTRL", fmt, ##__VA_ARGS__)
 
 /* ── ENet protocol constants ─────────────────────────────────────── */
@@ -188,6 +203,55 @@ typedef struct {
 static retx_entry_t retx_ring[RETX_SLOTS];
 static int retx_head = 0;  /* next slot to write */
 
+/* ── RTT-adaptive retransmit timeout (Jacobson/Karels) ──────────
+ * Replaces the fixed 300ms timeout with one that adapts to actual
+ * network conditions.  On LAN, RTO drops to ~50ms for faster gap
+ * recovery.  On lossy WiFi with jitter, it stretches appropriately.
+ * This closes the "adaptive timing" gap vs. ENet's built-in RTT. */
+static u32 s_srtt_us = 0;           /* smoothed RTT (µs) */
+static u32 s_rttvar_us = 150000;    /* RTT variance (µs), init 150ms */
+static u32 s_rto_us = 300000;       /* computed retransmit timeout (µs) */
+static int s_rtt_initialized = 0;
+
+#define RTO_MIN_US    50000    /* 50ms floor — below is unrealistic for PSP WiFi */
+#define RTO_MAX_US   1000000   /* 1s ceiling */
+
+/* Update smoothed RTT from a sample.  Jacobson/Karels algorithm.
+ * Only called with non-retransmitted samples (Karn's algorithm). */
+static void rtt_update(u32 rtt_sample_us)
+{
+    if (!s_rtt_initialized) {
+        s_srtt_us = rtt_sample_us;
+        s_rttvar_us = rtt_sample_us / 2;
+        s_rtt_initialized = 1;
+    } else {
+        /* RTTVAR = (3/4)*RTTVAR + (1/4)*|RTT - SRTT| */
+        int delta = (int)rtt_sample_us - (int)s_srtt_us;
+        if (delta < 0) delta = -delta;
+        s_rttvar_us = (3 * s_rttvar_us + (u32)delta) / 4;
+        /* SRTT = (7/8)*SRTT + (1/8)*RTT */
+        s_srtt_us = (7 * s_srtt_us + rtt_sample_us) / 8;
+    }
+    s_rto_us = s_srtt_us + 4 * s_rttvar_us;
+    if (s_rto_us < RTO_MIN_US) s_rto_us = RTO_MIN_US;
+    if (s_rto_us > RTO_MAX_US) s_rto_us = RTO_MAX_US;
+}
+
+/* ── Bandwidth estimation ──────────────────────────────────────────
+ * Track received video bytes and report throughput to the server via
+ * ENet BANDWIDTH_LIMIT.  This closes the "no bandwidth estimation"
+ * gap vs. ENet's built-in bandwidth tracking. */
+static u32 s_bw_last_bytes = 0;
+static u32 s_bw_last_time_us = 0;
+static u32 s_estimated_bw_bps = 0;  /* estimated incoming bandwidth (bytes/sec) */
+
+/* Server-provided throttle and bandwidth parameters */
+static u32 s_server_incoming_bw = 0;
+static u32 s_server_outgoing_bw = 0;
+static u32 s_throttle_interval = 5000;
+static u32 s_throttle_accel = 2;
+static u32 s_throttle_decel = 2;
+
 /* Store a sent reliable packet for retransmission.
  * Called from the ping thread (and recv thread for 0x010E echo). */
 static void retx_store(const unsigned char *pkt, int pkt_len,
@@ -211,10 +275,19 @@ static void retx_store(const unsigned char *pkt, int pkt_len,
 static void retx_ack(unsigned char channel, unsigned short seq)
 {
     int i;
+    u32 now = sceKernelGetSystemTimeLow();
     for (i = 0; i < RETX_SLOTS; i++) {
         retx_entry_t *e = &retx_ring[i];
         if (e->active && !e->acked && e->channel == channel && e->seq == seq) {
             e->acked = 1;
+            /* Karn's algorithm: only measure RTT from non-retransmitted
+             * packets — ACK for a retransmit is ambiguous (could be for
+             * the original or the retransmit). */
+            if (e->retries == 0) {
+                u32 rtt = now - e->send_time_us;
+                if (rtt > 0 && rtt < 5000000) /* sanity: < 5s */
+                    rtt_update(rtt);
+            }
             return;
         }
     }
@@ -231,8 +304,8 @@ static int retx_scan(int sock, const struct sockaddr_in *dst)
         retx_entry_t *e = &retx_ring[i];
         if (!e->active || e->acked) continue;
 
-        /* Check if enough time has passed since last send */
-        if ((now - e->send_time_us) < RETX_TIMEOUT_US) continue;
+        /* Check if enough time has passed since last send (RTT-adaptive) */
+        if ((now - e->send_time_us) < s_rto_us) continue;
 
         if (e->retries >= RETX_MAX_TRIES) {
             /* Give up — mark inactive to free the slot */
@@ -259,6 +332,15 @@ static void retx_clear(void)
         retx_ring[i].acked = 0;
     }
     retx_head = 0;
+    /* Reset RTT estimator for new session */
+    s_srtt_us = 0;
+    s_rttvar_us = 150000;
+    s_rto_us = 300000;
+    s_rtt_initialized = 0;
+    /* Reset bandwidth estimator */
+    s_bw_last_bytes = 0;
+    s_bw_last_time_us = 0;
+    s_estimated_bw_bps = 0;
 }
 
 /* Per-channel reliable sequence allocation.
@@ -463,6 +545,32 @@ static int build_unsequenced_raw(unsigned char *buf, int buflen,
         memcpy(p, raw_payload, raw_len);
         p += raw_len;
     }
+
+    return (int)(p - buf);
+}
+
+/* ── Build ENet BANDWIDTH_LIMIT command ───────────────────────────────
+ * Reports our estimated bandwidth to the server so Sunshine can
+ * adjust encoding bitrate.  ENet protocol-level command (not encrypted). */
+static int build_bandwidth_limit(unsigned char *buf, int buflen,
+                                  unsigned int incoming_bw,
+                                  unsigned int outgoing_bw)
+{
+    unsigned char *p = buf;
+    if (buflen < 16) return -1; /* 4 header + 12 command */
+
+    /* ENet Protocol Header */
+    p = put_be16(p, (server_peer_id & 0x0FFF) |
+                     ((unsigned short)(session_bits & 0x03) << 12) |
+                     ENET_FLAG_SENT_TIME);
+    p = put_be16(p, 0); /* sentTime */
+
+    /* BANDWIDTH_LIMIT command (12 bytes): no ACK flag */
+    *p++ = ENET_CMD_BANDWIDTH_LIMIT; /* 10 */
+    *p++ = 0xFF;                      /* channelID = 0xFF */
+    p = put_be16(p, 0);              /* reliableSequenceNumber = 0 */
+    p = put_be32(p, incoming_bw);     /* incomingBandwidth (bytes/sec) */
+    p = put_be32(p, outgoing_bw);     /* outgoingBandwidth (bytes/sec) */
 
     return (int)(p - buf);
 }
@@ -1061,16 +1169,40 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                     continue;
                 }
 
-                /* ── BANDWIDTH_LIMIT (10): 12 bytes — ACK handled by Universal ── */
+                /* ── BANDWIDTH_LIMIT (10): 12 bytes — parse and store ── */
                 if (cmd_num == ENET_CMD_BANDWIDTH_LIMIT) {
                     if (p + 12 > end) break;
+                    s_server_incoming_bw = ((unsigned int)p[4] << 24) |
+                                           ((unsigned int)p[5] << 16) |
+                                           ((unsigned int)p[6] << 8) |
+                                            (unsigned int)p[7];
+                    s_server_outgoing_bw = ((unsigned int)p[8] << 24) |
+                                           ((unsigned int)p[9] << 16) |
+                                           ((unsigned int)p[10] << 8) |
+                                            (unsigned int)p[11];
+                    ctrl_log("[CTRL RX] BANDWIDTH_LIMIT server_in=%u server_out=%u\n",
+                             s_server_incoming_bw, s_server_outgoing_bw);
                     p += 12;
                     continue;
                 }
 
-                /* ── THROTTLE_CONFIGURE (11): 16 bytes — ACK handled by Universal ── */
+                /* ── THROTTLE_CONFIGURE (11): 16 bytes — parse and store ── */
                 if (cmd_num == ENET_CMD_THROTTLE_CONFIGURE) {
                     if (p + 16 > end) break;
+                    s_throttle_interval = ((unsigned int)p[4] << 24) |
+                                          ((unsigned int)p[5] << 16) |
+                                          ((unsigned int)p[6] << 8) |
+                                           (unsigned int)p[7];
+                    s_throttle_accel = ((unsigned int)p[8] << 24) |
+                                       ((unsigned int)p[9] << 16) |
+                                       ((unsigned int)p[10] << 8) |
+                                        (unsigned int)p[11];
+                    s_throttle_decel = ((unsigned int)p[12] << 24) |
+                                       ((unsigned int)p[13] << 16) |
+                                       ((unsigned int)p[14] << 8) |
+                                        (unsigned int)p[15];
+                    ctrl_log("[CTRL RX] THROTTLE_CONFIGURE interval=%u accel=%u decel=%u\n",
+                             s_throttle_interval, s_throttle_accel, s_throttle_decel);
                     p += 16;
                     continue;
                 }
@@ -1224,6 +1356,59 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                 0,      /* multiFecBlockIndex */
                 1       /* multiFecBlockCount */
             );
+        }
+
+        /* ── Bandwidth estimation: compute throughput over 5s window ───
+         * Reports incoming bandwidth to the server via ENet BANDWIDTH_LIMIT
+         * so Sunshine can adjust encoding bitrate.  This closes the
+         * "no bandwidth estimation" gap vs. ENet's built-in tracking. */
+        if (count > 0 && (count % 50) == 0 && ctrl_socket >= 0) {
+            extern volatile u32 g_fec_total_bytes_received;
+            u32 now_bw = sceKernelGetSystemTimeLow();
+            u32 bytes_now = g_fec_total_bytes_received;
+
+            if (s_bw_last_time_us != 0) {
+                u32 dt_us = now_bw - s_bw_last_time_us;
+                u32 dbytes = bytes_now - s_bw_last_bytes;
+                if (dt_us > 100000) { /* at least 100ms elapsed */
+                    s_estimated_bw_bps = (u32)((u64)dbytes * 1000000ULL / (u64)dt_us);
+
+                    /* Send BANDWIDTH_LIMIT to server.
+                     * Apply bandwidth report scaling (BW_REPORT_SCALE_PCT):
+                     *   100 = report exact measured bandwidth (default)
+                     *   120 = inflate 20% → server sends higher quality
+                     *    80 = deflate 20% → smaller frames, faster decode
+                     * Inflation risks WiFi congestion; deflation reduces quality
+                     * but lowers latency.  Tuned for 802.11b headroom. */
+                    {
+                        unsigned char bw_buf[20];
+                        u32 reported_bw = s_estimated_bw_bps;
+#define BW_REPORT_SCALE_PCT 115  /* inflate 15% to prevent premature server downgrade */
+                        reported_bw = (u32)((u64)reported_bw * BW_REPORT_SCALE_PCT / 100);
+                        /* Phase 5.9: Apply quality-based BW scaling */
+                        reported_bw = (u32)((u64)reported_bw * (u32)s_quality_bw_scale_pct / 100);
+                        int bw_len = build_bandwidth_limit(bw_buf, sizeof(bw_buf),
+                                                           reported_bw, 0);
+                        if (bw_len > 0) {
+                            sceNetInetSendto(ctrl_socket, bw_buf, bw_len, 0,
+                                             (struct sockaddr *)&dst, sizeof(dst));
+                        }
+
+                        if (count <= 10 || (count % 300) == 0) {
+                            ctrl_log("[CTRL BW] raw=%ukbps scaled=%ukbps (x%d%%) rto=%uus\n",
+                                     s_estimated_bw_bps * 8 / 1000,
+                                     reported_bw * 8 / 1000,
+                                     BW_REPORT_SCALE_PCT,
+                                     s_rto_us);
+                        }
+                    }
+                }
+            }
+            s_bw_last_bytes = bytes_now;
+            s_bw_last_time_us = now_bw;
+
+            /* Update connection quality metrics alongside bandwidth */
+            update_connection_quality(s_estimated_bw_bps);
         }
 
         if (count % 50 == 0) { /* 50 × 100ms = 5 seconds */
@@ -1442,23 +1627,44 @@ int control_stream_request_idr(void)
         return -1;
     }
 
-    /* Rate-limit IDR requests to max 1/sec (1000ms throttle).
-     * Without this, frame drops + FEC failures flood the server with
-     * IDR requests, wasting bandwidth and confusing Sunshine.  At
-     * 500ms throttle, 66 IDR requests in 50s caused Sunshine to stop
-     * encoding entirely.  1/sec gives the server time to produce and
-     * deliver the IDR before we ask for another one.
-     * First 5 requests bypass throttle for rapid-fire during initial connection. */
+    /* Rate-limit IDR requests with exponential backoff.
+     * Starts at 500ms, doubles on each consecutive request up to 4s max.
+     * Resets to 500ms when a new IDR decode succeeds (g_idr_fully_decoded
+     * goes from 0→1).  This prevents flooding Sunshine during bad WiFi
+     * while still allowing rapid recovery when signal improves.
+     * First 3 requests bypass throttle for rapid-fire during initial connection. */
     {
         static u64 s_last_idr_tick = 0;
         static int s_idr_count = 0;
+        static u32 s_idr_backoff_us = 500000; /* start at 500ms */
+        static int s_idr_prev_decoded = 0;
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (s_idr_count >= 5 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < 1000000) {
+
+        /* Reset backoff when an IDR decode succeeds */
+        if (g_idr_fully_decoded && !s_idr_prev_decoded) {
+            ctrl_log("[IDR BACKOFF] reset to 500ms (IDR decoded ok, count=%d)\n", s_idr_count);
+            s_idr_backoff_us = 500000; /* reset to 500ms */
+        }
+        s_idr_prev_decoded = g_idr_fully_decoded;
+
+        if (s_idr_count >= 3 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < s_idr_backoff_us) {
+            ctrl_log("[IDR BACKOFF] throttled (backoff=%ums count=%d)\n",
+                     s_idr_backoff_us / 1000, s_idr_count);
             return 0; /* throttled — recent IDR already in flight */
         }
         s_last_idr_tick = now;
         s_idr_count++;
+
+        /* Exponential backoff: double interval after each send, cap at 4s */
+        if (s_idr_count >= 3) {
+            u32 prev_backoff = s_idr_backoff_us;
+            s_idr_backoff_us *= 2;
+            if (s_idr_backoff_us > 4000000)
+                s_idr_backoff_us = 4000000;
+            ctrl_log("[IDR BACKOFF] %ums -> %ums (count=%d)\n",
+                     prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
+        }
     }
 
     /* CTRL_TYPE_IDR_REQ (0x0302) is the correct Gen7Enc IDR request.
@@ -1896,6 +2102,141 @@ void control_stream_abort(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * Connection Quality Monitoring
+ * ══════════════════════════════════════════════════════════════════ */
+
+ConnQualityState control_stream_get_quality(void)
+{
+    return s_conn_quality;
+}
+
+/* Called from the ping thread every 5 seconds to recompute quality.
+ * Uses FEC counters, frame rate, and bandwidth estimate. */
+static void update_connection_quality(u32 estimated_bw_bps)
+{
+    extern volatile u32 g_fec_packets_recovered;
+    extern volatile u32 g_fec_packets_failed;
+    extern volatile u32 g_fec_frames_dropped;
+    extern volatile u32 g_fec_recovery_attempts;
+
+    u32 now_us = sceKernelGetSystemTimeLow();
+    u32 dt_us = (s_quality_prev_time_us != 0) ? (now_us - s_quality_prev_time_us) : 5000000;
+    if (dt_us == 0) dt_us = 1;
+
+    /* Delta FEC stats since last update */
+    u32 d_recovered = g_fec_packets_recovered - s_quality_prev_fec_recovered;
+    u32 d_failed    = g_fec_packets_failed    - s_quality_prev_fec_failed;
+    u32 d_dropped   = g_fec_frames_dropped    - s_quality_prev_fec_dropped;
+    u32 d_attempts  = g_fec_recovery_attempts - s_quality_prev_fec_attempts;
+
+    /* Loss rate: failed / (recovered + failed), scaled x10 for 0.1% precision */
+    u32 total_fec_pkts = d_recovered + d_failed;
+    u32 loss_rate_x10 = 0;
+    if (total_fec_pkts > 0) {
+        loss_rate_x10 = (d_failed * 1000) / total_fec_pkts;
+    }
+
+    /* FEC recovery success rate */
+    u32 recovery_pct = 100;
+    if (d_attempts > 0) {
+        u32 d_success = (d_attempts > d_dropped) ? (d_attempts - d_dropped) : 0;
+        recovery_pct = (d_success * 100) / d_attempts;
+    }
+
+    /* Frame rate: delta frames / delta time */
+    u32 d_frames = g_last_good_frame - s_quality_prev_lgf;
+    u32 fps = (d_frames * 1000000) / dt_us;
+
+    /* Classify quality */
+    ConnQuality q;
+    if (loss_rate_x10 < 10 && d_dropped == 0) {
+        q = CONN_QUALITY_EXCELLENT;  /* <1.0% loss */
+    } else if (loss_rate_x10 < 30 && d_dropped <= 1) {
+        q = CONN_QUALITY_GOOD;       /* <3.0% loss */
+    } else if (loss_rate_x10 < 80 && d_dropped <= 3) {
+        q = CONN_QUALITY_FAIR;       /* <8.0% loss */
+    } else if (loss_rate_x10 < 150) {
+        q = CONN_QUALITY_POOR;       /* <15% loss */
+    } else {
+        q = CONN_QUALITY_CRITICAL;   /* >15% loss */
+    }
+
+    /* Phase 5.9: Quality transition hysteresis — require 3 consecutive
+     * readings at a new level before committing the transition.
+     * Prevents oscillation between states on borderline conditions. */
+    {
+        static ConnQuality s_pending_quality = CONN_QUALITY_FAIR;
+        static int s_consecutive_at_pending = 0;
+        static ConnQuality s_committed_quality = CONN_QUALITY_FAIR;
+        static const char * const q_names[] = { "EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL" };
+
+        if (q == s_pending_quality) {
+            s_consecutive_at_pending++;
+        } else {
+            s_pending_quality = q;
+            s_consecutive_at_pending = 1;
+        }
+
+        if (s_consecutive_at_pending >= 3 && q != s_committed_quality) {
+            ctrl_log("[PHASE5-QUALITY] transition: %s -> %s (consecutive=%d)\n",
+                     q_names[s_committed_quality], q_names[q], s_consecutive_at_pending);
+
+            /* Phase 5.9: Scale BW reports on quality transitions.
+             * POOR/CRITICAL → halve reported BW to make server reduce encoding.
+             * EXCELLENT/GOOD → restore to normal. */
+            if (q >= CONN_QUALITY_POOR)
+                s_quality_bw_scale_pct = 50;
+            else
+                s_quality_bw_scale_pct = 100;
+
+            s_committed_quality = q;
+        }
+
+        q = s_committed_quality;
+    }
+
+    /* Log raw quality state transitions (pre-hysteresis for diagnostics) */
+    {
+        static ConnQuality s_prev_q = CONN_QUALITY_FAIR;
+        static const char * const q_names[] = { "EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL" };
+        if (q != s_prev_q) {
+            ctrl_log("[QUALITY] %s -> %s (loss=%u.%u%% fec_ok=%u%% fps=%u bw=%ukbps)\n",
+                     q_names[s_prev_q], q_names[q],
+                     loss_rate_x10 / 10, loss_rate_x10 % 10,
+                     recovery_pct, fps, estimated_bw_bps / 125);
+            s_prev_q = q;
+        }
+    }
+
+    /* Periodic quality stats every 30s (6 updates at 5s interval) */
+    {
+        static u32 s_quality_log_count = 0;
+        s_quality_log_count++;
+        if (s_quality_log_count % 6 == 0) {
+            ctrl_log("[QUALITY] q=%d loss=%u.%u%% fec=%u%% fps=%u bw=%ukbps d_rec=%u d_fail=%u d_drop=%u\n",
+                     (int)q, loss_rate_x10 / 10, loss_rate_x10 % 10,
+                     recovery_pct, fps, estimated_bw_bps / 125,
+                     d_recovered, d_failed, d_dropped);
+        }
+    }
+
+    /* Update snapshot */
+    s_conn_quality.quality          = q;
+    s_conn_quality.loss_rate_pct    = loss_rate_x10;
+    s_conn_quality.fec_recovery_pct = recovery_pct;
+    s_conn_quality.frames_per_sec   = fps;
+    s_conn_quality.bw_estimate_bps  = estimated_bw_bps;
+
+    /* Save previous counters */
+    s_quality_prev_fec_recovered = g_fec_packets_recovered;
+    s_quality_prev_fec_failed    = g_fec_packets_failed;
+    s_quality_prev_fec_dropped   = g_fec_frames_dropped;
+    s_quality_prev_fec_attempts  = g_fec_recovery_attempts;
+    s_quality_prev_lgf           = g_last_good_frame;
+    s_quality_prev_time_us       = now_us;
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * control_stream_stop
  * ══════════════════════════════════════════════════════════════════ */
 void control_stream_stop(void)
@@ -1904,10 +2245,35 @@ void control_stream_stop(void)
 
     ctrl_running = 0;
 
-    /* IMPORTANT: Close the socket BEFORE waiting for threads.
-     * This unblocks Recvfrom immediately on most PSP network stacks,
-     * preventing a 2-second hang in WaitThreadEnd. */
+    /* ── Graceful ENet DISCONNECT with linger ──────────────────────
+     * Send a proper ENet DISCONNECT command before closing the socket.
+     * This tells Sunshine we're leaving intentionally (vs. a crash/timeout),
+     * allowing it to release encoder resources immediately instead of
+     * waiting for the 10-second ENet timeout.
+     * Best-effort: if the send fails, we still close the socket. */
     if (ctrl_socket >= 0) {
+        unsigned char disc_pkt[16];
+        unsigned char *p = disc_pkt;
+        /* ENet protocol header (4 bytes) */
+        p = put_be16(p, (server_peer_id & 0x0FFF) |
+                        ((unsigned short)session_bits << 12));
+        p = put_be16(p, 0); /* sentTime = 0 */
+        /* ENet DISCONNECT command (8 bytes) */
+        *p++ = ENET_CMD_DISCONNECT | ENET_CMD_FLAG_ACK; /* commandType */
+        *p++ = 0xFF; /* channelID */
+        p = put_be16(p, 0); /* reliableSeq = 0 for disconnect */
+        p = put_be32(p, 0); /* data = 0 */
+
+        sceNetInetSendto(ctrl_socket, disc_pkt, (int)(p - disc_pkt), 0,
+                         (struct sockaddr *)&g_server_addr,
+                         sizeof(g_server_addr));
+
+        /* Brief linger: give the DISCONNECT packet time to reach Sunshine.
+         * 50ms is enough for a single UDP packet on 802.11b even at
+         * worst-case 1Mbps (~0.1ms per 1500B packet). */
+        sceKernelDelayThread(50000);
+
+        ctrl_log("[CTRL] sent graceful ENet DISCONNECT\n");
         sceNetInetClose(ctrl_socket);
         ctrl_socket = -1;
     }

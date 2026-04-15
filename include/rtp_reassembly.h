@@ -52,6 +52,10 @@ void rtp_reassembly_flush_pre_ready_frames(void);
 /* Flush partially assembled frame (e.g. on START_A request) */
 void rtp_reassembly_flush_partial_frame(void);
 
+/* Host processing latency extracted from Sunshine frame headers (microseconds).
+ * Updated per-frame when Sunshine type-0x01 headers are present. */
+extern volatile u32 g_host_processing_us;
+
 /*--------------------------------------------------------------------------
  * Required External Function
  *

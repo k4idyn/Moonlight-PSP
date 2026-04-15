@@ -145,6 +145,19 @@ int audio_thread_send_ping_burst(void);
  */
 void audio_thread_get_stats(AudioStats *out);
 
+/* ── Phase 3.5: RTP Audio Stats API ───────────────────────────────
+ * Structured audio stats for HUD and diagnostics. */
+typedef struct {
+    u32 packets_received;    /* total audio RTP packets received */
+    u32 packets_decoded;     /* successfully decoded audio frames */
+    u32 plc_count;           /* packet loss concealment invocations */
+    u32 fec_recovered;       /* in-band FEC recoveries */
+    u32 underruns;           /* ring buffer underruns */
+    u32 frames_played;       /* total DMA chunks played */
+} RtpAudioStats;
+
+void rtp_get_audio_stats(RtpAudioStats *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,6 +15,7 @@
 #include <pspkernel.h>
 #include <pspctrl.h>
 #include <pspiofilemgr.h>
+#include <psppower.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -72,6 +73,38 @@
 #define CTRL_CHANNEL_MOUSE        0x03
 #define CTRL_CHANNEL_GAMEPAD0     0x10  /* CTRL_CHANNEL_GAMEPAD_BASE + 0 */
 
+/* ── Phase 3 Protocol Constants ──────────────────────────────────── */
+
+/* Keyboard event (Type 5) */
+#define KEYBOARD_MAGIC            0x00000005
+#define KEY_ACTION_DOWN           0x03
+#define KEY_ACTION_UP             0x04
+
+/* Controller Arrival (Type 0x37) */
+#define CONTROLLER_ARRIVAL_MAGIC  0x00000037
+#define CONTROLLER_TYPE_XBOX      1
+/* Supported button flags: all standard Xbox buttons.
+ * PSP can emulate most via button mapper. */
+#define SUPPORTED_BUTTON_FLAGS    0x0000FFFF
+/* Capabilities: we have analog triggers (via L+combo) */
+#define CONTROLLER_CAP_ANALOG_TRIGGERS  0x01
+
+/* Controller Battery (Type 0x40) */
+#define CONTROLLER_BATTERY_MAGIC  0x00000040
+#define BATTERY_STATE_UNKNOWN     0x00
+#define BATTERY_STATE_NOT_PRESENT 0x01
+#define BATTERY_STATE_DISCHARGING 0x02
+#define BATTERY_STATE_CHARGING    0x04
+#define BATTERY_STATE_FULL        0x08
+
+/* Scroll Event (Type 0x09, Gen5) */
+#define SCROLL_MAGIC_GEN5         0x00000009
+/* High-res Scroll (Type 0x33) */
+#define SCROLL_HIRES_MAGIC        0x00000033
+
+/* Battery report interval: every 30 seconds */
+#define BATTERY_REPORT_INTERVAL_US  (30 * 1000 * 1000)
+
 /* ------------------------------------------------------------------ *
  * State tracking
  * ------------------------------------------------------------------ */
@@ -86,6 +119,12 @@ extern PspConfig g_psp_config;
 /* Browser-mode button-press memory for edge detection */
 static int g_mouse_l_down = 0;
 static int g_mouse_r_down = 0;
+
+/* Phase 3: Battery report timer */
+static SceUInt32 g_last_battery_report_us = 0;
+
+/* Phase 3: Keyboard OSK trigger state (R+Triangle edge detection) */
+static int g_osk_trigger_prev = 0;
 
 /* ------------------------------------------------------------------ *
  * map_cfg I/O
@@ -407,6 +446,109 @@ static void send_mouse_button(int pressed, uint8_t button)
     }
 }
 
+/* ── Phase 3.1: Controller Arrival Event ────────────────────────── */
+static void send_controller_arrival(void)
+{
+    uint8_t pkt[16];
+    memset(pkt, 0, sizeof(pkt));
+    put_be32(&pkt[0], 12);                              /* size: remaining bytes */
+    put_le32(&pkt[4], CONTROLLER_ARRIVAL_MAGIC);         /* magic 0x37 */
+    pkt[8] = 0;                                          /* controllerNumber = 0 */
+    pkt[9] = CONTROLLER_TYPE_XBOX;                       /* controllerType = Xbox */
+    put_le32(&pkt[10], SUPPORTED_BUTTON_FLAGS);          /* supportedButtonFlags */
+    put_le16(&pkt[14], CONTROLLER_CAP_ANALOG_TRIGGERS);  /* capabilities */
+    int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
+    diag_log_write("INP", "Controller arrival sent: type=Xbox caps=0x%04X ret=%d",
+                   CONTROLLER_CAP_ANALOG_TRIGGERS, ret);
+}
+
+/* ── Phase 3.2: Controller Battery Event ────────────────────────── */
+static void send_controller_battery(void)
+{
+    int charging = scePowerIsBatteryCharging();
+    int percent  = scePowerGetBatteryLifePercent();
+    uint8_t state;
+
+    if (percent < 0) {
+        state = BATTERY_STATE_NOT_PRESENT;
+        percent = 0;
+    } else if (charging) {
+        state = (percent >= 100) ? BATTERY_STATE_FULL : BATTERY_STATE_CHARGING;
+    } else {
+        state = BATTERY_STATE_DISCHARGING;
+    }
+    if (percent > 100) percent = 100;
+
+    uint8_t pkt[11];
+    memset(pkt, 0, sizeof(pkt));
+    put_be32(&pkt[0], 7);                           /* size: remaining bytes */
+    put_le32(&pkt[4], CONTROLLER_BATTERY_MAGIC);     /* magic 0x40 */
+    pkt[8] = 0;                                      /* controllerNumber = 0 */
+    pkt[9] = state;                                  /* batteryState */
+    pkt[10] = (uint8_t)percent;                      /* batteryPercentage */
+
+    int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
+    diag_log_write("INP", "Battery report: state=%d pct=%d charging=%d ret=%d",
+                   state, percent, charging, ret);
+}
+
+/* ── Phase 3.3: Keyboard Event Sender ───────────────────────────── */
+void input_send_keyboard_event(uint8_t key_action, uint16_t vk_code, uint8_t modifiers)
+{
+    uint8_t pkt[17];
+    memset(pkt, 0, sizeof(pkt));
+    put_be32(&pkt[0], 13);                   /* size: remaining bytes */
+    put_le32(&pkt[4], KEYBOARD_MAGIC);       /* magic 0x05 */
+    pkt[8] = key_action;                     /* KEY_ACTION_DOWN or _UP */
+    /* pkt[9..11] = padding (0) */
+    put_le16(&pkt[12], 0x0000);              /* reserved */
+    put_le16(&pkt[14], vk_code);             /* Windows VK code */
+    pkt[16] = modifiers;                     /* modifier bitmask */
+
+    int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_KEYBOARD);
+    diag_log_write("INP", "Keyboard event: action=%d vk=0x%04X mod=0x%02X ret=%d",
+                   key_action, vk_code, modifiers, ret);
+}
+
+/* Send a complete key tap (down + up) for a VK code */
+static void send_key_tap(uint16_t vk_code, uint8_t modifiers)
+{
+    input_send_keyboard_event(KEY_ACTION_DOWN, vk_code, modifiers);
+    sceKernelDelayThread(5000); /* 5ms between down/up for server to register */
+    input_send_keyboard_event(KEY_ACTION_UP, vk_code, modifiers);
+}
+
+/* ── Phase 3.4: Scroll Event Senders ────────────────────────────── */
+void input_send_scroll(int16_t scroll_amount)
+{
+    uint8_t pkt[10];
+    memset(pkt, 0, sizeof(pkt));
+    put_be32(&pkt[0], 6);                   /* size: remaining bytes */
+    put_le32(&pkt[4], SCROLL_MAGIC_GEN5);   /* magic 0x09 */
+    pkt[8] = (uint8_t)((scroll_amount >> 8) & 0xFF);  /* BE16 scrollAmt high */
+    pkt[9] = (uint8_t)(scroll_amount & 0xFF);          /* BE16 scrollAmt low */
+
+    int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
+    if (ret <= 0) {
+        diag_log_write("INP", "Scroll FAILED: ret=%d amt=%d", ret, scroll_amount);
+    }
+}
+
+void input_send_scroll_hires(int16_t scroll_amount_120ths)
+{
+    uint8_t pkt[10];
+    memset(pkt, 0, sizeof(pkt));
+    put_be32(&pkt[0], 6);                       /* size: remaining bytes */
+    put_le32(&pkt[4], SCROLL_HIRES_MAGIC);       /* magic 0x33 */
+    pkt[8] = (uint8_t)((scroll_amount_120ths >> 8) & 0xFF);
+    pkt[9] = (uint8_t)(scroll_amount_120ths & 0xFF);
+
+    int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
+    if (ret <= 0) {
+        diag_log_write("INP", "HiRes scroll FAILED: ret=%d amt=%d", ret, scroll_amount_120ths);
+    }
+}
+
 /* ================================================================== *
  * Public API
  * ================================================================== */
@@ -446,6 +588,15 @@ void input_init(int sock)
     memset(&g_prev, 0, sizeof(g_prev));
     sceCtrlPeekBufferPositive(&g_prev, 1);
     g_prev_valid = 1;
+
+    /* Phase 3.1: Send controller arrival event to tell server our type */
+    send_controller_arrival();
+
+    /* Phase 3.2: Send initial battery report */
+    send_controller_battery();
+    g_last_battery_report_us = sceKernelGetSystemTimeLow();
+
+    diag_log_write("INP", "Input initialized: arrival+battery sent");
 }
 
 /*
@@ -461,6 +612,15 @@ void input_poll_and_send(void)
 
     if (!g_initialized)
         return;
+
+    /* Phase 3.2: Periodic battery report every 30 seconds */
+    {
+        SceUInt32 now_us = sceKernelGetSystemTimeLow();
+        if ((now_us - g_last_battery_report_us) >= BATTERY_REPORT_INTERVAL_US) {
+            send_controller_battery();
+            g_last_battery_report_us = now_us;
+        }
+    }
 
     /* Read controller (non-blocking — peek, not read) */
     sceCtrlPeekBufferPositive(&pad, 1);
@@ -502,6 +662,32 @@ void input_poll_and_send(void)
     if (g_psp_config.controlMode == CONTROL_MODE_BROWSER) {
         /* ---- Browser Mode: analog stick → mouse, L/R → MB1/MB2 ---- */
 
+        /* Phase 3.4: L+DpadUp/Down → scroll events in browser mode */
+        if (pad.Buttons & PSP_CTRL_LTRIGGER) {
+            if ((pad.Buttons & PSP_CTRL_UP) && !(g_prev.Buttons & PSP_CTRL_UP)) {
+                input_send_scroll(120);  /* scroll up */
+                diag_log_write("INP", "Browser scroll up");
+            }
+            if ((pad.Buttons & PSP_CTRL_DOWN) && !(g_prev.Buttons & PSP_CTRL_DOWN)) {
+                input_send_scroll(-120);  /* scroll down */
+                diag_log_write("INP", "Browser scroll down");
+            }
+        }
+
+        /* Phase 3.3: R+Triangle → send Enter key (OSK placeholder).
+         * Full PSP OSK (sceUtilityOskInit) requires blocking the render
+         * loop which stalls the stream. Instead, send Enter as a quick
+         * keyboard action for common desktop use (confirm dialogs, etc). */
+        {
+            int osk_now = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                          (pad.Buttons & PSP_CTRL_TRIANGLE);
+            if (osk_now && !g_osk_trigger_prev) {
+                send_key_tap(0x0D, 0);  /* VK_RETURN */
+                diag_log_write("INP", "R+Triangle: sent Enter key");
+            }
+            g_osk_trigger_prev = osk_now;
+        }
+
         /* Analog stick → relative mouse delta with deadzone */
         int ax = (int)pad.Lx - 128;
         int ay = (int)pad.Ly - 128;
@@ -541,6 +727,18 @@ void input_poll_and_send(void)
         }
     } else {
         /* ---- Xbox Mode: full gamepad with L+combo mapper ---- */
+
+        /* Phase 3.3: R+Triangle → send Enter key in Xbox mode too */
+        {
+            int osk_now = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                          (pad.Buttons & PSP_CTRL_TRIANGLE);
+            if (osk_now && !g_osk_trigger_prev) {
+                send_key_tap(0x0D, 0);  /* VK_RETURN */
+                diag_log_write("INP", "R+Triangle: sent Enter key (Xbox mode)");
+            }
+            g_osk_trigger_prev = osk_now;
+        }
+
         uint16_t buttons = translate_buttons(pad.Buttons);
         int16_t lsx = map_analog(pad.Lx);
         int16_t lsy = -map_analog(pad.Ly);   /* invert Y */

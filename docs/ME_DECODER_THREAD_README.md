@@ -4,7 +4,7 @@
 
 The PSP has two processors: the main Allegrex CPU at 333 MHz and the Media Engine (ME) at 222 MHz. In PSP Moonlight, they divide work as follows:
 
-- **Main CPU**: FFmpeg H.264 decode, RTP reassembly, FEC repair, audio decode, input, UI, network receive
+- **Main CPU**: OpenH264 H.264 decode, RTP reassembly, FEC repair, audio decode, input, UI, network receive
 - **ME**: YUV420P → RGBA8888 color conversion using VFPU vector instructions
 
 The ME does **not** run H.264 decode. The original goal was to use `sceMpeg` on the ME for hardware-assisted AVC decode, but that approach was abandoned — see the Historical Context section below.
@@ -13,22 +13,20 @@ The ME does **not** run H.264 decode. The original goal was to use `sceMpeg` on 
 
 ## Why the ME for Color Conversion
 
-After FFmpeg produces a decoded `AVFrame` (YUV420P planar), the PSP's GU/display system needs RGB or RGBA data. The conversion math — three multiply-accumulate operations per pixel at 480×272 = ~130,000 pixels per frame — is ideal for the VFPU's 128-bit vector lanes.
+After OpenH264 produces a decoded YUV420P frame, the PSP's GU/display system needs RGB or RGBA data. The conversion math — three multiply-accumulate operations per pixel at 480×272 = ~130,000 pixels per frame — is ideal for the VFPU's 128-bit vector lanes.
 
 Critically, the ME runs **concurrently** with the main CPU. The pipeline is:
 
 ```
 Main CPU                              ME (222 MHz)
 ─────────────────────────             ─────────────────────────
-Frame N: avcodec_send_packet()
-Frame N: avcodec_receive_frame()
-         → YUV420P AVFrame
+Frame N: DecodeFrameNoDelay()
+         → YUV420P planes
 Frame N: BeginME(yuv→rgba entry) ──▶  Frame N: VFPU YUV→RGBA (~31 µs)
-Frame N+1: avcodec_send_packet()
-Frame N+1: avcodec_receive_frame()    [ME finishes Frame N]
+Frame N+1: DecodeFrameNoDelay()       [ME finishes Frame N]
 ```
 
-Throughput = `max(FFmpeg_time, ME_convert_time)` rather than their sum.
+Throughput = `max(OpenH264_decode_time, ME_convert_time)` rather than their sum.
 
 ---
 
@@ -75,7 +73,7 @@ If the ME hangs or `WaitME()` times out, `sw_me_worker.c` calls `KillME()`, re-i
 
 ## Initialization
 
-Called from `ffmpeg_pipeline_init()` in `src/ffmpeg_decode.c`:
+Called from `openh264_pipeline_init()` in `src/openh264_decode.cpp`:
 
 ```c
 sw_me_worker_init();
@@ -90,7 +88,7 @@ The PRX `moonlight_me_helper.prx` must exist at `ms0:/PSP/GAME/Moonlight/moonlig
 
 ## Teardown
 
-Called from `ffmpeg_pipeline_shutdown()`:
+Called from `openh264_pipeline_shutdown()`:
 
 ```c
 sw_me_worker_wait();     // drain any in-flight job
@@ -103,7 +101,7 @@ sw_me_worker_deinit();   // call FinishME, unload PRX
 
 | Thread | Priority | Role |
 |--------|----------|------|
-| Main / UI | 0x20 | FFmpeg decode, input, HUD |
+| Main / UI | 0x20 | OpenH264 decode, input, HUD |
 | Network receive | 0x15 | UDP socket drain |
 | Audio output | 0x12 | Opus decode + sceAudio |
 | ME VFPU job | (ME hardware) | YUV→RGBA, runs on separate core |
@@ -118,6 +116,6 @@ The original plan was to use `sceMpegAvcDecode` on the ME to decode H.264 direct
 
 `sceMpeg` was designed for MPEG-4/H.264 playback from managed ringbuffers. The hardware expects a continuous, properly-framed bitstream fed through `sceMpegRingbufferPut`. The Moonlight protocol delivers RTP-fragmented H.264 NAL units out of order with FEC repair packets interleaved. Mapping this stream model onto the `sceMpeg` ringbuffer contract cleanly is not feasible — the hardware stalls or returns error `0x80628002` on any gap or ordering issue in the input.
 
-The software FFmpeg path handles RTP-fragmented input naturally, at the cost of running on the main CPU. The ME is then left free for the color conversion step, which it handles without the strict sequencing requirements that break `sceMpeg`.
+The software decode path (now OpenH264, previously FFmpeg) handles RTP-fragmented input naturally, at the cost of running on the main CPU. The ME is then left free for the color conversion step, which it handles without the strict sequencing requirements that break `sceMpeg`.
 
 For full decode pipeline documentation, see `docs/DECODER_PIPELINE.md`.

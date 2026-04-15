@@ -25,6 +25,18 @@ typedef struct {
 void button_mapping_get(ButtonMapping *mapping);
 void button_mapping_set(const ButtonMapping *mapping);
 
+/* Phase 3: input_init now also sends controller arrival event */
+void input_init(int sock);
+void input_poll_and_send(void);
+void input_shutdown(void);
+
+/* Phase 3.1: Keyboard input via PSP OSK */
+void input_send_keyboard_event(uint8_t key_action, uint16_t vk_code, uint8_t modifiers);
+
+/* Phase 3.4: Scroll events */
+void input_send_scroll(int16_t scroll_amount);
+void input_send_scroll_hires(int16_t scroll_amount_120ths);
+
 #ifdef __cplusplus
 }
 #endif

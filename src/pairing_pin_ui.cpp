@@ -231,8 +231,8 @@ PairingPINState pairing_pin_ui_run(PairingPINUI *ui)
         ui_draw_footer_hint("{O} / {TR}: Cancel pairing");
 
         ui_end_frame();
-
-        sceKernelDelayThread(16000); /* yield ~60 fps */
+        /* ui_end_frame() already waits for VBlank (~16ms). No extra delay needed.
+         * The previous redundant 16ms delay was halving the frame rate to ~30fps. */
     }
 
     /* Show brief success message before returning to library screen */
@@ -244,7 +244,7 @@ PairingPINState pairing_pin_ui_run(PairingPINUI *ui)
             render_text_centered("Pairing Successful!",  SCREEN_HEIGHT/2 - 10, UI_COL_ACCENT);
             render_text_centered("Connecting to Library...", SCREEN_HEIGHT/2 + 14, UI_COL_TEXT);
             ui_end_frame();
-            sceKernelDelayThread(16000);
+            /* ui_end_frame() already paces to VBlank — no extra delay needed */
         }
     }
     /* GU / UIManager is already initialised by display_init() + ui_manager_init().

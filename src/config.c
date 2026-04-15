@@ -161,6 +161,7 @@ void configSetDefaults(PspConfig *config)
     config->resolutionIndex = 0;             /* Quality preset: 368x208 */
     config->fpsIndex = 0;                    /* 15 FPS (index 0 in [15,20,30,60,Custom]) */
     config->audioEnabled = 1;                /* Enabled by default */
+    config->disableEncryption = 0;           /* Encryption on by default (safe default) */
 
     /* Pairing persistence */
     memset(config->pairedHostIp, 0, sizeof(config->pairedHostIp));
@@ -252,8 +253,13 @@ int loadConfig(PspConfig *config)
         else if (strncmp(trimmed, "fpsIndex", 8) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
                 config->fpsIndex = value;
-                /* Rebuild actual fps from index */
-                config->fps = (value == 0) ? 15 : (value == 1) ? 30 : (value == 2) ? 40 : 60;
+                /* Rebuild actual fps from index — must match FPS_VALUES[] in settings_menu.c:
+                 * 0=15, 1=20, 2=30, 3=60, 4=Custom (keep existing fps) */
+                if (value == 0) config->fps = 15;
+                else if (value == 1) config->fps = 20;
+                else if (value == 2) config->fps = 30;
+                else if (value == 3) config->fps = 60;
+                /* else: Custom index — leave config->fps as-is from 'fps' key */
                 fileLoaded = 1;
             }
         }
@@ -312,6 +318,12 @@ int loadConfig(PspConfig *config)
         else if (strncmp(trimmed, "cabacTestMode", 13) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
                 config->cabacTestMode = (value != 0) ? 1 : 0;
+                fileLoaded = 1;
+            }
+        }
+        else if (strncmp(trimmed, "disableEncryption", 17) == 0) {
+            if (parseIntValue(trimmed, &value) == 0) {
+                config->disableEncryption = (value != 0) ? 1 : 0;
                 fileLoaded = 1;
             }
         }
@@ -415,6 +427,12 @@ int saveConfig(const PspConfig *config)
     writeString(fd, line);
 
     sprintf(line, "audioEnabled = %d\n", config->audioEnabled);
+    writeString(fd, line);
+
+    writeString(fd, "\n[advanced]\n");
+    sprintf(line, "cabacTestMode = %d\n", config->cabacTestMode);
+    writeString(fd, line);
+    sprintf(line, "disableEncryption = %d\n", config->disableEncryption);
     writeString(fd, line);
 
     writeString(fd, "\n[hosts]\n");
