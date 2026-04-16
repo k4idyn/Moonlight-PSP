@@ -3585,7 +3585,7 @@ int network_connect_all(void)
         if (launch_ret < 0) {
             pair_log("[STEP 4] launch step failed\n");
             stream_connect_stop();
-            return -2;
+            return -3;  /* -3 = infrastructure failure (retryable) */
         }
     }
 
@@ -3627,10 +3627,11 @@ int network_connect_all(void)
                              cancel_path, cancel_resp, sizeof(cancel_resp));
             pair_log("[CANCEL] response: %.120s\n", cancel_resp);
         }
-        /* Return -2 to distinguish RTSP failure from pairing failure (-1).
-         * Pairing was already successful so g_is_paired should stay set. */
+        /* Return -3 to distinguish RTSP failure from user cancel (-2) and
+         * pairing failure (-1).  Pairing was already successful so
+         * g_is_paired should stay set; -3 is retryable in main.c. */
         stream_connect_stop();
-        return -2;
+        return -3;
     }
 
     stream_connect_stop();

@@ -234,6 +234,13 @@ host_select_loop:
         }
     }
     diag_log_write("UI", "TRANSITION connect_done ret=%d t=%u\n", ret, sceKernelGetSystemTimeLow() / 1000);
+    /* Persist pairing as soon as it succeeds — even if RTSP/launch failed
+     * later (ret == -3).  Without this, restarting the app after a partial
+     * failure would lose the pairing and prompt a new PIN. */
+    if (g_is_paired) {
+        const char *ph = network_get_paired_host();
+        if (ph && ph[0]) { config_add_paired_host(&g_psp_config, ph); }
+    }
     if (ret < 0) {
         LOG("[STEP 4] Connection failed (%d)\n", ret);
         network_me_shutdown();
@@ -243,10 +250,6 @@ host_select_loop:
         skip_rescan = 1;  /* Keep cached host list — user can Square to rescan */
         goto host_select_loop;
     }
-    /* Don't clear host list — keep cached for quick relaunch after
-     * stream exit.  Hosts are refreshed on settings→host or Square. */
-    const char *ph = network_get_paired_host();
-    if (ph && ph[0]) { config_add_paired_host(&g_psp_config, ph); }
 
     extern unsigned char g_remote_input_key[16];
     stream_crypto_init(g_remote_input_key);

@@ -193,7 +193,11 @@ int loadConfig(PspConfig *config)
     /* Try to open config file */
     fd = sceIoOpen(CONFIG_FILE_PATH, PSP_O_RDONLY, 0777);
     if (fd < 0) {
-        /* File doesn't exist - return defaults */
+        /* File doesn't exist - return defaults.
+         * Still remember the default config so that config_add_manual_host
+         * (which saves g_last_loaded_config) preserves any pairing data
+         * that might be added later in the same session. */
+        rememberLoadedConfig(config);
         return -1;
     }
     
