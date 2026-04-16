@@ -1,16 +1,12 @@
 # Known Issues
 
-_PSP Moonlight v0.2.2-beta_
+_PSP Moonlight v0.2.3-beta_
 
-This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in v0.2.2-beta.
+This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in the current release.
 
 ---
 
 ## Critical / Active Blockers
-
-### Deblocking filter disabled
-**Status:** Compile-time disabled (`PSP_SKIP_DEBLOCKING`)  
-**Impact:** At bitrates below ~500 kbps, decoded frames show visible 8×8 block boundaries. Deblocking is disabled via compile flag for ~15% decode speed improvement. The H.264 spec treats deblocking as optional for Baseline Profile. Workaround: use ≥500 kbps.
 
 ### No display double-buffering
 **Status:** Not implemented  
@@ -64,6 +60,25 @@ Custom resolutions always mapped to `resolutionIndex=0` (480×272) on INI reload
 
 ### Decode stall on P-frame backlog — Fixed in v0.2.2-beta
 When packet loss caused >256 packets to queue, decoder wasted time on stale P-frames with corrupted references. Now scans forward to next IDR/SPS/PPS instead of decoding sequentially.
+
+---
+
+## Fixed (included in v0.2.3-beta)
+
+### Deblocking filter re-enabled — Fixed in v0.2.3-beta
+Deblocking was compile-time disabled (`PSP_SKIP_DEBLOCKING`) for ~15% decode speed improvement. At sub-native resolutions (256×144, 368×208) the CPU cost is only ~2–3ms/frame, which is acceptable. Re-enabled by removing the compile flag. Removes blocking artifacts at low bitrates.
+
+### Stale pairing data on 401 response — Fixed in v0.2.3-beta
+Three separate 401-response handlers now remove the specific host IP from the paired array (shift + decrement) instead of just clearing a single field. Prevents stale pairing data for other hosts in the multi-host pairing system.
+
+### Quit+relaunch slow (two loading screens) — Fixed in v0.2.3-beta
+Quitting a stream and relaunching the same game took ~15–24s (host re-probe + Resume/Quit popup + cancel + 6s wait + launch). Fixed: host list is cached across stream exits (skip_rescan=1), and same-app relaunch auto-resumes without the popup.
+
+### Offline hosts showing "Unpaired" — Fixed in v0.2.3-beta
+Offline hosts displayed "Unpaired" in the host list, which was misleading since their pairing status can't be verified. Paired/Unpaired label now hidden for offline hosts (status 0).
+
+### Back from game list error triggers full re-discovery — Fixed in v0.2.3-beta
+Pressing back from "Failed to Load Games" triggered a full host re-discovery (3–8s rescan). Now returns instantly to the cached host list. Square button still available for manual rescan.
 
 ---
 

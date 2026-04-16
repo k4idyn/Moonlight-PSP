@@ -99,8 +99,9 @@ typedef struct {
     int resolutionIndex;        /* Index into RESOLUTION_OPTIONS */
     int fpsIndex;               /* Index into FPS_OPTIONS */
 
-    /* Pairing persistence */
-    char pairedHostIp[16];      /* IP of last successfully paired host */
+    /* Pairing persistence — up to 8 remembered paired hosts */
+    char pairedHostIps[8][16];  /* IPs of successfully paired hosts */
+    int  pairedHostCount;       /* Number of valid entries (0..8) */
 
     /* Network: local UDP bind address.
      * Leave empty (all zeros) for real PSP hardware — sockets bind INADDR_ANY.

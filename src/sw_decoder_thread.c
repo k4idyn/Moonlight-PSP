@@ -51,6 +51,10 @@ extern void oh264_pipeline_abandon(void);
 
 /* Forward declaration — lightweight CABAC detection */
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len);
+static int s_pps_checked = 0;  /* PPS scan state — reset in init for new streams */
+
+/* CABAC dialog gate — main thread sets to 1 while dialog is on-screen */
+volatile int g_cabac_dialog_active = 0;
 
 /* ============================================================================
  * Constants
@@ -81,6 +85,9 @@ static PacketRingBuffer *g_packet_rb = NULL;
 
 /* Timestamp of last decoded frame — read by main loop for latency display */
 volatile u32 g_last_frame_decode_us = 0;
+
+/* Per-frame decode duration (µs) — smoothed EMA for HUD display */
+volatile u32 g_decode_time_us = 0;
 
 /* Watchdog: set to sceKernelGetSystemTimeLow() before oh264_pipeline_decode_frame(),
  * cleared to 0 after it returns.  Main loop checks: if non-zero and elapsed > 3s,
@@ -267,6 +274,12 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         }
     }
 
+    /* If CABAC dialog is on-screen, skip decoding entirely — the user
+     * hasn't confirmed yet, so don't run the decoder/produce frames. */
+    if (g_cabac_dialog_active) {
+        return;
+    }
+
     u8 *rgba_out = NULL;
     g_decode_active_us = sceKernelGetSystemTimeLow();
     int ret = oh264_pipeline_decode_frame(nal_data, nal_len, &rgba_out);
@@ -282,6 +295,15 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
 
         u64 t_cb_done;
         sceRtcGetCurrentTick(&t_cb_done);
+
+        /* Update per-frame decode time (EMA α=0.2 for smoothing) */
+        {
+            u32 dec_us_raw = (u32)(t_cb_done - t_cb_entry);
+            static float s_dec_ema = 0.0f;
+            if (s_dec_ema < 1.0f) s_dec_ema = (float)dec_us_raw;
+            else s_dec_ema = s_dec_ema * 0.8f + (float)dec_us_raw * 0.2f;
+            g_decode_time_us = (u32)(s_dec_ema + 0.5f);
+        }
 
         s_perf_count++;
         if (s_prev_done && (s_perf_count % 60) == 0) {
@@ -488,6 +510,8 @@ static int sw_decoder_thread(SceSize args, void *argp)
 int sw_decoder_thread_init(FrameRingBuffer *rb)
 {
     g_packet_rb = &g_shared.packet_ring;
+    g_cabac_detected = 0;  /* Reset for new stream */
+    s_pps_checked = 0;     /* Allow re-detection on new stream */
 
     dec_log("Init: Software H.264 decode (CAVLC+VFPU dual-core)\n");
 
@@ -781,7 +805,6 @@ static unsigned int nal_read_ue(const u8 *data, int total_bits, int *bit_pos)
 
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len)
 {
-    static int s_pps_checked = 0;
     if (s_pps_checked || g_cabac_detected) return;
 
     /* Scan for PPS NAL units (start code + NAL type 8) */

@@ -1033,7 +1033,15 @@ static int sunshine_launch_session(int target_appid)
             pair_log("[SERVERINFO] 401 — clearing stale pairing\n");
             g_is_paired = 0;
             g_last_paired_host[0] = '\0';
-            g_psp_config.pairedHostIp[0] = '\0';
+            /* Remove current target from paired list */
+            { int _pi; for (_pi = 0; _pi < g_psp_config.pairedHostCount; _pi++) {
+                if (strcmp(g_psp_config.pairedHostIps[_pi], g_sunshine_host) == 0) {
+                    int _pj; for (_pj = _pi; _pj < g_psp_config.pairedHostCount - 1; _pj++)
+                        memcpy(g_psp_config.pairedHostIps[_pj], g_psp_config.pairedHostIps[_pj+1], 16);
+                    memset(g_psp_config.pairedHostIps[g_psp_config.pairedHostCount - 1], 0, 16);
+                    g_psp_config.pairedHostCount--; break;
+                }
+            }}
             saveConfig(&g_psp_config);
             return -401;
         }
@@ -1086,25 +1094,37 @@ static int sunshine_launch_session(int target_appid)
              rikeyid, (unsigned int)rikeyid, g_av_ri_key_id, g_av_ri_key_id, (void *)&g_av_ri_key_id);
 
     /* ------------------------------------------------------------------
-     * Step C: If an app is already running, show Resume / Quit popup.
-     * Stop the stream_connect render thread first to avoid two threads
-     * calling ui_begin_frame simultaneously (causes GU corruption).
+     * Step C: If an app is already running, resume or quit+relaunch.
+     * Same app → auto-resume (instant relaunch, no popup).
+     * Different app → show Resume / Quit popup.
      * ------------------------------------------------------------------ */
     if (current_game > 0) {
-        pair_log("[LAUNCH] existing session detected (currentgame=%d)\n",
-                 current_game);
+        pair_log("[LAUNCH] existing session detected (currentgame=%d, target=%d)\n",
+                 current_game, target_appid);
 
-        stream_connect_stop();
+        int user_choice;
 
-        int user_choice = prompt_existing_session_action();
+        if (current_game == target_appid) {
+            /* Same app — auto-resume without popup for instant relaunch.
+             * Loading UI thread keeps running with the RTSP phase text. */
+            pair_log("[LAUNCH] same app, auto-resuming (skipping popup)\n");
+            user_choice = 0;
+        } else {
+            /* Different app — ask user whether to quit current + launch new.
+             * Stop the stream_connect render thread first to avoid two threads
+             * calling ui_begin_frame simultaneously (causes GU corruption). */
+            stream_connect_stop();
 
-        if (user_choice == -1) {
-            /* User cancelled — back to host/game menu */
-            pair_log("[LAUNCH] user cancelled session action\n");
-            return -1;
+            user_choice = prompt_existing_session_action();
+
+            if (user_choice == -1) {
+                /* User cancelled — back to host/game menu */
+                pair_log("[LAUNCH] user cancelled session action\n");
+                return -1;
+            }
+
+            stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
         }
-
-        stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
 
         if (user_choice == 0) {
             /* Resume existing session — send /resume instead of /launch */
@@ -1166,7 +1186,14 @@ static int sunshine_launch_session(int target_appid)
                     pair_log("[CANCEL] 401 — clearing stale pairing\n");
                     g_is_paired = 0;
                     g_last_paired_host[0] = '\0';
-                    g_psp_config.pairedHostIp[0] = '\0';
+                    { int _pi; for (_pi = 0; _pi < g_psp_config.pairedHostCount; _pi++) {
+                        if (strcmp(g_psp_config.pairedHostIps[_pi], g_sunshine_host) == 0) {
+                            int _pj; for (_pj = _pi; _pj < g_psp_config.pairedHostCount - 1; _pj++)
+                                memcpy(g_psp_config.pairedHostIps[_pj], g_psp_config.pairedHostIps[_pj+1], 16);
+                            memset(g_psp_config.pairedHostIps[g_psp_config.pairedHostCount - 1], 0, 16);
+                            g_psp_config.pairedHostCount--; break;
+                        }
+                    }}
                     saveConfig(&g_psp_config);
                     return -401;
                 }
@@ -1256,7 +1283,14 @@ static int sunshine_launch_session(int target_appid)
                 pair_log("[LAUNCH] 401 — clearing stale pairing\n");
                 g_is_paired = 0;
                 g_last_paired_host[0] = '\0';
-                g_psp_config.pairedHostIp[0] = '\0';
+                { int _pi; for (_pi = 0; _pi < g_psp_config.pairedHostCount; _pi++) {
+                    if (strcmp(g_psp_config.pairedHostIps[_pi], g_sunshine_host) == 0) {
+                        int _pj; for (_pj = _pi; _pj < g_psp_config.pairedHostCount - 1; _pj++)
+                            memcpy(g_psp_config.pairedHostIps[_pj], g_psp_config.pairedHostIps[_pj+1], 16);
+                        memset(g_psp_config.pairedHostIps[g_psp_config.pairedHostCount - 1], 0, 16);
+                        g_psp_config.pairedHostCount--; break;
+                    }
+                }}
                 saveConfig(&g_psp_config);
                 return -401;
             }

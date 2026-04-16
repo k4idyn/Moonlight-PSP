@@ -142,7 +142,7 @@ void configSetDefaults(PspConfig *config)
     config->width = DEFAULT_WIDTH;           /* 368 — Quality preset (math optimum) */
     config->height = DEFAULT_HEIGHT;         /* 208 — ~16:9, mod-16 aligned */
     config->fps = DEFAULT_FPS;               /* 30 FPS */
-    config->bitrate = DEFAULT_BITRATE;       /* 500 kbps flat (proven safe on 802.11b) */
+    config->bitrate = DEFAULT_BITRATE;       /* 384 kbps default */
     config->packetSize = DEFAULT_PACKET_SIZE;
     config->streamingRemotely = 2;           /* STREAM_CFG_AUTO */
     config->audioConfiguration = 0x0000CA02; /* Stereo */
@@ -164,7 +164,8 @@ void configSetDefaults(PspConfig *config)
     config->disableEncryption = 0;           /* Encryption on by default (safe default) */
 
     /* Pairing persistence */
-    memset(config->pairedHostIp, 0, sizeof(config->pairedHostIp));
+    memset(config->pairedHostIps, 0, sizeof(config->pairedHostIps));
+    config->pairedHostCount = 0;
 
     /* Network bind IP (empty = INADDR_ANY, for real hardware) */
     memset(config->localBindIp, 0, sizeof(config->localBindIp));
@@ -285,7 +286,7 @@ int loadConfig(PspConfig *config)
             if (parseIntValue(trimmed, &value) == 0) {
                 /* Enforce 802.11b ceiling: max 4000 kbps */
                 if (value > MAX_BITRATE) value = MAX_BITRATE;
-                if (value < 100)         value = 100;
+                if (value < 32)          value = 32;
                 config->bitrate = value;
                 fileLoaded = 1;
             }
@@ -327,10 +328,39 @@ int loadConfig(PspConfig *config)
                 fileLoaded = 1;
             }
         }
+        else if (strncmp(trimmed, "debugLog", 8) == 0) {
+            if (parseIntValue(trimmed, &value) == 0) {
+                diag_log_set_debug(value);
+                fileLoaded = 1;
+            }
+        }
         else if (strncmp(trimmed, "paired_host_ip", 14) == 0) {
-            parseStringValue(trimmed, config->pairedHostIp, sizeof(config->pairedHostIp));
+            /* Legacy single paired host — migrate to slot 0 if array empty */
+            {
+                char legacy_ip[16] = {0};
+                parseStringValue(trimmed, legacy_ip, sizeof(legacy_ip));
+                if (legacy_ip[0] && config->pairedHostCount == 0) {
+                    strncpy(config->pairedHostIps[0], legacy_ip, 15);
+                    config->pairedHostIps[0][15] = '\0';
+                    config->pairedHostCount = 1;
+                    diag_log_write("CONFIG", "Migrated legacy paired host: %s\n", legacy_ip);
+                }
+            }
             fileLoaded = 1;
-            diag_log_write("CONFIG", "Loaded paired host: %s\n", config->pairedHostIp);
+        }
+        else if (strncmp(trimmed, "paired_host_", 12) == 0) {
+            /* New format: paired_host_0 = ip, paired_host_1 = ip, ... */
+            int slot = -1;
+            if (sscanf(trimmed, "paired_host_%d", &slot) == 1 &&
+                slot >= 0 && slot < 8) {
+                parseStringValue(trimmed, config->pairedHostIps[slot],
+                                 sizeof(config->pairedHostIps[slot]));
+                if (slot + 1 > config->pairedHostCount)
+                    config->pairedHostCount = slot + 1;
+                diag_log_write("CONFIG", "Loaded paired host[%d]: %s\n",
+                               slot, config->pairedHostIps[slot]);
+            }
+            fileLoaded = 1;
         }
         else if (strncmp(trimmed, "local_bind_ip", 13) == 0) {
             parseStringValue(trimmed, config->localBindIp, sizeof(config->localBindIp));
@@ -434,6 +464,11 @@ int saveConfig(const PspConfig *config)
     writeString(fd, line);
     sprintf(line, "disableEncryption = %d\n", config->disableEncryption);
     writeString(fd, line);
+    {
+        extern int g_debug_logging;
+        sprintf(line, "debugLog = %d\n", g_debug_logging);
+        writeString(fd, line);
+    }
 
     writeString(fd, "\n[hosts]\n");
     for (index = 0; index < g_manual_host_count; index++) {
@@ -445,8 +480,15 @@ int saveConfig(const PspConfig *config)
     }
 
     writeString(fd, "\n[pairing]\n");
-    sprintf(line, "paired_host_ip = %s\n", config->pairedHostIp);
-    writeString(fd, line);
+    {
+        int pi;
+        for (pi = 0; pi < config->pairedHostCount && pi < 8; pi++) {
+            if (config->pairedHostIps[pi][0]) {
+                sprintf(line, "paired_host_%d = %s\n", pi, config->pairedHostIps[pi]);
+                writeString(fd, line);
+            }
+        }
+    }
 
     writeString(fd, "\n[network]\n");
     writeString(fd, "; local_bind_ip: leave empty for real PSP hardware (uses INADDR_ANY).\n");
@@ -518,6 +560,70 @@ int config_add_manual_host(const char *ip, const char *mac)
     return saveConfig(&config_to_save);
 }
 
+/* -------------------------------------------------------------------------
+ * config_is_host_paired - Check if an IP is in the paired-hosts list.
+ * ------------------------------------------------------------------------- */
+int config_is_host_paired(const PspConfig *config, const char *ip)
+{
+    int i;
+    if (!config || !ip || !ip[0]) return 0;
+    for (i = 0; i < config->pairedHostCount && i < 8; i++) {
+        if (config->pairedHostIps[i][0] &&
+            strcmp(config->pairedHostIps[i], ip) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * config_add_paired_host - Add an IP to the paired list (MRU at slot 0).
+ *
+ * Deduplicates: if already present, moves it to slot 0.
+ * If full (8 entries), the oldest entry (slot 7) is evicted.
+ * Persists to config.ini.
+ * ------------------------------------------------------------------------- */
+int config_add_paired_host(PspConfig *config, const char *ip)
+{
+    int i, existing;
+
+    if (!config || !ip || !ip[0]) return -1;
+
+    /* Find existing slot (if any) */
+    existing = -1;
+    for (i = 0; i < config->pairedHostCount && i < 8; i++) {
+        if (strcmp(config->pairedHostIps[i], ip) == 0) {
+            existing = i;
+            break;
+        }
+    }
+
+    if (existing == 0) {
+        /* Already MRU — nothing to do */
+        return saveConfig(config);
+    }
+
+    if (existing > 0) {
+        /* Shift entries [0..existing-1] right by 1, place ip at slot 0 */
+        for (i = existing; i > 0; i--)
+            memcpy(config->pairedHostIps[i], config->pairedHostIps[i - 1], 16);
+    } else {
+        /* New entry — shift all right, cap at 8 */
+        int count = config->pairedHostCount < 8 ? config->pairedHostCount : 7;
+        for (i = count; i > 0; i--)
+            memcpy(config->pairedHostIps[i], config->pairedHostIps[i - 1], 16);
+        if (config->pairedHostCount < 8)
+            config->pairedHostCount++;
+    }
+
+    /* Place at slot 0 (MRU) */
+    memset(config->pairedHostIps[0], 0, 16);
+    strncpy(config->pairedHostIps[0], ip, 15);
+
+    diag_log_write("CONFIG", "Added paired host: %s (count=%d)\n",
+                   ip, config->pairedHostCount);
+
+    return saveConfig(config);
+}
 int config_delete_manual_host(const char *ip)
 {
     int index;

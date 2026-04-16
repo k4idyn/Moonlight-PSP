@@ -1,6 +1,6 @@
 # Building PSP Moonlight
 
-_v0.2.2-beta_
+_v0.2.3-beta_
 
 This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
 

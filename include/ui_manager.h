@@ -303,6 +303,11 @@ float ui_draw_text_large(float x, float y, u32 color, const char *text);
 float ui_draw_text_small(float x, float y, u32 color, const char *text);
 
 /**
+ * ui_draw_text_scaled - Render text at a caller-specified scale.
+ */
+float ui_draw_text_scaled(float x, float y, u32 color, const char *text, float scale);
+
+/**
  * ui_draw_pin_large - Render a short string (e.g. 4-digit PIN) at 2× scale,
  * horizontally centred on center_x (uses INTRAFONT_ALIGN_CENTER internally).
  *

@@ -1418,7 +1418,7 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             }
         }
 
-        /* Periodic IDR refresh: every 60 seconds during normal streaming,
+        /* Periodic IDR refresh: every 5 seconds during normal streaming,
          * force-request an IDR to reset the H.264 reference chain.
          * At low bitrate on 802.11b WiFi, quantization errors accumulate
          * in P-frame references (especially without HEVC intra-refresh).
@@ -1428,12 +1428,11 @@ static int ctrl_ping_thread(SceSize args, void *argp)
          * Must clear g_idr_fully_decoded before requesting, otherwise
          * the request is silently suppressed by control_stream_request_idr().
          *
-         * Reduced from 10s to 60s to prevent IDR flood on lossy WiFi.
-         * Frequent IDR requests cause Sunshine to produce large keyframes
-         * that are more vulnerable to partial loss, creating a vicious
-         * cycle: lost IDR → request another → lost again → server gives up. */
-        if (count > 0 && (count % 600) == 0 && g_idr_fully_decoded) {
-            ctrl_log("[CTRL PING] Periodic IDR refresh (60s)\n");
+         * Reduced from 60s to 5s for fast-motion gaming: rapid scene
+         * changes cause P-frame drift to accumulate faster, and the
+         * IDR backoff cap (now 1s) prevents flooding. */
+        if (count > 0 && (count % 50) == 0 && g_idr_fully_decoded) {
+            ctrl_log("[CTRL PING] Periodic IDR refresh (5s)\n");
             g_idr_fully_decoded = 0;
             control_stream_request_idr();
         }
@@ -1656,12 +1655,14 @@ int control_stream_request_idr(void)
         s_last_idr_tick = now;
         s_idr_count++;
 
-        /* Exponential backoff: double interval after each send, cap at 4s */
+        /* Exponential backoff: double interval after each send, cap at 500ms.
+         * Reduced from 1s — log analysis shows corruption visible for ~6s
+         * with 1s cap; 500ms cap clears ghosting artifacts in ~3s. */
         if (s_idr_count >= 3) {
             u32 prev_backoff = s_idr_backoff_us;
             s_idr_backoff_us *= 2;
-            if (s_idr_backoff_us > 4000000)
-                s_idr_backoff_us = 4000000;
+            if (s_idr_backoff_us > 500000)
+                s_idr_backoff_us = 500000;
             ctrl_log("[IDR BACKOFF] %ums -> %ums (count=%d)\n",
                      prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
         }

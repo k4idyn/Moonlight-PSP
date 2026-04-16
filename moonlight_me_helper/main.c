@@ -1,5 +1,6 @@
 #include <pspsdk.h>
 #include <pspkernel.h>
+#include <pspsyscon.h>
 #include <string.h>
 
 
@@ -160,6 +161,14 @@ void KillME(volatile struct me_struct *mei)
 	pspSdkSetK1(k1);
 }
 
+
+int DisableMsLED(void)
+{
+	unsigned int k1 = pspSdkSetK1(0);
+	int ret = sceSysconCtrlLED(0, 0);  /* LED 0 = Memory Stick, 0 = off */
+	pspSdkSetK1(k1);
+	return ret;
+}
 
 int module_start(SceSize args, void *argp)
 {

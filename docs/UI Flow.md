@@ -1,6 +1,6 @@
 # UI Flow Reference
 
-This document describes the actual implemented UI flow of PSP Moonlight v0.2.2-beta. It replaces the original development spec, which described intended behavior that was sometimes implemented differently or not yet implemented at all.
+This document describes the actual implemented UI flow of PSP Moonlight v0.2.3-beta. It replaces the original development spec, which described intended behavior that was sometimes implemented differently or not yet implemented at all.
 
 All screen coordinates are in native PSP resolution: 480×272.
 
@@ -10,16 +10,17 @@ All screen coordinates are in native PSP resolution: 480×272.
 
 ```
 Startup
-  └─▶ WiFi Setup (netconf_ui.c)
-        └─▶ Host Discovery (host_discovery.c)
-              ├─▶ Pairing Screen (pairing.c)
-              │     └─▶ Host Discovery (on success)
-              └─▶ Game Library (game_grid_ui.cpp)
-                    ├─▶ Settings Menu (settings_menu.c)
-                    └─▶ Connecting Screen (stream_connect_ui.c)
-                          └─▶ Active Stream
-                                └─▶ HUD Overlay (hud.c)
-                                      └─▶ Game Library (on quit)
+  └─▶ Settings Menu (settings_menu.c)
+        └─▶ WiFi Setup (netconf_ui.c) [skipped if already connected]
+              └─▶ Host Discovery (host_discovery.c)
+                    ├─▶ Back (○) → Settings Menu
+                    ├─▶ Pairing Screen (pairing.c)
+                    │     └─▶ Host Discovery (on success)
+                    └─▶ Game Library (game_grid_ui.cpp)
+                          ├─▶ Back (○) → Host Discovery (cached, instant)
+                          └─▶ Connecting Screen (stream_connect_ui.c)
+                                └─▶ Active Stream
+                                      └─▶ Host Discovery (on quit, cached)
 ```
 
 ---
@@ -28,7 +29,7 @@ Startup
 
 **Source file:** `src/netconf_ui.c`
 
-On startup, the app immediately invokes `sceUtilityNetconfInitStart` to open the PSP's native Network Configuration dialog. This is a firmware-level UI — the app suspends its own render loop while it is active.
+On startup, the app first shows the Settings Menu. After exiting settings, it checks `sceNetApctlGetState()`. If WiFi is already connected (state 4), the netconf dialog is skipped entirely. Otherwise, the app invokes `sceUtilityNetconfInitStart` to open the PSP's native Network Configuration dialog. This is a firmware-level UI — the app suspends its own render loop while it is active.
 
 The app polls `sceNetApctlGetState()` in a loop. Once state reaches `PSP_NET_APCTL_STATE_IP_ACQUIRED`, the dialog is dismissed and the app transitions to Host Discovery. If the user cancels or the connection times out (60 seconds), a non-fatal error is displayed and the app exits cleanly.
 
@@ -42,10 +43,13 @@ No custom UI is drawn during this screen — it uses the PSP firmware's built-in
 
 **Source file:** `src/host_discovery.c`
 
-Displays a scrollable list of known hosts. Each entry shows hostname, IP address, and online/offline status. The list is populated by:
+Displays a smooth-scrolling list of known hosts. Each entry is a rounded-rectangle card showing hostname + IP on the left and Online/Offline status + Paired/Unpaired label on the right. The selected card grows 2% (focus pop) and gains an extra shadow offset for hover lift. Paired/Unpaired is only shown for online hosts.
 
-1. Manual hosts loaded from `config.ini` on startup
-2. Network scan results — HTTP probes on port 47989 against known IPs
+The list is populated by:
+
+1. Manual hosts loaded from `config.ini` on startup (with paired status from config)
+2. mDNS multicast discovery (`_nvstream._tcp.local.`) — near-instant LAN discovery
+3. HTTP probes on port 47989 against known IPs (3s connect + 2s recv timeout per host)
 
 Auto-selection is disabled. The user navigates with D-pad Up/Down.
 
@@ -54,10 +58,10 @@ Auto-selection is disabled. The user navigates with D-pad Up/Down.
 | Button | Action |
 |--------|--------|
 | Cross | Select host (→ Pairing or Game Library depending on paired status) |
-| Square | Rescan LAN |
+| Circle | Back to Settings Menu |
+| Square | Rescan LAN (mDNS + HTTP re-probe). Long-hold: full /24 subnet scan |
 | Triangle | Add host manually via PSP OSK (numeric/IP input) |
 | Select | Send Wake-on-LAN to the selected offline host (if MAC is stored) |
-| Square (held on entry) | Open host context menu: Wake on LAN / Remove Host / Unpair |
 
 **Manual host entry:** Pressing Triangle opens `sceUtilityOskInitStart` in numeric/IP mode. The entered IP is validated and saved to `config.ini`.
 
@@ -109,8 +113,8 @@ Grid layout: 3 columns × N rows. `ROWS_VISIBLE` rows are shown at a time. Scrol
 | D-pad | Navigate grid |
 | Cross | Launch selected game (→ Connecting screen) |
 | Start | Launch selected game |
-| Triangle | Open Settings Menu |
-| Select | Return to Host Discovery |
+| Circle | Back to Host Discovery (cached, instant — no re-probe) |
+| Square | Refresh game library |
 
 **Scroll indicator:** Bottom-right corner shows "Row N/M".
 
@@ -136,7 +140,7 @@ A vertical list of 5 configurable settings. D-pad Up/Down navigates rows; D-pad 
 | FPS | 15, 20, 30, 60 | 15 |
 | Control Mode | Xbox, Browser | Xbox |
 | Theme | Ocean Depths, Sunset Blvd, Forest Canopy, Modern Minimal, Golden Hour, Arctic Frost, Desert Rose, Tech Innovate, Botanical, Midnight Gal. | Ocean Depths |
-| Bitrate | 300–max kbps, 100 kbps steps | 500 kbps |
+| Bitrate | Codec-aligned presets (64–2560 kbps) | 384 kbps |
 
 **Resolution notes:**
 - "480×272 (PSP Native)" streams at the PSP's native display resolution. This is the target for full-detail streaming.

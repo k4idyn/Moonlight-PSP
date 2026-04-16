@@ -239,7 +239,8 @@ extern "C" int oh264_pipeline_init(void)
      * Since we build OpenH264 from source for PSP (DISABLE_DECODER_MT,
      * single-threaded), these settings maximize decode-to-display speed:
      *   - VIDEO_BITSTREAM_AVC: standard Annex-B NAL input (no container overhead)
-     *   - ERROR_CON_SLICE_COPY: copy previous slice on error (fast, no re-decode)
+     *   - ERROR_CON_FRAME_COPY_CROSS_IDR: on error, copy entire previous frame
+     *     even across IDR boundaries — keeps picture stable on packet loss
      *   - bParseOnly=false: full decode, immediate output
      *   - NUM_OF_THREADS=0: explicit single-thread (matches PSP hardware)
      *   - TRACE_LEVEL=0: disable all internal logging (saves ~200µs/frame)
@@ -247,7 +248,7 @@ extern "C" int oh264_pipeline_init(void)
     SDecodingParam param;
     memset(&param, 0, sizeof(param));
     param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    param.eEcActiveIdc = ERROR_CON_SLICE_COPY;
+    param.eEcActiveIdc = ERROR_CON_FRAME_COPY_CROSS_IDR;
     param.bParseOnly   = false;
 
     long iret = g_decoder->Initialize(&param);
@@ -333,6 +334,9 @@ extern "C" int oh264_pipeline_init(void)
         } else {
             diag_log_write("OH264", "ME helper load failed: 0x%08X", (unsigned)me_prx_id);
         }
+#ifdef RETAIL_BUILD
+        DisableMsLED();
+#endif
     }
 
     g_me_ctrl_cached = (volatile struct me_struct *)memalign(64, sizeof(struct me_struct));

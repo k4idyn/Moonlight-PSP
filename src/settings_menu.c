@@ -70,10 +70,6 @@ const char * const FPS_OPTIONS[5] = {
 };
 const int FPS_VALUES[5] = { 15, 20, 30, 60, -1 };
 
-/* Useless-box auto-coupling: when resolution changes, snap to these */
-const int RESOLUTION_OPTIMAL_FPS_IDX[3] = { 0, 2, 0 };  /* 15fps, 30fps, 15fps */
-const int RESOLUTION_OPTIMAL_BITRATE[3] = { 500, 500, 500 };  /* 500kbps flat */
-
 /* Forward declaration needed for fps_update_custom and resolution_update_custom */
 static MenuState g_menu_state;
 
@@ -130,8 +126,26 @@ const char * const THEME_OPTIONS[10] = {
 #define MENU_ITEM_BITRATE       6
 #define MENU_ITEM_COUNT         7
 
-#define BITRATE_STEP           100
-#define BITRATE_MIN            300
+#define BITRATE_MIN             32
+
+/* Bitrate presets: multiples of 64 for clean codec alignment.
+ * Increasing step sizes at higher bitrates (64→128→256→512). */
+static const int BITRATE_PRESETS[] = {
+    64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048, 2560
+};
+#define BITRATE_PRESET_COUNT  (int)(sizeof(BITRATE_PRESETS) / sizeof(BITRATE_PRESETS[0]))
+
+static int bitrate_preset_index(int bitrate)
+{
+    int i, best = 0, best_diff = 999999;
+    for (i = 0; i < BITRATE_PRESET_COUNT; i++) {
+        int diff = bitrate > BITRATE_PRESETS[i]
+                 ? bitrate - BITRATE_PRESETS[i]
+                 : BITRATE_PRESETS[i] - bitrate;
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
 
 /*--------------------------------------------------------------------------
  * Local State - g_menu_state declared earlier for forward reference
@@ -149,31 +163,6 @@ static int clamp_index(int value, int min_value, int max_value)
         return max_value;
     }
     return value;
-}
-
-/*--------------------------------------------------------------------------
- * Useless-box coupling: auto-snap FPS + bitrate when resolution changes
- *
- * Like a "useless box" — flip one switch and the mechanism immediately
- * flips the others to maintain mathematical optimality.  The user sees
- * FPS and bitrate update instantly in the UI when cycling resolution.
- *
- * Bitrate formula: 0.35 bpp × W × H × FPS / 1000 (kbps)
- *--------------------------------------------------------------------------*/
-static void autocouple_from_resolution(void)
-{
-    int ri = g_menu_state.resolutionIndex;
-    g_menu_state.fpsIndex = RESOLUTION_OPTIMAL_FPS_IDX[ri];
-    g_menu_state.bitrate  = RESOLUTION_OPTIMAL_BITRATE[ri];
-}
-
-/* Recompute bitrate when FPS changes (keep 0.35 bpp target) */
-static void autocouple_bitrate_from_fps(void)
-{
-    /* Flat 500kbps for all presets — proven safe on 802.11b.
-     * Higher bitrate scales decode cost ~linearly (measured:
-     * 804kbps → 637 µs/Kpx vs 385 µs/Kpx at 500kbps). */
-    g_menu_state.bitrate = 500;
 }
 
 /*--------------------------------------------------------------------------
@@ -216,25 +205,26 @@ static void draw_setting_row(int row_idx, const char *label,
     card.label[0] = '\0';
     ui_draw_button(&card);
 
-    /* Label on the left */
-    ui_draw_text((float)(rx + 10),
-                 (float)(ry + item_h / 2 + 5),
+    /* Label on the left — selected row text is 2px taller */
+    float label_scale = is_selected ? 0.50f : 0.45f;
+    ui_draw_text_scaled((float)(rx + 10),
+                 (float)(ry + item_h / 2 + 4),
                  is_selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT,
-                 label);
+                 label, label_scale);
 
     /* Value selector: toggle items get < > arrows; action items (Button Map)
      * just highlight the label in focus colour — no left/right toggle arrows. */
     int vx = rx + item_w - VAL_W - 8;
     if (is_selected && row_idx != MENU_ITEM_BUTTON_MAP) {
-        float vy = (float)(ry + item_h / 2 + 5);
-        float x2 = ui_draw_text((float)vx, vy, UI_COL_ACCENT, "< ");
-        x2 = ui_draw_text(x2, vy, UI_COL_TEXT_FOCUS, value);
-        ui_draw_text(x2, vy, UI_COL_ACCENT, " >");
+        float vy = (float)(ry + item_h / 2 + 4);
+        float x2 = ui_draw_text_scaled((float)vx, vy, UI_COL_ACCENT, "< ", label_scale);
+        x2 = ui_draw_text_scaled(x2, vy, UI_COL_TEXT_FOCUS, value, label_scale);
+        ui_draw_text_scaled(x2, vy, UI_COL_ACCENT, " >", label_scale);
     } else {
-        ui_draw_text((float)(vx + 16),
-                     (float)(ry + item_h / 2 + 5),
+        ui_draw_text_scaled((float)(vx + 16),
+                     (float)(ry + item_h / 2 + 4),
                      is_selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT_DIM,
-                     value);
+                     value, label_scale);
     }
 }
 
@@ -333,11 +323,13 @@ void settings_menu_draw(const PspConfig *config)
     /* Top header bar — drawn AFTER rows so it always sits on top */
     ui_draw_header("Moonlight Settings");
 
-    /* Footer hint — context-sensitive for Custom resolution */
-    if (g_menu_state.currentSelection == MENU_ITEM_RESOLUTION &&
-        g_menu_state.resolutionIndex == RESOLUTION_CUSTOM_INDEX) {
+    /* Footer hint — context-sensitive for Custom resolution/fps */
+    if ((g_menu_state.currentSelection == MENU_ITEM_RESOLUTION &&
+         g_menu_state.resolutionIndex == RESOLUTION_CUSTOM_INDEX) ||
+        (g_menu_state.currentSelection == MENU_ITEM_FPS &&
+         g_menu_state.fpsIndex == FPS_CUSTOM_INDEX)) {
         ui_draw_footer_hint(
-            "{LF}/{RF}: Change  {X}: Edit  {ST}: Save  {TR}: Skip");
+            "{UP}/{DN}: Navigate  {LF}/{RF}: Change  {X}: Edit  {ST}: Save  {TR}: Skip");
     } else {
         ui_draw_footer_hint(
             "{UP}/{DN}: Navigate  {LF}/{RF}: Change  {X}: Save  {TR}: Skip");
@@ -485,7 +477,6 @@ int settings_menu_run(PspConfig *config)
                     if (g_menu_state.resolutionIndex < 0) {
                         g_menu_state.resolutionIndex = RESOLUTION_COUNT - 1;
                     }
-                    autocouple_from_resolution(); /* useless-box: snap FPS + bitrate */
                     break;
                 case MENU_ITEM_FPS:
                     g_menu_state.fpsIndex--;
@@ -493,7 +484,6 @@ int settings_menu_run(PspConfig *config)
                         g_menu_state.fpsIndex = FPS_COUNT - 1;
                     }
                     if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX && g_menu_state.customFpsValue == 0) g_menu_state.customFpsValue = 24;
-                    autocouple_bitrate_from_fps(); /* useless-box: snap bitrate */
                     break;
                 case MENU_ITEM_AUDIO:
                     g_menu_state.audioEnabled = !g_menu_state.audioEnabled;
@@ -512,9 +502,10 @@ int settings_menu_run(PspConfig *config)
                     }
                     break;
                 case MENU_ITEM_BITRATE:
-                    g_menu_state.bitrate -= BITRATE_STEP;
-                    if (g_menu_state.bitrate < BITRATE_MIN) {
-                        g_menu_state.bitrate = BITRATE_MIN;
+                    {
+                        int idx = bitrate_preset_index(g_menu_state.bitrate);
+                        if (idx > 0) idx--;
+                        g_menu_state.bitrate = BITRATE_PRESETS[idx];
                     }
                     break;
             }
@@ -529,7 +520,6 @@ int settings_menu_run(PspConfig *config)
                     if (g_menu_state.resolutionIndex >= RESOLUTION_COUNT) {
                         g_menu_state.resolutionIndex = 0;
                     }
-                    autocouple_from_resolution(); /* useless-box: snap FPS + bitrate */
                     break;
                 case MENU_ITEM_FPS:
                     g_menu_state.fpsIndex++;
@@ -537,7 +527,6 @@ int settings_menu_run(PspConfig *config)
                         g_menu_state.fpsIndex = 0;
                     }
                     if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX && g_menu_state.customFpsValue == 0) g_menu_state.customFpsValue = 24;
-                    autocouple_bitrate_from_fps(); /* useless-box: snap bitrate */
                     break;
                 case MENU_ITEM_AUDIO:
                     g_menu_state.audioEnabled = !g_menu_state.audioEnabled;
@@ -556,9 +545,10 @@ int settings_menu_run(PspConfig *config)
                     ui_apply_theme(g_menu_state.uiThemeIndex);
                     break;
                 case MENU_ITEM_BITRATE:
-                    g_menu_state.bitrate += BITRATE_STEP;
-                    if (g_menu_state.bitrate > MAX_BITRATE) {
-                        g_menu_state.bitrate = MAX_BITRATE;
+                    {
+                        int idx = bitrate_preset_index(g_menu_state.bitrate);
+                        if (idx < BITRATE_PRESET_COUNT - 1) idx++;
+                        g_menu_state.bitrate = BITRATE_PRESETS[idx];
                     }
                     break;
             }
@@ -574,7 +564,6 @@ int settings_menu_run(PspConfig *config)
                 int cw, ch;
                 if (osk_get_resolution_input(&cw, &ch) == 0) {
                     resolution_update_custom(cw, ch);
-                    autocouple_from_resolution();
                 }
                 g_menu_state.needsRedraw = 1;
             } else if (g_menu_state.currentSelection == MENU_ITEM_FPS &&
@@ -582,7 +571,6 @@ int settings_menu_run(PspConfig *config)
                 int cfps;
                 if (osk_get_fps_input(&cfps) == 0) {
                     fps_update_custom(cfps);
-                    autocouple_bitrate_from_fps();
                 }
                 g_menu_state.needsRedraw = 1;
             } else if (g_menu_state.currentSelection == MENU_ITEM_BUTTON_MAP) {

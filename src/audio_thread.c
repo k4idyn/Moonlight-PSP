@@ -20,6 +20,9 @@
 #include <string.h>
 #include <stdio.h>
 
+/* CABAC dialog gate — decoder thread sets, main thread clears */
+extern volatile int g_cabac_dialog_active;
+
 #include <pspkernel.h>
 #include <pspthreadman.h>
 #include <pspaudio.h>
@@ -268,6 +271,14 @@ static int audio_play_thread_func(SceSize args, void *argp)
     }
 
     while (s_running) {
+        /* While CABAC dialog is active, play silence and drain any
+         * buffered audio so the user hears nothing until they confirm. */
+        if (g_cabac_dialog_active) {
+            ring_pop_pcm(s_play_buf); /* drain ring to discard */
+            sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_silence);
+            continue;
+        }
+
         if (ring_pop_pcm(s_play_buf) == 0) {
             sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_play_buf);
             s_stats.frames_played++;
@@ -644,6 +655,14 @@ static int audio_thread_func(SceSize args, void *argp)
 
     while (s_running) {
         loop_count++;
+
+        /* While CABAC dialog is on-screen, pause audio processing.
+         * Keep pinging so the server doesn't drop us, but don't decode
+         * or play audio — the user hasn't confirmed the stream yet. */
+        if (g_cabac_dialog_active) {
+            sceKernelDelayThread(50 * 1000);
+            continue;
+        }
 
         /* --- Inline ping: 100 ms until first audio data, then 500 ms --- */
         {

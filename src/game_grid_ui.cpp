@@ -174,8 +174,8 @@ static void render_grid(void)
         ui_draw_text_centered(0.0f, (float)SCREEN_W, (float)(SCREEN_H / 2),
                               UI_COL_TEXT_DIM, "No games found on server.");
         ui_draw_text_centered(0.0f, (float)SCREEN_W, (float)(SCREEN_H / 2 + 18),
-                              UI_COL_TEXT_DIM, "Press O to go back.");
-        ui_draw_footer_hint("{O}: Back");
+                              UI_COL_TEXT_DIM, "Press [] to refresh or O to go back.");
+        ui_draw_footer_hint("{SQ}: Refresh  {O}: Back");
         ui_end_frame();
         return;
     }
@@ -202,8 +202,15 @@ static void render_grid(void)
         int card_w = tw + 2 * pad;
         int card_h = th + 2 * pad;
 
-        /* 1. Distant Shadow (Rounded) */
-        ui_draw_rect_rounded(card_x + 5, card_y + 5, card_w, card_h, 14, UI_COL_SHADOW);
+        /* 1. 3-layer drop shadow — grows +1px when focused for hover effect */
+        {
+            int so = focused ? 1 : 0; /* shadow offset boost */
+            ui_set_blend(1);
+            ui_draw_rect_rounded(card_x + 3 + so, card_y + 3 + so, card_w, card_h, 14, 0x18000000u);
+            ui_draw_rect_rounded(card_x + 2 + so, card_y + 2 + so, card_w, card_h, 14, 0x28000000u);
+            ui_draw_rect_rounded(card_x + 1 + so, card_y + 1 + so, card_w, card_h, 14, 0x38000000u);
+            ui_set_blend(0);
+        }
 
         /* 2. Solid Card Base (Thick background, visible through any alpha channels) */
         u32 card_col = focused ? g_ui_sel_color : g_ui_card_color;

@@ -27,7 +27,7 @@ extern "C" {
 
 /* Bitrate adjustment parameters */
 #define BITRATE_DROP_KBPS    50    /* Legacy: Drop 50 kbps per check when signal < 40% */
-#define BITRATE_MIN_KBPS     100   /* Minimum bitrate floor (100 kbps) */
+#define BITRATE_MIN_KBPS     32    /* Minimum bitrate floor (32 kbps) */
 #define BITRATE_MAX_RECOVERY 50    /* Legacy: Recover 50 kbps per check when signal > 60% */
 
 /* PID controller tuning constants (fixed-point x1000 for integer math) */
@@ -45,7 +45,7 @@ extern "C" {
 
 /* Phase 4: Adaptive bitrate constants */
 #define ADAPT_FAST_DROP_THRESHOLD  3      /* consecutive drops to trigger halve */
-#define ADAPT_SLOW_RECOVER_KBPS   25     /* kbps per second recovery rate */
+#define ADAPT_SLOW_RECOVER_KBPS   50     /* kbps per second recovery rate (was 25) */
 #define ADAPT_GREEN_HOLDOFF_US    (5 * 1000 * 1000) /* 5s green before recovery */
 #define ADAPT_DEADZONE_PCT        15     /* +/-15% stability band */
 #define ADAPT_CEILING_MAX_KBPS    4000   /* absolute bitrate ceiling */

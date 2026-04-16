@@ -41,6 +41,7 @@ static u16 expected_seq = 0;
 static int reassembling = 0;
 static int g_frame_had_gaps = 0;
 static int g_saw_first_sof = 0;
+static unsigned int s_consec_gap_frames = 0; /* consecutive frames with seq gaps */
 
 /* External dependencies */
 extern int g_decoder_ready;
@@ -315,15 +316,28 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
              * data IS complete despite the seq gaps in the RTP stream.
              * RS recovery is mathematically exact — don't mark corrupt. */
             if (g_frame_had_gaps && !g_fec_recovery_clean) {
+                s_consec_gap_frames++;
                 g_refs_corrupted = 1;
                 g_current_frame_is_corrupt = 1;
                 g_idr_fully_decoded = 0;
-                diag_log_write("RTP", "frame %u has seq gaps -- refs corrupted",
-                               frame_id);
+                diag_log_write("RTP", "frame %u has seq gaps -- refs corrupted (consec=%u)",
+                               frame_id, s_consec_gap_frames);
                 control_stream_request_idr();
+                /* Preemptive IDR: after 2 consecutive gap frames, the
+                 * picture is severely degraded.  Force a second IDR
+                 * request to improve recovery odds on lossy WiFi. */
+                if (s_consec_gap_frames >= 2) {
+                    diag_log_write("RTP", "2+ consecutive gap frames -- preemptive IDR");
+                    control_stream_request_idr();
+                    s_consec_gap_frames = 0;
+                }
             } else if (g_frame_had_gaps && g_fec_recovery_clean) {
                 /* FEC recovered — seq gaps are expected but data is clean */
                 g_current_frame_is_corrupt = 0;
+                s_consec_gap_frames = 0;
+            } else {
+                /* No gaps — reset consecutive counter */
+                s_consec_gap_frames = 0;
             }
             /* Reset FEC clean flag for next frame */
             g_fec_recovery_clean = 0;

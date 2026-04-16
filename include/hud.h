@@ -20,6 +20,7 @@ typedef struct {
     float fec_recovery_pct; /* FEC recovery success percentage */
     int   battery_pct;      /* PSP battery percentage (0-100) */
     int   host_proc_ms;     /* Host-side encode latency in ms */
+    int   decode_ms;        /* Per-frame decode duration in ms */
 } HudStats;
 
 /*============================================================================

@@ -983,6 +983,7 @@ float ui_draw_text(float x, float y, u32 color, const char *text)
     if (!s_font) {
         static int logged = 0;
         if (!logged) {
+#ifndef RETAIL_BUILD
             SceUID fd = sceIoOpen("ms0:/moonlight_debug.log", 
                                   PSP_O_WRONLY | PSP_O_APPEND | PSP_O_CREAT, 0644);
             if (fd >= 0) {
@@ -990,6 +991,7 @@ float ui_draw_text(float x, float y, u32 color, const char *text)
                 sceIoWrite(fd, msg, strlen(msg));
                 sceIoClose(fd);
             }
+#endif
             logged = 1; /* Only log once to avoid flooding Log */
         }
         return bmf_draw(x, y, color, text, 1.0f);
@@ -1085,6 +1087,22 @@ float ui_draw_text_small(float x, float y, u32 color, const char *text)
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
     intraFontSetStyle(s_font, 0.35f, color, 0, INTRAFONT_ALIGN_LEFT);
+    intraFontActivate(s_font);
+    float nx = intraFontPrint(s_font, x, y, text);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuDisable(GU_BLEND);
+    intraFontSetStyle(s_font, 0.45f, UI_COL_TEXT, 0, INTRAFONT_ALIGN_LEFT);
+    return nx;
+}
+
+float ui_draw_text_scaled(float x, float y, u32 color, const char *text, float scale)
+{
+    if (!text) return x;
+    if (!s_font)
+        return bmf_draw(x, y, color, text, scale / 0.45f);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    intraFontSetStyle(s_font, scale, color, 0, INTRAFONT_ALIGN_LEFT);
     intraFontActivate(s_font);
     float nx = intraFontPrint(s_font, x, y, text);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
@@ -1418,19 +1436,16 @@ void ui_draw_button(const UiButton *b)
     u32 brd = b->focused ? UI_COL_BORDER_FOC : UI_COL_BORDER;
     u32 tc  = b->focused ? UI_COL_TEXT_FOCUS  : UI_COL_TEXT;
 
-    /* === Drop Shadow (3-layer for realistic soft shadow) === */
+    /* === Drop Shadow (3-layer, grows +2px when focused for hover effect) === */
     ui_set_blend(1);
-    /* Layer 1: outermost faint shadow (offset +3, +3) */
-    ui_draw_rect_rounded(b->x + 3, b->y + 3, b->w, b->h, 12, 0x18000000u);
-    /* Layer 2: middle shadow (offset +2, +2) */
-    ui_draw_rect_rounded(b->x + 2, b->y + 2, b->w, b->h, 12, 0x28000000u);
-    /* Layer 3: inner shadow (offset +1, +1) */
-    if (b->focused) {
-        /* Focused cards get a colored glow shadow from the accent color */
-        u32 glow = (g_ui_accent_color & 0x00FFFFFFu) | 0x30000000u;
-        ui_draw_rect_rounded(b->x + 1, b->y + 1, b->w, b->h, 12, glow);
-    } else {
-        ui_draw_rect_rounded(b->x + 1, b->y + 1, b->w, b->h, 12, 0x38000000u);
+    {
+        int so = b->focused ? 1 : 0;
+        /* Layer 1: outermost faint shadow */
+        ui_draw_rect_rounded(b->x + 3 + so, b->y + 3 + so, b->w, b->h, 12, 0x18000000u);
+        /* Layer 2: middle shadow */
+        ui_draw_rect_rounded(b->x + 2 + so, b->y + 2 + so, b->w, b->h, 12, 0x28000000u);
+        /* Layer 3: inner shadow */
+        ui_draw_rect_rounded(b->x + 1 + so, b->y + 1 + so, b->w, b->h, 12, 0x38000000u);
     }
 
     /* Card panel with border */
@@ -1477,7 +1492,7 @@ void ui_draw_error_modal(const char *title, const char *message,
     ui_draw_rect_rounded(bx, by, bw, bh, 12, UI_COL_ERR_PANEL);
 
     /* Red border (2 px) */
-    ui_draw_border(bx, by, bw, bh, 2, UI_COL_ERR_BORDER);
+    ui_draw_hollow_rect_rounded(bx, by, bw, bh, 12, 2, UI_COL_ERR_BORDER);
 
     /* "ERROR" label in red */
     ui_draw_text_centered((float)bx, (float)bw,
@@ -1595,11 +1610,11 @@ void ui_draw_texture_placeholder(int x, int y, int w, int h,
     ui_draw_rect_rounded(x, y, w, h, 12, brd); /* Outer border */
     ui_draw_rect_rounded(x + t, y + t, w - 2*t, h - 2*t, 12 - t, bg); /* Inner body */
 
-    /* Centred "game controller" icon: a simple rectangle row */
+    /* Centred "game controller" icon: rounded pill shapes */
     int icon_x = x + w/2 - 8;
     int icon_y = y + h/2 - 10;
-    ui_draw_rect(icon_x,     icon_y,     16, 10, UI_COL_BORDER);
-    ui_draw_rect(icon_x + 4, icon_y - 3,  4, 4,  UI_COL_BORDER);
+    ui_draw_rect_rounded(icon_x,     icon_y,     16, 10, 4, UI_COL_BORDER);
+    ui_draw_rect_rounded(icon_x + 4, icon_y - 3,  4, 4,  2, UI_COL_BORDER);
 
     /* Game title below the icon */
     if (title && title[0]) {

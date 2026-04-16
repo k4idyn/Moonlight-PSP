@@ -10,6 +10,65 @@ never published; they're documented here so the commit history makes sense.
 
 ---
 
+## [0.2.3-beta] — 2026-04-15
+
+### Added — Host Discovery & Navigation
+- **mDNS host discovery:** New `mdnsDiscoverHosts()` sends multicast queries for `_nvstream._tcp.local.` on 224.0.0.251:5353 with multicast group join and 2s listen window (resend at 1s). Near-instant LAN discovery replacing the need for manual IP entry only.
+- **Quick subnet scan (Square button):** New `quickSubnetScan()` does sequential non-blocking TCP connect to port 47989 across the /24 subnet with 15ms timeout per host. Shows progress UI, interruptible via Circle. Manual-trigger only to avoid exhausting the PSP socket pool.
+- **Multi-host pairing (up to 8):** Replaced single `pairedHostIp[16]` with `pairedHostIps[8][16]` array + `pairedHostCount`. MRU ordering (slot 0 = most recent). New `config_is_host_paired()` and `config_add_paired_host()` APIs. Legacy `paired_host_ip` migrates to slot 0 on load.
+- **Paired status display:** Host cards show "Paired" (green) / "Unpaired" (muted red) label for online hosts. Uses config-based paired-host list because plain HTTP `/serverinfo` can't verify the TLS client cert.
+- **Back navigation (Host → Settings):** Circle button in host discovery returns to settings menu. WiFi state is checked first — if already connected (apctl state 4), the netconf dialog is skipped on re-entry.
+- **Auto-resume same app:** When current game matches the target app, stream auto-resumes without the Resume/Quit popup. Different app still prompts. Saves ~12s on quit+relaunch of the same game.
+- **Debug log config persistence:** New `debugLog` key in config.ini controls `g_debug_logging` flag.
+
+### Changed — UI/UX Refinements
+- **Smooth-scroll animation (host list):** Lerp-based camera scrolling with focus pop animation (selected host grows 2%). Scissor-clipped rendering. Matches settings menu animation system.
+- **Unified 3-layer drop shadow + hover lift:** Consistent 3-layer shadow (alpha 0x18/0x28/0x38, all black) across all card UIs (host list, game grid, button mapping, placeholder/error). Selected cards get +1px shadow offset for hover lift effect.
+- **Scaled text rendering:** New `ui_draw_text_scaled()` function. Selected items render at 0.50f scale, unselected at 0.45f — making the focused item visually larger.
+- **Host card layout overhaul:** Two-row layout: name + IP on left, status + paired on right. Dynamic card sizing from focus pop. Thicker border (2px) on selected items. Rounded status dot (radius 5).
+- **Bitrate preset selector:** Replaced linear 100 kbps stepping with codec-aligned presets: 64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048, 2560 kbps.
+- **Removed auto-coupling:** FPS and bitrate no longer auto-snap when resolution changes. Full manual control over all three settings.
+- **Rounded placeholder icon and error modal:** Game placeholder uses rounded pill shapes; error modal border uses `ui_draw_hollow_rect_rounded`.
+- **Footer hint updates:** Host list shows `{O}: Back`, game grid empty state shows refresh hint, settings shows `{X}: Edit` for custom FPS row.
+
+### Changed — Performance & Streaming
+- **IDR refresh interval: 60s → 5s:** More frequent IDR resets prevent P-frame drift during fast motion.
+- **IDR backoff ceiling: 4s → 500ms:** Exponential backoff clears ghosting in ~3s (was ~6s).
+- **FEC recovery threshold: 50% → 75%:** Even 25–50% partial parity gives Reed-Solomon a fair chance; error-concealed result beats a dropped frame.
+- **Preemptive IDR on consecutive gaps:** After 2+ consecutive gap frames, fires a second preemptive IDR request.
+- **Error concealment upgrade:** Changed from `ERROR_CON_SLICE_COPY` to `ERROR_CON_FRAME_COPY_CROSS_IDR` — copies entire previous frame on error, even across IDR boundaries.
+- **Deblocking filter re-enabled:** Removed `PSP_SKIP_DEBLOCKING` compile flag. At sub-native resolutions (256×144, 368×208) the CPU cost (~2–3ms/frame) is acceptable, and it removes blocking artifacts at low bitrates.
+- **Bitrate recovery doubled:** `ADAPT_SLOW_RECOVER_KBPS` increased from 25 to 50 kbps/s for faster recovery after signal drops.
+- **Minimum bitrate floor: 100 → 32 kbps:** Allows deeper adaptive reduction on poor WiFi.
+- **Default bitrate: 500 → 384 kbps:** WiFi-safe default that balances quality and reliability.
+- **Quick relaunch (skip host re-probe):** All exit-to-menu paths keep the cached host list. No re-discovery unless the user explicitly presses Square or returns through settings.
+
+### Fixed
+- **Stale pairing cleanup (401 handling):** Three separate 401-response handlers now remove the specific host IP from the paired array (shift + decrement) instead of just clearing a single field.
+- **User-cancel connect: no retry:** ret == -2 (user cancelled) now breaks out of the connection retry loop immediately instead of retrying.
+- **WiFi re-prompt on back-nav:** Checks `sceNetApctlGetState()` — skips netconf dialog if WiFi is already connected (state 4).
+- **PairStatus trust from HTTP probe:** After host selection, if `selected_host->paired` is true, sets `g_is_paired = 1` — trusts probe status rather than config-only.
+- **Offline hosts no longer show "Unpaired":** Paired/Unpaired label hidden for offline hosts (status 0) since they can't be verified.
+- **Back from game list error instant return:** Skip_rescan set for all connection failure returns, so pressing back from "Failed to Load Games" instantly shows the cached host list.
+
+### Build
+- **`RETAIL_BUILD` flag:** Added `-DRETAIL_BUILD` to CFLAGS and CXXFLAGS, suppressing non-FATAL diagnostic logging for release builds.
+
+### Performance (368×208 @ 15fps, 384 kbps)
+| Metric | v0.2.2-beta | v0.2.3-beta |
+|---|---|---|
+| Host discovery | Manual IP entry | mDNS + subnet scan |
+| Paired host tracking | 1 host | 8 hosts (MRU) |
+| IDR backoff ceiling | 4000ms | 500ms |
+| FEC recovery threshold | 50% parity | 75% parity |
+| Deblocking filter | Disabled | Re-enabled |
+| Default bitrate | 500 kbps | 384 kbps |
+| Min adaptive bitrate | 100 kbps | 32 kbps |
+| Quit+relaunch same app | ~15–24s (2 loading screens) | ~2–4s (auto-resume) |
+| UI shadows | 1-layer accent glow | 3-layer black + hover lift |
+
+---
+
 ## [0.2.2-beta] — 2026-04-14
 
 ### Added — New Protocol Features
@@ -81,7 +140,7 @@ never published; they're documented here so the commit history makes sense.
 - **OpenH264 third-party library:** Added `third_party/openh264/` with PSP-specific Makefile, decoder-only static build, deblocking disabled compile flag (`PSP_SKIP_DEBLOCKING`).
 
 ### Changed — Decoder Replacement
-- **Replaced FFmpeg with OpenH264:** Switched H.264 decoder from FFmpeg libavcodec to a custom PSP port of OpenH264. Benefits: smaller code footprint, CABAC support, faster error concealment, no GPL dependency on FFmpeg. Old `ffmpeg_decode.c` moved to `legacy/`.
+- **Replaced FFmpeg with OpenH264:** Switched H.264 decoder from FFmpeg libavcodec to a custom PSP port of OpenH264. Benefits: smaller code footprint, CABAC/CAVLC support, faster error concealment, no GPL dependency on FFmpeg. Note: CABAC is technically supported but only works ~25% of the time on PSP hardware (causes stalls and rubber-banding) — **CAVLC is strongly recommended**. Old `ffmpeg_decode.c` moved to `legacy/`.
 - **Decoder pipeline:** New `openh264_decode.cpp` handles OpenH264 decode + ME YUV→RGBA dispatch with spin-wait ME completion (500K iterations, yield threshold 4).
 - **Deblocking filter disabled:** Compile-time `PSP_SKIP_DEBLOCKING` flag skips deblocking for ~15% decode speed improvement on PSP hardware.
 - **Decoder thread optimizations:** Batch decode size 512, ring threshold 512, semaphore timeout 500ms, optimized for throughput on PSP-1000.
@@ -109,7 +168,7 @@ never published; they're documented here so the commit history makes sense.
 ### Performance (480×272 @ 15fps, 500 kbps)
 | Metric | v0.2.0-beta | v0.2.1-beta |
 |---|---|---|
-| Decoder | FFmpeg libavcodec | OpenH264 (smaller, CABAC) |
+| Decoder | FFmpeg libavcodec | OpenH264 (smaller, CAVLC recommended) |
 | Audio | Decode-only, no playback | Full playback with PLC |
 | FPS (480×272) | 15–18 fps | 10–18 fps |
 | FPS (256×144@30fps) | N/A | 17 fps |

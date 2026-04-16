@@ -40,7 +40,9 @@ void diag_log_set_debug(int enable)
 
 static char  s_buf[LOG_BUF_SIZE];
 static int   s_buf_pos = 0;
+#ifndef RETAIL_BUILD
 static int   s_first_write = 1;  /* truncate log on first write each load */
+#endif
 
 /* ---------- time-guarded flush ---------- */
 #define FLUSH_TIME_GUARD_US  2000000  /* flush if >2 seconds since last */
@@ -57,6 +59,7 @@ static void ensure_init(void)
 }
 
 /* ---------- write buffer to a single path ---------- */
+#ifndef RETAIL_BUILD
 static void write_to_path(const char *path)
 {
     int flags = PSP_O_WRONLY | PSP_O_CREAT;
@@ -72,6 +75,7 @@ static void write_to_path(const char *path)
         sceIoClose(fd);
     }
 }
+#endif
 
 /* ---------- internal flush (caller holds semaphore) ---------- */
 static void flush_locked(void)
@@ -83,7 +87,9 @@ static void flush_locked(void)
      * cp, etc.), causing a deadlock: the diag_log semaphore is held
      * while host0: blocks, so every other thread that tries to log
      * also freezes.  ms0: writes are local and non-contended. */
+#ifndef RETAIL_BUILD
     write_to_path(LOG_PATH_MS);
+#endif
 
     s_buf_pos = 0;
     s_last_flush_us = sceKernelGetSystemTimeLow();
@@ -167,6 +173,7 @@ void diag_log_clear(void)
 
     s_buf_pos = 0;
 
+#ifndef RETAIL_BUILD
     sceIoRemove(LOG_PATH_MS);
     sceIoRemove(LOG_PATH_HOST);
     /* legacy cleanup */
@@ -176,6 +183,7 @@ void diag_log_clear(void)
     sceIoRemove("ms0:/moonlight_debug.log");
     sceIoRemove("ms0:/hello_test.txt");
     sceIoRemove("ms0:/applist_dump.xml");
+#endif
 
     sceKernelSignalSema(s_sem, 1);
 }

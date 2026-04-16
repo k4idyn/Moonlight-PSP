@@ -18,6 +18,7 @@ typedef struct {
     char ip[16];        /* IPv4 address string */
     char mac[18];       /* MAC address "XX:XX:XX:XX:XX:XX" (WOL), or "" */
     int status;         /* 0: Offline, 1: Online, 2: Locked */
+    int paired;         /* 0: Unpaired, 1: Paired (from <PairStatus> in serverinfo) */
 } HostPC;
 
 /*============================================================================

@@ -160,9 +160,7 @@ void hud_render(void)
 
     ui_set_blend(1);
     /* Compute panel height dynamically based on content:
-     * 5 stat lines + optional Host line + separator + 2 menu items + padding
-     * Without Host: 8 + 20 + 72 + 6 + 32 + 8 = 146
-     * With Host:    146 + 18 = 164                                           */
+     * 5 stat lines + optional Host/Decode lines + separator + 2 menu items + padding */
     {
         int hud_height = HUD_PADDING                               /* top pad  */
                        + (HUD_LINE_HEIGHT + 4)                     /* Latency  */
@@ -172,6 +170,8 @@ void hud_render(void)
                        + HUD_PADDING;                              /* bot pad  */
         if (g_stats.host_proc_ms > 0)
             hud_height += HUD_LINE_HEIGHT + 2;                     /* Host ln  */
+        if (g_stats.decode_ms > 0)
+            hud_height += HUD_LINE_HEIGHT + 2;                     /* Decode ln */
         /* Panel background — semi-transparent dark with rounded corners */
         ui_draw_rect_rounded(HUD_X, HUD_Y, HUD_WIDTH, hud_height, 6, HUD_BG_COLOR);
     }
@@ -203,6 +203,11 @@ void hud_render(void)
 
     if (g_stats.host_proc_ms > 0) {
         snprintf(buf, sizeof(buf), "Host: %dms", g_stats.host_proc_ms);
+        draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+        y_offset += HUD_LINE_HEIGHT + 2;
+    }
+    if (g_stats.decode_ms > 0) {
+        snprintf(buf, sizeof(buf), "Decode: %dms", g_stats.decode_ms);
         draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
         y_offset += HUD_LINE_HEIGHT + 2;
     }

@@ -1,6 +1,6 @@
 # Architecture
 
-_PSP Moonlight v0.2.2-beta_
+_PSP Moonlight v0.2.3-beta_
 
 ## Overview
 
@@ -17,7 +17,7 @@ Main CPU (Allegrex MIPS32R2 @ 333 MHz)
   Network receive (UDP socket, 1024-slot ring)
   RTP reassembly + frame boundary detection
   Reed-Solomon FEC repair (up to 66% parity) + predictive loss detection
-  OpenH264 H.264 decode (Baseline, CABAC/CAVLC)
+  OpenH264 H.264 decode (Baseline, CAVLC recommended — CABAC supported but unstable)
   Control stream (Moonlight protocol, input forward)
   Opus stereo audio decode (48 kHz, fixed-point) + adaptive PLC
   PID-based adaptive bitrate controller
@@ -61,13 +61,13 @@ src/
 ├── rtp_reassembly.c         ← RTP frame assembly + FEC trigger
 ├── rtp_fec.c                ← Reed-Solomon FEC + IDR/RFI policy
 │     Predictive WiFi burst loss detection
-│     Selective FEC skip when >50% parity lost
+│     Selective FEC skip when >75% parity lost
 │     Multi-FEC block recovery (4 independent blocks)
 ├── rs.c                     ← Galois field Reed-Solomon codec
 ├── control_stream.c         ← Moonlight control protocol + input forwarding
 │     Per-channel reliable sequence counters (48 entries)
 │     Ping / IDR request / input packets
-│     IDR exponential backoff (500ms → 4000ms)
+│     IDR exponential backoff (500ms ceiling)
 │     Quality hysteresis (3-reading minimum)
 │     Enhanced watchdog credit restoration (FEC-weighted)
 │
@@ -89,6 +89,11 @@ src/
 │     RTCP receiver reports
 │     WiFi power save disable during streaming
 ├── main.c                   ← Entry point, display loop, watchdog integration
+│     Quick relaunch: cached hosts + skip_rescan on intentional exits
+├── host_discovery.c         ← mDNS + HTTP probe + subnet scan + host list UI
+│     mdnsDiscoverHosts(): multicast _nvstream._tcp.local.
+│     quickSubnetScan(): /24 TCP scan, interruptible, Square button
+│     Smooth-scroll animation, 3-layer shadow, paired status display
 └── display_gpu.c            ← PSP GE/GU framebuffer output
 ```
 

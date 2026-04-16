@@ -63,11 +63,35 @@ PSP Moonlight streams from a Sunshine server. Configure Sunshine for optimal PSP
 | Setting | Value | Why |
 |---|---|---|
 | **Video Codec** | H.264 | Only codec the PSP can decode |
-| **Encoder Profile** | Baseline | PSP OpenH264 build supports Baseline (CABAC capable but CAVLC preferred) |
-| **Entropy Coding** | CAVLC | CABAC is not supported — CAVLC only |
+| **Encoder Profile** | Baseline | PSP OpenH264 build supports Baseline only |
+| **Entropy Coding** | CAVLC | **CAVLC strongly recommended.** CABAC is technically supported but only works about 25% of the time — it causes frequent stalls, choppy video, and rubber-banding on PSP hardware. See "Changing Entropy Coding" below. |
 | **Resolution** | 480×272 | Native PSP LCD resolution |
 | **Frame Rate** | 15 fps | Optimal for PSP-1000 (17.9 fps peak) |
-| **Bitrate** | 500 kbps | Best quality/reliability balance for 802.11b |
+| **Bitrate** | 384 kbps | WiFi-safe default for 802.11b |
+
+### Changing Entropy Coding (CABAC → CAVLC)
+
+Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. The PSP technically supports CABAC, but it only works about 25% of the time — the other 75% you'll see the video freeze, stutter, rubber-band, or stall completely. **You need to switch to CAVLC.**
+
+**How to change it in Sunshine's Web UI:**
+
+1. Open your Sunshine Web UI in a browser (usually `https://localhost:47990` or `https://<your-PC-IP>:47990`).
+2. Log in with your Sunshine credentials.
+3. Go to **Configuration** (the gear icon or "Configuration" tab).
+4. Scroll down to the **Encoder** section.
+5. Look for a setting called **Encoder Coder Type** or **AMD Coder** (the exact name depends on your GPU and Sunshine version).
+6. Change it from **CABAC** to **CAVLC**.
+7. Click **Save** and restart Sunshine.
+
+**If you prefer editing the config file directly:**
+
+Open `sunshine.conf` (usually in `C:\Users\<you>\Applications\Files\Apollo\config\sunshine.conf` on Windows, or `~/.config/sunshine/sunshine.conf` on Linux) and add or change:
+
+```ini
+amd_coder = cavlc
+```
+
+> **Why?** CABAC is a more complex entropy coding method that saves bandwidth but requires significantly more CPU to decode. The PSP's 333 MHz MIPS processor simply can't keep up with CABAC decoding in real-time for most streams. CAVLC is lighter and works reliably.
 
 ### Sunshine Configuration
 
@@ -109,13 +133,13 @@ min_fps_factor = 1
 
 ### Video doesn't start / black screen
 - Verify `moonlight_me_helper.prx` is in the same folder as `EBOOT.PBP`.
-- Set Sunshine to **H.264 Baseline, CAVLC** (not Main/High profile, not CABAC).
-- Reduce bitrate to **500 kbps** if on a weak Wi-Fi signal.
+- Set Sunshine to **H.264 Baseline, CAVLC** (not Main/High profile). CABAC is technically supported but causes severe stuttering ~75% of the time — always use CAVLC.
+- Reduce bitrate to **384 kbps** if on a weak Wi-Fi signal.
 
 ### Low FPS or stuttering
 - Move the PSP closer to your Wi-Fi router (802.11b has limited range).
 - Reduce resolution to **368×208** if you need higher FPS.
-- Reduce bitrate to **300 kbps** if packet loss is high (check the HUD stats).
+- Reduce bitrate to **384 kbps** if packet loss is high (check the HUD stats).
 
 ### Application crashes on launch
 - Ensure your CFW is **6.60** or **6.61** based. ARK-4 on 6.61 is recommended.

@@ -94,6 +94,7 @@ extern int  sw_decoder_thread_init(FrameRingBuffer *frame_rb);
 extern void sw_decoder_thread_shutdown(void);
 extern void sw_decoder_thread_force_restart(void);
 extern int  decoder_is_cabac_detected(void);
+extern volatile int g_cabac_dialog_active;
 extern void oh264_pipeline_flush_buffers(void);
 extern int  safety_buffer_init(void);
 extern void safety_buffer_shutdown(void);
@@ -160,28 +161,51 @@ int main(int argc, char *argv[]) {
     ui_begin_frame(); ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT); ui_draw_header("PSP Moonlight");
     ui_draw_text_centered(0.0f, 480.0f, 130.0f, UI_COL_TEXT, "Initialising..."); ui_end_frame();
 
+settings_menu_entry:
     LOG("[STEP 1] Loading settings...\n");
     diag_log_write("UI", "TRANSITION settings_menu_init t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     settings_menu_init(&g_psp_config);
-    if (g_psp_config.pairedHostIp[0] != '\0') network_restore_paired_host(g_psp_config.pairedHostIp);
+    if (g_psp_config.pairedHostCount > 0 && g_psp_config.pairedHostIps[0][0] != '\0')
+        network_restore_paired_host(g_psp_config.pairedHostIps[0]);
     network_set_local_bind_ip(g_psp_config.localBindIp);
     if (settings_menu_run(&g_psp_config) < 0) LOG("[STEP 1] Menu cancelled\n");
     diag_log_write("UI", "TRANSITION settings_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
 
     LOG("[STEP 2] Connecting Wi-Fi...\n");
     diag_log_write("UI", "TRANSITION wifi_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
-    if (netconf_ui_run() < 0) { halt_with_error("Wi-Fi", -1); return -1; }
-    wifi_keepalive_start();  /* Background WiFi monitor — prevents idle disconnect */
+    { /* Skip netconf dialog if WiFi is already connected (back-navigation) */
+        int apctl_state = 0;
+        sceNetApctlGetState(&apctl_state);
+        if (apctl_state != 4) {
+            if (netconf_ui_run() < 0) { halt_with_error("Wi-Fi", -1); return -1; }
+            wifi_keepalive_start();
+        } else {
+            diag_log_write("UI", "WiFi already connected, skipping netconf\n");
+        }
+    }
     diag_log_write("UI", "TRANSITION wifi_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
 
 host_select_loop:
     diag_log_write("UI", "TRANSITION host_discovery_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     if (!skip_rescan) host_discovery_init();
     skip_rescan = 0;
-    while (1) { if (renderHostDiscoveryList() >= 0) { selected_host = host_discovery_get_selected(); break; } }
+    while (1) {
+        int host_ret = renderHostDiscoveryList();
+        if (host_ret == -2) {
+            /* Back button: return to settings menu */
+            diag_log_write("UI", "HOST back_to_settings t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+            host_discovery_shutdown();
+            goto settings_menu_entry;
+        }
+        if (host_ret >= 0) { selected_host = host_discovery_get_selected(); break; }
+    }
     if (!selected_host) { halt_with_error("Host Selection", -1); return -1; }
     snprintf(selected_host_ip, sizeof(selected_host_ip), "%s", selected_host->ip);
     network_set_target_host(selected_host_ip);
+    /* Trust the server's <PairStatus> from the HTTP probe rather than
+     * relying solely on the single paired_host_ip in config.  This lets
+     * the PSP work with multiple paired hosts without re-pairing. */
+    if (selected_host->paired) g_is_paired = 1;
     diag_log_write("UI", "TRANSITION host_selected ip=%s t=%u\n", selected_host_ip, sceKernelGetSystemTimeLow() / 1000);
     config_add_manual_host(selected_host_ip, selected_host->mac);
 
@@ -196,6 +220,7 @@ host_select_loop:
             ret = network_connect_all();
             connect_attempts++;
             if (ret >= 0) break;
+            if (ret == -2) break;  /* User cancelled — don't retry */
             if (connect_attempts >= MAX_CONNECT_ATTEMPTS) break;
             LOG("[STEP 4] Connection attempt %d failed (%d), retrying in 5s...\n",
                 connect_attempts, ret);
@@ -215,11 +240,13 @@ host_select_loop:
         control_stream_stop();
         audio_thread_shutdown();
         rtsp_session_close();
-        skip_rescan = 1; goto host_select_loop;
+        skip_rescan = 1;  /* Keep cached host list — user can Square to rescan */
+        goto host_select_loop;
     }
-    host_discovery_shutdown();
+    /* Don't clear host list — keep cached for quick relaunch after
+     * stream exit.  Hosts are refreshed on settings→host or Square. */
     const char *ph = network_get_paired_host();
-    if (ph) { snprintf(g_psp_config.pairedHostIp, sizeof(g_psp_config.pairedHostIp), "%s", ph); saveConfig(&g_psp_config); }
+    if (ph && ph[0]) { config_add_paired_host(&g_psp_config, ph); }
 
     extern unsigned char g_remote_input_key[16];
     stream_crypto_init(g_remote_input_key);
@@ -242,6 +269,7 @@ host_select_loop:
     
     diag_log_write("MAIN", "Initializing SW decoder (CAVLC+VFPU dual-core)...\n");
     { g_cabac_detected = 0;
+      g_cabac_dialog_active = 0;
       /* SDP-based early detection: if test mode requested CABAC from the server,
        * pre-set the flag so the warning screen shows immediately rather than
        * relying on PPS NAL parsing (which fails if the initial IDR is lost). */
@@ -312,7 +340,7 @@ host_select_loop:
                 /* Reset shared ring state so a fresh stream can re-initialize */
                 memset(&g_shared, 0, sizeof(g_shared));
 
-                skip_rescan = 0;
+                skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
                 goto host_select_loop;
             }
             sceKernelDelayThread(1000);
@@ -347,39 +375,89 @@ host_select_loop:
         static float s_display_fps = 0.0f;
         static int s_latency_avg_ms = 0;
 
-        /* CABAC warning takes highest priority — OpenH264 CAN
-         * decode CABAC data, so frames arrive and would bypass the old
-         * else-if chain.  Show warning immediately and block all display. */
-        if (decoder_is_cabac_detected()) {
-            /* CABAC warning screen — perfectly vertically centered on 272px display.
-             * Header bar is 28px, usable area = 244px (28..272).
-             * Content block: 7 lines, ~18px spacing = ~126px total.
-             * Center Y = 28 + (244 - 126) / 2 = 87.  First text at Y=87.
-             * Encoder lines are left-aligned within a centered 260px block
-             * so colon-separated values line up visually. */
-            ui_begin_frame(); ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT); ui_draw_header("CABAC DETECTED");
-            ui_draw_text_centered(0.0f, 480.0f,  88.0f, UI_COL_TEXT, "Server sent CABAC encoding.");
-            ui_draw_text_centered(0.0f, 480.0f, 108.0f, UI_COL_TEXT, "PSP requires CAVLC (Baseline).");
-            ui_draw_text_centered(0.0f, 480.0f, 136.0f, UI_COL_TEXT_DIM, "In Sunshine/Apollo web UI, set:");
-            ui_draw_text_centered(110.0f, 260.0f, 158.0f, UI_COL_TEXT_DIM, "AMD:    amd_coder = cavlc");
-            ui_draw_text_centered(110.0f, 260.0f, 176.0f, UI_COL_TEXT_DIM, "Intel:  qsv_coder = cavlc");
-            ui_draw_text_centered(110.0f, 260.0f, 194.0f, UI_COL_TEXT_DIM, "NVIDIA: nv_coder  = cavlc");
-            /* Footer-aligned dismiss prompt */
-            ui_draw_text_centered(0.0f, 480.0f, 258.0f, UI_COL_TEXT_DIM, "Press X or O to return.");
-            ui_end_frame();
-            sceCtrlPeekBufferPositive(&pad, 1); pad.Buttons |= g_remote_buttons; g_remote_buttons = 0;
-            if (pad.Buttons & (PSP_CTRL_CIRCLE | PSP_CTRL_CROSS)) {
-                /* Gracefully tear down stream and return to host menu.
-                 * The old `break` fell through to sceKernelExitGame(). */
-                diag_log_write("MAIN", "CABAC dismiss: returning to host menu\n");
-                abort_stream_to_menu();
-                memset(&g_shared, 0, sizeof(g_shared));
-                skip_rescan = 0;
-                goto host_select_loop;
+        /* CABAC warning dialog: show once per stream when CABAC entropy
+         * coding is detected.  User can accept the risk (choppy decode)
+         * or go back to the app list to switch encoder settings. */
+        {
+            static int s_cabac_choice = 0; /* 0=not shown, 1=continue, 2=back */
+
+            /* Auto-reset when a new stream starts (g_cabac_detected resets to 0
+             * in sw_decoder_thread_init, so the first frames have it == 0). */
+            if (!decoder_is_cabac_detected())
+                s_cabac_choice = 0;
+
+            if (decoder_is_cabac_detected() && s_cabac_choice == 0) {
+                diag_log_write("CABAC", "CABAC detected — showing warning dialog\n");
+
+                /* Gate decoder + audio: stop processing until user confirms */
+                g_cabac_dialog_active = 1;
+
+                /* Drain any stale button presses before accepting input */
+                {
+                    SceCtrlData drain;
+                    do {
+                        sceCtrlPeekBufferPositive(&drain, 1);
+                        sceKernelDelayThread(16 * 1000);
+                    } while (drain.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE));
+                }
+
+                SceCtrlData cpd, cprev;
+                memset(&cprev, 0, sizeof(cprev));
+
+                while (1) {
+                    sceCtrlPeekBufferPositive(&cpd, 1);
+                    cpd.Buttons |= g_remote_buttons; g_remote_buttons = 0;
+
+                    ui_begin_frame();
+                    ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+                    ui_draw_header("PSP Moonlight");
+
+                    int pw = 360, ph = 120;
+                    int px = (UI_SCREEN_W - pw) / 2;
+                    int py = (UI_SCREEN_H - ph) / 2 - 10;
+                    int bd = 2;
+                    ui_set_blend(1);
+                    ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
+                    ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
+                    ui_set_blend(0);
+
+                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
+                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using CABAC entropy coding.");
+                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "This causes choppy playback on PSP.");
+                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Switch encoder to CAVLC for best results.");
+
+                    ui_draw_footer_hint("{X}: Continue Anyway    {O}: Back");
+                    ui_end_frame();
+
+                    int cx = (cpd.Buttons & PSP_CTRL_CROSS) && !(cprev.Buttons & PSP_CTRL_CROSS);
+                    int co = (cpd.Buttons & PSP_CTRL_CIRCLE) && !(cprev.Buttons & PSP_CTRL_CIRCLE);
+
+                    if (cx) {
+                        diag_log_write("CABAC", "User chose CONTINUE with CABAC\n");
+                        s_cabac_choice = 1;
+                        break;
+                    }
+                    if (co) {
+                        diag_log_write("CABAC", "User chose BACK — aborting stream\n");
+                        s_cabac_choice = 2;
+                        break;
+                    }
+
+                    cprev = cpd;
+                    sceKernelDelayThread(50 * 1000);
+                }
+
+                /* Un-gate decoder + audio now that user has decided */
+                g_cabac_dialog_active = 0;
+
+                if (s_cabac_choice == 2) {
+                    abort_stream_to_menu();
+                    memset(&g_shared, 0, sizeof(g_shared));
+                    s_cabac_choice = 0;  /* Reset for next stream */
+                    skip_rescan = 1;
+                    goto host_select_loop;
+                }
             }
-            sceDisplayWaitVblankStart();
-            sceKernelDelayThread(1000);
-            continue;  /* Skip frame display, input send, and all stream processing */
         }
 
         /* G-1: Poll input BEFORE display for minimum latency.
@@ -465,6 +543,12 @@ host_select_loop:
 
                         /* Host processing latency from Sunshine headers */
                         hs.host_proc_ms = (int)(g_host_processing_us / 1000);
+
+                        /* Per-frame decode time from decoder thread */
+                        {
+                            extern volatile u32 g_decode_time_us;
+                            hs.decode_ms = (int)(g_decode_time_us / 1000);
+                        }
 
                         hud_update_stats(&hs);
                     }
@@ -746,7 +830,7 @@ host_select_loop:
             g_remote_exit_request = 0;
             abort_stream_to_menu();
             memset(&g_shared, 0, sizeof(g_shared));
-            skip_rescan = 0;
+            skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
             goto host_select_loop;
         }
 
@@ -767,7 +851,7 @@ host_select_loop:
                     s_combo_start_us = 0;
                     abort_stream_to_menu();
                     memset(&g_shared, 0, sizeof(g_shared));
-                    skip_rescan = 0;
+                    skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
                     goto host_select_loop;
                 }
             } else {
@@ -788,7 +872,7 @@ host_select_loop:
                 diag_log_write("MAIN", "HUD Quit selected — returning to host menu\n");
                 abort_stream_to_menu();
                 memset(&g_shared, 0, sizeof(g_shared));
-                skip_rescan = 0;
+                skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
                 goto host_select_loop;
             }
         }

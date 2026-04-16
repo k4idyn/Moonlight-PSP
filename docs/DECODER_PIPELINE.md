@@ -31,7 +31,7 @@ oh264_pipeline_decode_frame()
     |
     +--[DecodeFrameNoDelay()]-------------------+
     |       pData[0]=Y, [1]=Cb, [2]=Cr          | OpenH264 H.264
-    |       SBufferInfo{ iBufferStatus, strides }| Baseline + CABAC
+    |       SBufferInfo{ iBufferStatus, strides }| Baseline (CAVLC recommended)
     |                                            | Single-threaded
     v                                            |
 ME dispatch (BeginME)                           -+
@@ -52,7 +52,7 @@ Throughput = `max(OpenH264_decode_ms, ME_convert_ms)` - not their sum.
 | Internal buffering | May buffer frames for reordering | No reorder buffering (streaming mode) |
 | Thread overhead | Thread-safe mutexes (unused on PSP) | Compiled with DISABLE_DECODER_MT, zero sync |
 | Error concealment | Full re-decode on error | SLICE_COPY - copies previous slice, no re-decode |
-| CABAC support | Not available in PSP build | Native CABAC+CAVLC support |
+| CABAC support | Not available in PSP build | CABAC+CAVLC supported, but CABAC is unstable on PSP (~25% success rate, causes stalls and rubber-banding). **Use CAVLC.** |
 | Trace logging | Always active | Disabled via DECODER_OPTION_TRACE_LEVEL=0 |
 | Source control | Binary cross-compiled library | Full source - recompilable with PSP-specific flags |
 

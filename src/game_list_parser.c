@@ -310,11 +310,13 @@ int game_list_fetch(GameList *gameList)
         pspDebugScreenPrintf("game_list_fetch: received %d bytes\n", xml_len);
 
         /* DUMP THE EXACT RAW XML DIRECTLY TO THE LOG SO WE CAN PROVE WHAT APOLLO SENT */
+#ifndef RETAIL_BUILD
         SceUID dump_fd = sceIoOpen("ms0:/applist_dump.xml", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
         if (dump_fd >= 0) {
             sceIoWrite(dump_fd, recv_buf, xml_len);
             sceIoClose(dump_fd);
         }
+#endif
 
         ret = game_list_parse_xml(gameList, recv_buf, xml_len);
     }

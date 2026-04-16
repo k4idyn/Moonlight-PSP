@@ -122,9 +122,9 @@ OPENH264_INCDIR  = -I$(OPENH264_ROOT)
 # ============================================================================
 # Compiler Flags
 # ============================================================================
-CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(MBEDTLS_CFLAGS) \
+CFLAGS  = -O2 -G0 -Wall -Werror -DPSP -DRETAIL_BUILD $(MBEDTLS_CFLAGS) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
-CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
+CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP -DRETAIL_BUILD -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
            $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 

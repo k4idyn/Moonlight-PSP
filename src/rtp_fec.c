@@ -771,8 +771,11 @@ static void attempt_recovery_and_submit(void)
         for (idx = g_data_packets; idx < g_total_packets; idx++) {
             if (g_slots[idx].received) parity_received++;
         }
-        if (parity_count > 0 && parity_received * 2 < parity_count) {
-            /* >50% parity lost — RS recovery is unreliable */
+        if (parity_count > 0 && parity_received * 4 < parity_count) {
+            /* >75% parity lost — RS recovery is truly unreliable.
+             * Lowered from 50% threshold: at 802.11b loss rates, even
+             * partial parity (25-50%) gives RS a fair chance, and the
+             * error-concealed result is better than a dropped frame. */
             g_fec_packets_failed += missing;
             g_fec_recovery_attempts++;
             {

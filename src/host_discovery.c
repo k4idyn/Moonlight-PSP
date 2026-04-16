@@ -16,6 +16,7 @@
 #include <pspthreadman.h>
 #include <pspnet.h>
 #include <pspnet_inet.h>
+#include <pspnet_apctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -23,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 
 #include "host_discovery.h"
 #include "config.h"
@@ -48,12 +50,19 @@
 #define MAX_RESPONSE_SIZE    2048
 #define MAX_VISIBLE_HOSTS    5
 #define CLIENT_UNIQUE_ID     client_identity_get_uid()
+#define SCAN_CONNECT_TIMEOUT_US 15000    /* 15ms per host (LAN SYN-ACK < 2ms) */
 
 static HostPC g_hosts[MAX_HOSTS];
 static int g_host_count = 0;
 static int g_selected_index = 0;
 static int g_first_visible_index = 0;
 static u32 g_prev_buttons = 0;
+
+/* Smooth-scroll animation state (mirrors settings_menu.c) */
+static float s_host_scroll_curr   = 0.0f;   /* current camera (lerps)           */
+static float s_host_target_camera = 0.0f;   /* integer camera from clamp logic  */
+static float s_host_focus_anim    = 0.0f;   /* lerps toward selected for pop    */
+static u32   s_host_last_anim_us  = 0;
 
 static void clampSelectionWindow(void)
 {
@@ -215,11 +224,18 @@ static void loadManualHosts(void)
 {
     int index;
     ManualHostEntry entry;
+    extern PspConfig g_psp_config;
 
     g_host_count = 0;
     for (index = 0; index < config_get_manual_host_count(); index++) {
         if (config_get_manual_host(index, &entry) == 0) {
             addOrUpdateHost(entry.ip, entry.ip, entry.mac, 0);
+            /* Set paired status from config so offline hosts show correct state */
+            {
+                int idx = findHostIndexByIp(entry.ip);
+                if (idx >= 0)
+                    g_hosts[idx].paired = config_is_host_paired(&g_psp_config, entry.ip);
+            }
         }
     }
 }
@@ -361,6 +377,16 @@ static int httpProbeHost(HostPC *host)
         host->status = 1; /* Online */
     }
 
+    /* Paired indicator: use config-based paired-host list because the plain
+     * HTTP /serverinfo endpoint (port 47989) cannot verify the TLS client
+     * certificate and always returns PairStatus=0.  The HTTPS endpoint
+     * (port 47984) does verify, but requires full TLS — too heavy for a
+     * discovery probe on PSP hardware. */
+    {
+        extern PspConfig g_psp_config;
+        host->paired = config_is_host_paired(&g_psp_config, host->ip);
+    }
+
     /* Extract <mac> tag for Wake-on-LAN */
     {
         const char *mp = strstr(response, "<mac>");
@@ -382,9 +408,286 @@ static int httpProbeHost(HostPC *host)
 
 
 /* -------------------------------------------------------------------------
- * scanNetwork - Probe every known (manual) host via HTTP on port 47989.
+ * mdnsDiscoverHosts - Discover Sunshine/GameStream hosts via mDNS.
+ *
+ * Sends an mDNS multicast query for _nvstream._tcp.local. (the service
+ * type advertised by Sunshine / GameStream / Apollo) and listens for
+ * responses for 2 seconds.  Each responding host's IP is extracted from
+ * the source address and probed via HTTP for full server info.
+ *
+ * This replaces the old sequential TCP subnet scan (254 hosts * timeout).
+ * mDNS discovery is near-instant on LAN.
+ * ------------------------------------------------------------------------- */
+static void mdnsDiscoverHosts(void)
+{
+    int sock, ret, nb;
+    struct sockaddr_in mcast_addr, bind_addr, from_addr;
+    socklen_t from_len;
+    u32 start_ms;
+    int found = 0;
+    int resent = 0;
+
+    /* mDNS query: _nvstream._tcp.local. type PTR class IN+QU */
+    static const unsigned char mdns_query[] = {
+        0x00, 0x00,  /* Transaction ID (0 for mDNS) */
+        0x00, 0x00,  /* Flags: standard query */
+        0x00, 0x01,  /* Questions: 1 */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* AN=0, NS=0, AR=0 */
+        /* _nvstream._tcp.local. */
+        9, '_','n','v','s','t','r','e','a','m',
+        4, '_','t','c','p',
+        5, 'l','o','c','a','l',
+        0,
+        0x00, 0x0C,  /* Type: PTR (12) */
+        0x80, 0x01   /* Class: IN + QU (unicast-response requested) */
+    };
+
+    sock = sceNetInetSocket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        diag_log_write("DISC", "mdns: socket() failed\n");
+        return;
+    }
+
+    nb = 1;
+    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+
+    /* Bind to port 5353 so we also receive multicast responses */
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_len    = (unsigned char)sizeof(bind_addr);
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port   = htons(5353);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    ret = sceNetInetBind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+    diag_log_write("DISC", "mdns: bind ret=%d (err=%d)\n",
+                   ret, ret < 0 ? sceNetInetGetErrno() : 0);
+
+    /* Join mDNS multicast group (best effort — unicast QU still works) */
+    {
+        struct ip_mreq mreq;
+        int join_ret;
+        mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        join_ret = sceNetInetSetsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                                        &mreq, sizeof(mreq));
+        diag_log_write("DISC", "mdns: multicast join ret=%d (err=%d)\n",
+                       join_ret, join_ret < 0 ? sceNetInetGetErrno() : 0);
+    }
+
+    /* Send query to mDNS multicast group */
+    memset(&mcast_addr, 0, sizeof(mcast_addr));
+    mcast_addr.sin_len    = (unsigned char)sizeof(mcast_addr);
+    mcast_addr.sin_family = AF_INET;
+    mcast_addr.sin_port   = htons(5353);
+    mcast_addr.sin_addr.s_addr = inet_addr("224.0.0.251");
+
+    ret = sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
+                           (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+    diag_log_write("DISC", "mdns: query sent (%d bytes, err=%d)\n",
+                   ret, ret < 0 ? sceNetInetGetErrno() : 0);
+
+    /* Show discovery indicator */
+    ui_begin_frame();
+    ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+    ui_draw_header("Host Discovery");
+    ui_draw_text_centered(0.0f, (float)UI_SCREEN_W, 120.0f,
+                          UI_COL_TEXT, "Discovering hosts...");
+    ui_end_frame();
+
+    /* Listen for responses for 2 seconds */
+    start_ms = sceKernelGetSystemTimeLow() / 1000;
+    while ((sceKernelGetSystemTimeLow() / 1000) - start_ms < 2000) {
+        unsigned char buf[512];
+
+        /* Re-send query at ~1s for reliability */
+        if (!resent && (sceKernelGetSystemTimeLow() / 1000) - start_ms >= 1000) {
+            sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
+                             (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+            resent = 1;
+        }
+
+        from_len = sizeof(from_addr);
+        memset(&from_addr, 0, sizeof(from_addr));
+        ret = sceNetInetRecvfrom(sock, buf, sizeof(buf), 0,
+                                 (struct sockaddr *)&from_addr, &from_len);
+
+        if (ret > 12 && (buf[2] & 0x80)) {
+            /* DNS response (QR bit set) — source IP is a Sunshine host */
+            char ip_str[16];
+            strncpy(ip_str, inet_ntoa(from_addr.sin_addr),
+                    sizeof(ip_str) - 1);
+            ip_str[sizeof(ip_str) - 1] = '\0';
+
+            if (findHostIndexByIp(ip_str) < 0) {
+                diag_log_write("DISC", "mdns: found host at %s\n", ip_str);
+                addOrUpdateHost(ip_str, ip_str, NULL, 0);
+                {
+                    int idx = findHostIndexByIp(ip_str);
+                    if (idx >= 0) {
+                        if (httpProbeHost(&g_hosts[idx]) == 0) {
+                            found++;
+                        }
+                    }
+                }
+            }
+        } else if (ret < 0) {
+            int err = sceNetInetGetErrno();
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                sceKernelDelayThread(50000); /* 50ms between polls */
+                continue;
+            }
+            diag_log_write("DISC", "mdns: recv error %d\n", err);
+            break;
+        }
+    }
+
+    /* Leave multicast group (best effort) */
+    {
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        sceNetInetSetsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                             &mreq, sizeof(mreq));
+    }
+
+    sceNetInetClose(sock);
+    diag_log_write("DISC", "mdns: done, found=%d new hosts\n", found);
+}
+
+/* -------------------------------------------------------------------------
+ * quickSubnetScan - Sequential TCP port scan for Sunshine on port 47989.
+ *
+ * Scans the local /24 subnet one IP at a time using the same non-blocking
+ * connect + select pattern as httpProbeHost (proven on PSP hardware).
+ * Each host is tried with a short timeout.  Discovered hosts are saved to
+ * config so they persist across rescans without repeating the full scan.
+ *
+ * Interruptible: Circle button cancels the scan.
+ * Returns the number of new hosts found.
+ * ------------------------------------------------------------------------- */
+static int quickSubnetScan(void)
+{
+    union SceNetApctlInfo info;
+    u32 local_ip, subnet;
+    int ip_idx, found = 0;
+    char local_ip_str[16];
+
+    /* Get PSP's local IP address */
+    if (sceNetApctlGetInfo(8, &info) != 0 || info.ip[0] == '\0') {
+        diag_log_write("DISC", "subnet: cannot get local IP\n");
+        return 0;
+    }
+    strncpy(local_ip_str, info.ip, sizeof(local_ip_str) - 1);
+    local_ip_str[sizeof(local_ip_str) - 1] = '\0';
+    local_ip = ntohl(inet_addr(local_ip_str));
+    subnet   = local_ip & 0xFFFFFF00;
+
+    diag_log_write("DISC", "subnet: scanning %d.%d.%d.x\n",
+                   (int)((subnet >> 24) & 0xFF),
+                   (int)((subnet >> 16) & 0xFF),
+                   (int)((subnet >> 8) & 0xFF));
+
+    for (ip_idx = 1; ip_idx <= 254; ip_idx++) {
+        u32 target = subnet | (u32)ip_idx;
+        struct in_addr ia;
+        char ip_str[16];
+        int sock, nb, ret;
+        struct sockaddr_in addr;
+
+        if (target == local_ip) continue;
+
+        ia.s_addr = htonl(target);
+        strncpy(ip_str, inet_ntoa(ia), sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = '\0';
+
+        /* Skip already-known hosts */
+        if (findHostIndexByIp(ip_str) >= 0) continue;
+
+        /* Check cancel and draw progress every 8 IPs */
+        if ((ip_idx & 7) == 0) {
+            SceCtrlData pad;
+            sceCtrlPeekBufferPositive(&pad, 1);
+            if (pad.Buttons & PSP_CTRL_CIRCLE) {
+                diag_log_write("DISC", "subnet: cancelled by user\n");
+                break;
+            }
+            {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Scanning subnet... (%d/254)", ip_idx);
+                ui_begin_frame();
+                ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+                ui_draw_header("Host Discovery");
+                ui_draw_text_centered(0.0f, (float)UI_SCREEN_W, 120.0f,
+                                      UI_COL_TEXT, msg);
+                ui_end_frame();
+            }
+        }
+
+        sock = sceNetInetSocket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+
+        nb = 1;
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_len    = (unsigned char)sizeof(addr);
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(HTTP_PORT);
+        addr.sin_addr.s_addr = htonl(target);
+
+        ret = sceNetInetConnect(sock, (struct sockaddr *)&addr, sizeof(addr));
+
+        if (ret != 0) {
+            /* Non-blocking connect in progress — wait with select (single fd) */
+            fd_set wfds;
+            struct timeval tv;
+            int optval;
+            socklen_t optlen;
+
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            tv.tv_sec  = 0;
+            tv.tv_usec = SCAN_CONNECT_TIMEOUT_US;
+
+            ret = sceNetInetSelect(sock + 1, NULL, &wfds, NULL, &tv);
+            if (ret <= 0) {
+                sceNetInetClose(sock);
+                continue;
+            }
+
+            optval = -1;
+            optlen = sizeof(optval);
+            sceNetInetGetsockopt(sock, SOL_SOCKET, SO_ERROR, &optval, &optlen);
+            if (optval != 0) {
+                sceNetInetClose(sock);
+                continue;
+            }
+        }
+
+        /* Connected — this is a Sunshine host */
+        sceNetInetClose(sock);
+        diag_log_write("DISC", "subnet: port open on %s\n", ip_str);
+
+        config_add_manual_host(ip_str, NULL);
+        addOrUpdateHost(ip_str, ip_str, NULL, 0);
+        {
+            int idx = findHostIndexByIp(ip_str);
+            if (idx >= 0 && httpProbeHost(&g_hosts[idx]) == 0) {
+                found++;
+            }
+        }
+    }
+
+    diag_log_write("DISC", "subnet: done, found=%d new hosts\n", found);
+    return found;
+}
+
+/* -------------------------------------------------------------------------
+ * scanNetwork - Probe every known (manual) host via HTTP on port 47989,
+ * then discover new Sunshine/GameStream hosts via mDNS and subnet scan.
  *
  * Apollo / Sunshine / GameStream hosts expose /serverinfo on this port.
+ * After known-host probing, mDNS multicast discovery and a batched TCP
+ * subnet scan find new hosts.
  * A scanning indicator is drawn for each host so the UI stays responsive.
  * ------------------------------------------------------------------------- */
 static void scanNetwork(void)
@@ -422,6 +725,9 @@ static void scanNetwork(void)
         }
     }
 
+    /* After probing known hosts, discover new ones via mDNS */
+    mdnsDiscoverHosts();
+
     if (g_host_count == 0) {
         g_selected_index = 0;
     }
@@ -450,25 +756,63 @@ static u32 statusColor(int status)
 static void drawHostItem(int index, int y, int selected)
 {
     HostPC *host = &g_hosts[index];
+
+    /* Focus pop: the selected host card grows 2% while the focus animation
+     * lerps, identical to the settings-menu card pop. */
+    float dist  = fabsf((float)index - s_host_focus_anim);
+    float scale = (dist < 1.0f) ? (1.0f + (1.0f - dist) * 0.02f) : 1.0f;
+    int item_h  = (int)((float)HOST_ITEM_H * scale);
+    int item_w  = (int)((float)HOST_ITEM_W * scale);
+
+    int ry = y - (item_h - HOST_ITEM_H) / 2;
+    int rx = HOST_LIST_X - (item_w - HOST_ITEM_W) / 2;
+
     u32 bg = selected ? UI_COL_CARD_SEL : UI_COL_PANEL;
     u32 border = selected ? UI_COL_BORDER_FOC : UI_COL_BORDER;
-    const int dot_x   = HOST_LIST_X + 8;
-    const int text_x  = HOST_LIST_X + 26;
-    const int status_x = HOST_LIST_X + 320;
-    const int status_w = HOST_ITEM_W - (status_x - HOST_LIST_X) - 8;
+    const int dot_x    = rx + 8;
+    const int text_x   = rx + 26;
+    const int status_x = rx + 320;
+    const int status_w = item_w - 320 - 8;
+    float text_scale   = selected ? 0.50f : 0.45f;
 
+    /* 3-layer drop shadow — grows +2px when selected for hover effect */
     ui_set_blend(1);
-    int t = 1;
-    ui_draw_rect_rounded(HOST_LIST_X, y, HOST_ITEM_W, HOST_ITEM_H, 8, border);
-    ui_draw_rect_rounded(HOST_LIST_X + t, y + t, HOST_ITEM_W - 2*t, HOST_ITEM_H - 2*t, 8 - t, bg);
-    ui_set_blend(0);
-    ui_draw_rect(dot_x, y + 11, 10, 16, statusColor(host->status));
+    {
+        int so = selected ? 1 : 0;
+        ui_draw_rect_rounded(rx + 3 + so, ry + 3 + so, item_w, item_h, 12, 0x18000000u);
+        ui_draw_rect_rounded(rx + 2 + so, ry + 2 + so, item_w, item_h, 12, 0x28000000u);
+        ui_draw_rect_rounded(rx + 1 + so, ry + 1 + so, item_w, item_h, 12, 0x38000000u);
+    }
 
-    ui_draw_text((float)text_x, (float)(y + 12), UI_COL_TEXT, host->name);
-    ui_draw_text((float)text_x, (float)(y + 26), UI_COL_TEXT_DIM, host->ip);
-    ui_draw_text_centered((float)status_x, (float)status_w, (float)(y + 16),
+    int t = selected ? 2 : 1;
+    ui_draw_rect_rounded(rx, ry, item_w, item_h, 12, border);
+    ui_draw_rect_rounded(rx + t, ry + t, item_w - 2*t, item_h - 2*t, 12 - t, bg);
+    ui_set_blend(0);
+    ui_draw_rect_rounded(dot_x, ry + 11, 10, 16, 5, statusColor(host->status));
+
+    /* Left side: name + IP, vertically centered as two rows.
+     * intraFont y = baseline; ascenders ~7px above, descenders ~2px below
+     * at 0.45 scale.  Two rows w/ 14px spacing ≈ 23px total text height.
+     * Pill = 38px → (38-23)/2 ≈ 7-8px padding → baselines at +16/+30. */
+    ui_draw_text_scaled((float)text_x, (float)(ry + 16), UI_COL_TEXT, host->name, text_scale);
+    ui_draw_text_scaled((float)text_x, (float)(ry + 30), UI_COL_TEXT_DIM, host->ip, text_scale);
+
+    /* Right side: status + paired label, vertically centered as two rows.
+     * Paired/Unpaired colour is vivid only when the row is selected;
+     * non-selected rows use the dim text colour for both states.
+     * Only show paired label for online hosts — offline hosts can't
+     * be verified and "Unpaired" would be misleading. */
+    ui_draw_text_centered((float)status_x, (float)status_w, (float)(ry + 16),
                           selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT_DIM,
                           statusText(host->status));
+    if (host->status > 0) {
+        u32 pair_col = UI_COL_TEXT_DIM;
+        if (selected)
+            pair_col = host->paired ? 0xFF55EE55u : 0xFF8888CCu;
+        ui_draw_text_centered((float)status_x, (float)status_w, (float)(ry + 30),
+                              pair_col,
+                              host->paired ? "Paired" : "Unpaired");
+    }
 }
 
 void host_discovery_init(void)
@@ -478,8 +822,20 @@ void host_discovery_init(void)
 
     loadManualHosts();
     scanNetwork();
+
+    /* Subnet scan is NOT run automatically — it exhausts the PSP socket pool
+     * and causes ENOMEM (errno 12) on the subsequent TLS connect.  mDNS +
+     * HTTP probe are sufficient for auto-discovery.  The user can still
+     * trigger a full subnet scan manually via the Square button. */
+
     clampSelectionWindow();
     g_prev_buttons = 0;
+
+    /* Reset smooth-scroll state so the list starts at the top */
+    s_host_scroll_curr   = 0.0f;
+    s_host_target_camera = 0.0f;
+    s_host_focus_anim    = 0.0f;
+    s_host_last_anim_us  = 0;
 }
 
 int renderHostDiscoveryList(void)
@@ -517,6 +873,10 @@ int renderHostDiscoveryList(void)
 
     if ((pad.Buttons & PSP_CTRL_SQUARE) && !(g_prev_buttons & PSP_CTRL_SQUARE)) {
         scanNetwork();
+        quickSubnetScan();
+        /* Let PSP reclaim socket resources before user can select a host */
+        sceKernelDelayThread(500 * 1000);   /* 500 ms cooldown */
+        clampSelectionWindow();
     }
 
     /* L+R together: delete selected host with confirmation dialog */
@@ -588,21 +948,27 @@ int renderHostDiscoveryList(void)
          * stale Start press from triggering exit dialog */
         sceCtrlPeekBufferPositive(&pad, 1);
         g_prev_buttons = pad.Buttons;
-        /* Re-draw and return immediately so we start fresh */
+        /* Re-draw and return immediately so we start fresh.
+         * Snap the smooth-scroll camera so the list is stable. */
+        s_host_target_camera = (float)g_first_visible_index;
+        s_host_scroll_curr   = s_host_target_camera;
+        s_host_focus_anim    = (float)g_selected_index;
+
         ui_begin_frame();
         ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
         ui_draw_header("Host Discovery");
+        ui_set_scissor(0, 30, 480, 214);
         {
-            int item_y_tmp = HOST_LIST_Y;
             int idx_tmp;
-            for (idx_tmp = g_first_visible_index;
-                 idx_tmp < g_host_count && idx_tmp < g_first_visible_index + MAX_VISIBLE_HOSTS;
-                 idx_tmp++) {
+            for (idx_tmp = 0; idx_tmp < g_host_count; idx_tmp++) {
+                int item_y_tmp = HOST_LIST_Y + (int)(((float)idx_tmp - s_host_scroll_curr)
+                                 * (float)(HOST_ITEM_H + HOST_GAP));
+                if (item_y_tmp + HOST_ITEM_H <= 30 || item_y_tmp >= 244) continue;
                 drawHostItem(idx_tmp, item_y_tmp, idx_tmp == g_selected_index);
-                item_y_tmp += HOST_ITEM_H + HOST_GAP;
             }
         }
-        ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {SE}: WOL  {L}+{R}: Del  {ST}: Exit");
+        ui_clear_scissor();
+        ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {O}: Back  {L}+{R}: Del  {SE}: WOL  {ST}: Exit");
         ui_end_frame();
         return -1;
     }
@@ -617,6 +983,12 @@ int renderHostDiscoveryList(void)
         exit_dialog_run();
     }
 
+    /* Circle: go back to settings menu */
+    if ((pad.Buttons & PSP_CTRL_CIRCLE) && !(g_prev_buttons & PSP_CTRL_CIRCLE)) {
+        g_prev_buttons = pad.Buttons;
+        return -2;  /* Signal: back to settings */
+    }
+
     ui_begin_frame();
     ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
     ui_draw_header("Host Discovery");
@@ -626,13 +998,31 @@ int renderHostDiscoveryList(void)
         ui_draw_text_centered(0.0f, (float)UI_SCREEN_W, 132.0f, UI_COL_TEXT_DIM,
                               "Press [] to scan or /\\ to add manually");
     } else {
-        item_y = HOST_LIST_Y;
-        for (index = g_first_visible_index;
-             index < g_host_count && index < g_first_visible_index + MAX_VISIBLE_HOSTS;
-             index++) {
-            drawHostItem(index, item_y, index == g_selected_index);
-            item_y += HOST_ITEM_H + HOST_GAP;
+        /* ---- Smooth-scroll animation (matches settings_menu.c) ---- */
+        {
+            u32 now_us = sceKernelGetSystemTimeLow();
+            float dt = 1.0f;
+            if (s_host_last_anim_us != 0) {
+                u32 elapsed = now_us - s_host_last_anim_us;
+                dt = (float)elapsed / 16667.0f;
+                if (dt > 4.0f) dt = 4.0f;
+                if (dt < 0.1f) dt = 0.1f;
+            }
+            s_host_last_anim_us = now_us;
+
+            s_host_target_camera = (float)g_first_visible_index;
+            s_host_scroll_curr  += (s_host_target_camera - s_host_scroll_curr) * 0.15f * dt;
+            s_host_focus_anim   += ((float)g_selected_index - s_host_focus_anim) * 0.20f * dt;
         }
+
+        ui_set_scissor(0, 30, 480, 214);
+        for (index = 0; index < g_host_count; index++) {
+            item_y = HOST_LIST_Y + (int)(((float)index - s_host_scroll_curr)
+                     * (float)(HOST_ITEM_H + HOST_GAP));
+            if (item_y + HOST_ITEM_H <= 30 || item_y >= 244) continue;
+            drawHostItem(index, item_y, index == g_selected_index);
+        }
+        ui_clear_scissor();
 
         if (g_first_visible_index > 0) {
             ui_draw_text((float)(HOST_LIST_X + HOST_ITEM_W - 12),
@@ -648,7 +1038,7 @@ int renderHostDiscoveryList(void)
         }
     }
 
-    ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {SE}: WOL  {L}+{R}: Del  {ST}: Exit");
+    ui_draw_footer_hint("{X}: Sel  {SQ}: Scan  {TR}: Add  {O}: Back  {L}+{R}: Del  {SE}: WOL  {ST}: Exit");
     ui_end_frame();
 
     if ((pad.Buttons & PSP_CTRL_CROSS) && !(g_prev_buttons & PSP_CTRL_CROSS)) {

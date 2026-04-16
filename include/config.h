@@ -63,7 +63,7 @@ typedef struct {
 #define DEFAULT_WIDTH           368     /* Quality preset — best visual at 15fps */
 #define DEFAULT_HEIGHT          208     /* ~16:9 (1.769), mod-16 aligned */
 #define DEFAULT_FPS             15      /* 60Hz/4 — highest safe fps for 368x208 */
-#define DEFAULT_BITRATE         500     /* Flat 500kbps — proven WiFi-safe, IDR < 15KB */
+#define DEFAULT_BITRATE         384     /* 384kbps — WiFi-safe default */
 #define MAX_BITRATE             2760    /* ~4.5Mbps WiFi - 25% FEC - 15% safety */
 #define DEFAULT_PACKET_SIZE     1024
 #define DEFAULT_CONTROL_MODE    CONTROL_MODE_XBOX
@@ -125,6 +125,23 @@ int config_add_manual_host(const char *ip, const char *mac);
  * Returns 0 on success, -1 if the IP was not found.
  */
 int config_delete_manual_host(const char *ip);
+
+/*
+ * config_is_host_paired - Check if a host IP is in the paired list.
+ *
+ * Returns 1 if paired, 0 if not.
+ */
+int config_is_host_paired(const PspConfig *config, const char *ip);
+
+/*
+ * config_add_paired_host - Add a host IP to the paired list (no duplicates).
+ *
+ * Most recently paired host is moved to slot 0.  If the list is full,
+ * the oldest entry is evicted.  Calls saveConfig() to persist.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int config_add_paired_host(PspConfig *config, const char *ip);
 
 /*
  * configSetDefaults - Initialize config with default values

@@ -126,6 +126,7 @@ int pairing_pin_ui_init(PairingPINUI *ui, const char *pin,
     int pin_len = strlen(pin);
     if (pin_len != PIN_DIGITS) {
         /* Log to debug file; no debug screen calls */
+#ifndef RETAIL_BUILD
         SceUID fd = sceIoOpen("ms0:/moonlight_debug.log",
                               PSP_O_WRONLY | PSP_O_APPEND | PSP_O_CREAT, 0777);
         if (fd >= 0) {
@@ -134,6 +135,7 @@ int pairing_pin_ui_init(PairingPINUI *ui, const char *pin,
             sceIoWrite(fd, msg, strlen(msg));
             sceIoClose(fd);
         }
+#endif
         return -1;
     }
 

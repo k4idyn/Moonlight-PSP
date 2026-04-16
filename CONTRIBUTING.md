@@ -60,7 +60,7 @@ The debug environment is **PSPLink + pspsh** over USB: `scrshot` for framebuffer
 Baseline test configuration (validated):
 - PSP-1000, 6.60 PRO-C2 or 6.61 ME/LME
 - Sunshine host on a 2.4 GHz 802.11b/g LAN
-- 480×272, 15 fps, 500 kbps, H.264 Baseline, CAVLC
+- 480×272, 15 fps, 384 kbps, H.264 Baseline, CAVLC
 - At least 3 minutes — short runs don't exercise the watchdog edge cases
 
 ---
@@ -153,7 +153,7 @@ The ME is a separate MIPS core. Rules:
 Recommended test setup:
 - PSP-1000 with 6.60 PRO-C2 or 6.61 LME
 - Sunshine host on the same 2.4 GHz network
-- Stream at 480×272, 15 fps, 500 kbps (the tested baseline)
+- Stream at 480×272, 15 fps, 384 kbps (the tested baseline)
 
 ---
 

@@ -239,9 +239,19 @@ extern "C" void button_mapping_ui_run(void)
             u32 brd_col = focused ? UI_COL_BORDER_FOC : UI_COL_BORDER;
             int t = focused ? 2 : 1;
             int radius = th / 2;
-            
+
+            /* 3-layer drop shadow — grows +2px when focused for hover effect */
+            ui_set_blend(1);
+            {
+                int so = focused ? 1 : 0;
+                ui_draw_rect_rounded(ox + 3 + so, oy + 3 + so, tw, th, radius, 0x18000000u);
+                ui_draw_rect_rounded(ox + 2 + so, oy + 2 + so, tw, th, radius, 0x28000000u);
+                ui_draw_rect_rounded(ox + 1 + so, oy + 1 + so, tw, th, radius, 0x38000000u);
+            }
+
             ui_draw_rect_rounded(ox, oy, tw, th, radius, brd_col);
             ui_draw_rect_rounded(ox + t, oy + t, tw - 2*t, th - 2*t, radius - t, bg_col);
+            ui_set_blend(0);
 
             // Draw Label (Left aligned)
             ui_draw_text((float)(ox + 16), (float)(oy + th / 2 + 5), focused ? UI_COL_TEXT_FOCUS : UI_COL_TEXT, getItemName(i));
