@@ -565,6 +565,11 @@ int settings_menu_run(PspConfig *config)
                 if (osk_get_resolution_input(&cw, &ch) == 0) {
                     resolution_update_custom(cw, ch);
                 }
+                /* Flush controller state so the Start press that confirmed
+                 * the OSK isn't re-detected as a "Save and Continue" edge
+                 * in the settings menu. */
+                sceCtrlPeekBufferPositive(&pad, 1);
+                memcpy(&prev_pad, &pad, sizeof(pad));
                 g_menu_state.needsRedraw = 1;
             } else if (g_menu_state.currentSelection == MENU_ITEM_FPS &&
                        g_menu_state.fpsIndex == FPS_CUSTOM_INDEX) {
@@ -572,11 +577,14 @@ int settings_menu_run(PspConfig *config)
                 if (osk_get_fps_input(&cfps) == 0) {
                     fps_update_custom(cfps);
                 }
+                sceCtrlPeekBufferPositive(&pad, 1);
+                memcpy(&prev_pad, &pad, sizeof(pad));
                 g_menu_state.needsRedraw = 1;
             } else if (g_menu_state.currentSelection == MENU_ITEM_BUTTON_MAP) {
                 extern void button_mapping_ui_run(void);
                 button_mapping_ui_run();
-                /* reload config to pick up any changes, or just redraw */
+                sceCtrlPeekBufferPositive(&pad, 1);
+                memcpy(&prev_pad, &pad, sizeof(pad));
                 g_menu_state.needsRedraw = 1;
             } else {
                 update_config_from_menu(config);
