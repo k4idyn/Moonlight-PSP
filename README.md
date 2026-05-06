@@ -18,17 +18,6 @@ PSP Moonlight is a Moonlight-compatible game-streaming client for Sony PSP syste
 
 The project streams H.264 video from a host PC running Sunshine, performs software decode on the main CPU, and uses the Media Engine for accelerated YUV-to-RGBA conversion.
 
-## What Changed Since v0.2.3-beta
-
-Using the current repository history at https://github.com/k4idyn/Moonlight-PSP (`v0.2.3-beta..main`), this v1.1.0 tree includes:
-
-- A PSP-native end-to-end pipeline rewrite (custom RTSP/RTP/FEC/decode path; no `moonlight-common-c` dependency).
-- OpenH264 software decode + ME VFPU YUV420P->RGBA conversion pipeline with watchdog-driven recovery.
-- Host discovery and UX upgrades: mDNS discovery, subnet scan, multi-host pairing, and persistent icon cache flow.
-- Binary-safe HTTPS icon asset downloads with static PNG decode buffers and raw RGB565 cache format.
-- Adaptive streaming controls: quality controller, loss-aware recovery behavior, and robust CAVLC-focused host compatibility.
-- UPnP IGD support for hotspot/remote RTP/RTCP mapping assistance.
-
 ## New in v1.1: Network and Streaming Control
 
 Compared with the current public upstream baseline, this tree includes additional network-path updates:
