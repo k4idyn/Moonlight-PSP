@@ -8,11 +8,29 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ---
 
-## [1.0.0] — 2026-05-05 (public release refresh)
+## [1.1.0] — 2026-05-06
+
+### Networking
+- Client-selected bitrate is now used directly for launch and transport bitrate setup (no implicit startup downscale).
+- Connection quality classification now prioritizes transport-side loss/FEC recovery signals and no longer penalizes clean links for decode-side FPS stalls.
+- RTCP Receiver Reports now use interval loss accounting and RFC3550-style jitter representation in RTP clock units.
+- Adaptive bitrate fast-drop trigger now requires 3 consecutive drop signals before halving.
+
+### Release
+- Retail (non-dev) build artifacts are published manually for this release because CI uses a different PSPSDK and does not produce reproducible release binaries for this branch.
+
+### Documentation
+- Public docs refreshed for ARK-4-only CFW guidance.
+- Installation guidance updated to remove risky flash-write install wording.
+- Encoder setup instructions now present vendor-neutral CAVLC guidance for NVIDIA/AMD/Intel users.
+
+---
+
+## [1.0.0] — 2026-05-05
 
 ### Release Hardening
 - Retail build mode is now the documented default for public packaging.
-- Public docs were normalized from internal audit wording to release wording.
+- Public docs were normalized from pre-release audit wording to release wording.
 - CABAC compatibility documentation was clarified as normal-mode unsupported behavior with explicit CAVLC host guidance.
 
 ### Fixed (vs v0.2.3-beta)
@@ -23,7 +41,7 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ### Documentation
 - Updated README status badges and version history for public release posture.
-- Reworked release-validation documentation (`docs/RELEASE_READINESS.md`) to include retail build commands and git-tag comparison notes.
+- Reworked release-validation documentation to include retail build commands and git-tag comparison notes.
 - Removed internal blocker/audit wording from user-facing docs (`docs/KNOWN_ISSUES.md`, encoder settings guides, and UI/architecture headers).
 
 ### Initial 1.0.0 publication (2026-05-04)
@@ -36,7 +54,7 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 - UPnP IGD hotspot/remote assist is included for RTP/RTCP UDP mapping setup and cleanup during streaming sessions.
 
 ### Documentation
-- Removed internal blocker-ID workflow references and test-only publication content from public docs.
+- Removed pre-release blocker workflow references and test-only publication content from public docs.
 - Updated README, install flow, and known-issues content for v1.0 user-facing guidance.
 
 ---
@@ -237,9 +255,9 @@ enough to publish for broader hardware testing.
 
 ---
 
-## [INTERNAL — 0.3.0-alpha] — 2026-04-11
+## [0.3.0-alpha] — 2026-04-11 (pre-release snapshot)
 
-> *Never published. Internal dev checkpoint.*
+> *Not publicly released. Kept for historical reference.*
 
 ### Architecture — FFmpeg Dual-Core Pipeline
 
@@ -270,9 +288,9 @@ frontend. The ME is retained solely for YUV→RGBA, running concurrently with FF
 
 ---
 
-## [INTERNAL — 0.2.0-alpha] — 2026-04-08
+## [0.2.0-alpha] — 2026-04-08 (pre-release snapshot)
 
-> *Never published. Internal dev checkpoint.*
+> *Not publicly released. Kept for historical reference.*
 
 ### ENet Per-Channel Sequence Bug Fix
 
@@ -282,9 +300,9 @@ frontend. The ME is retained solely for YUV→RGBA, running concurrently with FF
 
 ---
 
-## [INTERNAL — 0.1.5-alpha] — 2026-04-07
+## [0.1.5-alpha] — 2026-04-07 (pre-release snapshot)
 
-> *Never published. Internal dev checkpoint.*
+> *Not publicly released. Kept for historical reference.*
 
 ### RTP/FEC Corruption Gating
 
@@ -301,9 +319,9 @@ frontend. The ME is retained solely for YUV→RGBA, running concurrently with FF
 
 ---
 
-## [INTERNAL — 0.1.0-alpha] — 2026-04-05
+## [0.1.0-alpha] — 2026-04-05 (pre-release snapshot)
 
-> *Never published. First hardware test checkpoint.*
+> *Not publicly released. First hardware test checkpoint.*
 
 ### Overview
 

@@ -44,7 +44,7 @@ extern "C" {
 #define PID_MAX_DELTA_KBPS  150
 
 /* Phase 4: Adaptive bitrate constants */
-#define ADAPT_FAST_DROP_THRESHOLD  2      /* consecutive drops to trigger halve */
+#define ADAPT_FAST_DROP_THRESHOLD  3      /* consecutive drops to trigger halve */
 #define ADAPT_SLOW_RECOVER_KBPS   25     /* kbps per second recovery rate */
 #define ADAPT_GREEN_HOLDOFF_US    (5 * 1000 * 1000) /* 5s green before recovery */
 #define ADAPT_DEADZONE_PCT        15     /* +/-15% stability band */
@@ -114,7 +114,8 @@ void signal_strength_init(int base_bitrate_kbps);
  * @configured_bitrate_kbps: User-selected stream bitrate from config
  *
  * Returns: Initial runtime bitrate budget in kbps used by both RTSP launch
- * and the adaptive signal-strength controller.
+ * and the adaptive signal-strength controller. The configured bitrate is
+ * used directly; only the global minimum floor is enforced.
  */
 int signal_strength_get_launch_bitrate_kbps(int configured_bitrate_kbps);
 

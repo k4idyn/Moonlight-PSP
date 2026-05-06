@@ -2569,7 +2569,7 @@ static int rtsp_announce(int sock, int enc_enabled)
         extern PspConfig g_psp_config;
         int requested_bitrate_kbps = g_psp_config.bitrate > 0 ? g_psp_config.bitrate : 1600;
         int launch_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(requested_bitrate_kbps);
-        int transport_bitrate_kbps = (launch_bitrate_kbps * 80 + 99) / 100;
+        int transport_bitrate_kbps = launch_bitrate_kbps;
         int packet_size = g_psp_config.packetSize > 0 ? g_psp_config.packetSize : 1392;
         /* Resolution from preset array — authoritative source of truth. */
         int ri = g_psp_config.resolutionIndex;
@@ -2660,7 +2660,7 @@ static int rtsp_announce(int sock, int enc_enabled)
              *   - enableRecoveryMode:0         recovery mode breaks FEC queue
              *   - videoQualityScoreUpdateTime:5000  quality scoring interval
              *   - minimumBitrateKbps           latch bitrate (no server scaling)
-             *   - configuredBitrateKbps        launch bitrate for FEC calc
+             *   - configuredBitrateKbps        client-selected target bitrate
              */
             /* Profile/entropy selection: Baseline+CAVLC by default,
              * Main+CABAC only in test mode (config cabacTestMode=1). */

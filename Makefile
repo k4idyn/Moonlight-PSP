@@ -125,8 +125,9 @@ OPENH264_INCDIR  = -I$(OPENH264_ROOT)
 # Build Mode
 # ============================================================================
 # RETAIL_BUILD=1 keeps diagnostics minimal and strips most log-file writes.
-# For hardware debugging/release verification, keep this at 0.
-RETAIL_BUILD ?= 0
+# This is the default for public release packaging.
+# For local hardware debugging/validation, use RETAIL_BUILD=0.
+RETAIL_BUILD ?= 1
 ifeq ($(RETAIL_BUILD),1)
 BUILD_MODE_DEFINES = -DRETAIL_BUILD
 else

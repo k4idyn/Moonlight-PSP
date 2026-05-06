@@ -11,7 +11,7 @@ A clear and concise description of what the bug is.
 
 **Hardware & Firmware**
  - PSP Model (e.g. 1000, 2000, 3000, Go, Street):
- - Custom Firmware Version (e.g. 6.61 PRO-C2, ARK-4):
+ - Custom Firmware Version (e.g. 6.61 ARK-4):
  - Host Software (Sunshine or NVIDIA GameStream):
  - Host Version:
 

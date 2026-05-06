@@ -1,6 +1,6 @@
 # Building PSP Moonlight
 
-_v1.0.0_
+_v1.1.0_
 
 This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
 
@@ -96,8 +96,10 @@ Expected output:
 
 ```bash
 cd ..
-make RETAIL_BUILD=1
+make
 ```
+
+`make` now defaults to `RETAIL_BUILD=1` for public packaging.
 
 For local diagnostics and verbose logging during development, use:
 
@@ -143,7 +145,7 @@ ls -lh EBOOT.PBP moonlight.prx moonlight_me_helper/moonlight_me_helper.prx
 
 ## Installing on PSP
 
-**Custom firmware required.** Tested on 6.60 PRO-C2 and 6.61 LME.
+**Custom firmware required.** Release validation targets ARK-4 on 6.60/6.61.
 
 ```
 ms0:/PSP/GAME/Moonlight/

@@ -2,13 +2,13 @@
 
 # PSP Moonlight
 
-**v1.0.0 - Dual-Core Software H.264 Streaming Client for Sony PlayStation Portable**
+**v1.1.0 - Dual-Core Software H.264 Streaming Client for Sony PlayStation Portable**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)](#known-limitations)
-[![Release](https://img.shields.io/badge/release-v1.0.0-blue)](#version-history)
+[![Release](https://img.shields.io/badge/release-v1.1.0-blue)](#version-history)
 
 </div>
 
@@ -20,7 +20,7 @@ The project streams H.264 video from a host PC running Sunshine, performs softwa
 
 ## What Changed Since v0.2.3-beta
 
-Using the current repository history at https://github.com/k4idyn/Moonlight-PSP (`v0.2.3-beta..main`), this v1.0.0 tree includes:
+Using the current repository history at https://github.com/k4idyn/Moonlight-PSP (`v0.2.3-beta..main`), this v1.1.0 tree includes:
 
 - A PSP-native end-to-end pipeline rewrite (custom RTSP/RTP/FEC/decode path; no `moonlight-common-c` dependency).
 - OpenH264 software decode + ME VFPU YUV420P->RGBA conversion pipeline with watchdog-driven recovery.
@@ -28,6 +28,15 @@ Using the current repository history at https://github.com/k4idyn/Moonlight-PSP 
 - Binary-safe HTTPS icon asset downloads with static PNG decode buffers and raw RGB565 cache format.
 - Adaptive streaming controls: quality controller, loss-aware recovery behavior, and robust CAVLC-focused host compatibility.
 - UPnP IGD support for hotspot/remote RTP/RTCP mapping assistance.
+
+## New in v1.1: Network and Streaming Control
+
+Compared with the current public upstream baseline, this tree includes additional network-path updates:
+
+- Launch and transport bitrate now start from the client-selected bitrate (no hidden startup downscale step).
+- Connection quality classification now uses transport metrics (loss/FEC recovery) without coupling decode FPS into bandwidth decisions.
+- RTCP Receiver Reports were aligned with interval loss accounting and RFC3550-style jitter units (`90 kHz` RTP clock domain).
+- Adaptive fast-drop trigger was tuned to require 3 consecutive drop signals before aggressive halving.
 
 ## Highlights
 
@@ -76,7 +85,7 @@ Opus audio decode + recovery
 ### PSP
 
 - PSP-1000 / PSP-2000 / PSP-3000
-- Custom firmware (ARK-4 recommended)
+- Custom firmware: ARK-4
 - 2.4 GHz Wi-Fi
 
 ### Host PC
@@ -88,9 +97,11 @@ Recommended baseline host profile:
 
 - Codec: H.264
 - Encoder profile: Baseline
-- Entropy: CAVLC (required for PSP v1.0 validation and normal playback)
+- Entropy: CAVLC (required for PSP v1.1 validation and normal playback)
 - Resolution/FPS: Start with 480x272 @ 15 fps
 - Bitrate: Start around 384 kbps and tune as needed
+
+This guidance applies to all supported host encoder backends (NVIDIA NVENC, AMD AMF, Intel QSV, and software x264).
 
 ## Building
 
@@ -100,8 +111,11 @@ See [docs/BUILDING.md](docs/BUILDING.md) for full environment setup.
 # 1) Build Media Engine helper PRX
 cd moonlight_me_helper && make
 
-# 2) Build application
+# 2) Build application (retail mode is default)
 cd .. && make
+
+# Optional debug build
+make RETAIL_BUILD=0
 ```
 
 Build output includes:
@@ -139,8 +153,12 @@ Detailed notes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
 ## Documentation Index
 
 - [docs/BUILDING.md](docs/BUILDING.md)
-- [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md)
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/NVENC_SETTINGS_GUIDE.md](docs/NVENC_SETTINGS_GUIDE.md)
+- [docs/AMD_SETTINGS_GUIDE.md](docs/AMD_SETTINGS_GUIDE.md)
+- [docs/QSV_SETTINGS_GUIDE.md](docs/QSV_SETTINGS_GUIDE.md)
+- [docs/SOFTWARE_ENCODING_GUIDE.md](docs/SOFTWARE_ENCODING_GUIDE.md)
 - [docs/GAME_LIST_PARSER_README.md](docs/GAME_LIST_PARSER_README.md)
 - [docs/PAIRING_README.md](docs/PAIRING_README.md)
 - [docs/DECODER_PIPELINE.md](docs/DECODER_PIPELINE.md)
@@ -149,6 +167,7 @@ Detailed notes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
 
 ## Version History
 
+- v1.1.0: Network controller refinements (transport-first quality classification, direct launch bitrate use, RTCP RR accounting update) and manual retail artifact publication.
 - v1.0.0: Public release of the PSP-native rewrite with documented host compatibility guidance and release validation.
 - v0.2.x: Public beta cycle.
 

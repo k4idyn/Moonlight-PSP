@@ -119,7 +119,6 @@ int signal_strength_get_launch_bitrate_kbps(int configured_bitrate_kbps)
 {
     int launch_bitrate_kbps = configured_bitrate_kbps > 0 ? configured_bitrate_kbps : 1600;
 
-    launch_bitrate_kbps = (launch_bitrate_kbps * 50 + 99) / 100;
     if (launch_bitrate_kbps < BITRATE_MIN_KBPS)
         launch_bitrate_kbps = BITRATE_MIN_KBPS;
 

@@ -1,6 +1,6 @@
 # Known Issues
 
-_PSP Moonlight v1.0.0_
+_PSP Moonlight v1.1.0_
 
 This document lists user-facing limitations, compatibility notes, and practical guidance for stable streaming on PSP hardware.
 
@@ -59,6 +59,12 @@ PSP Moonlight supports UPnP IGD port mapping assistance for hotspot and remote/N
 ---
 
 ## Host Compatibility Guidance
+
+### Network behavior notes (current branch)
+
+- Client bitrate is now used directly at launch (no hidden startup downscale).
+- Transport adaptation decisions are based on network/FEC signals; decoder FPS is displayed for diagnostics but does not directly classify link quality.
+- RTCP receiver reports now use interval-loss accounting and RTP-clock jitter units for host-side quality feedback.
 
 ### Recommended baseline stream profile
 

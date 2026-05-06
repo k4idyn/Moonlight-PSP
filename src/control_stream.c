@@ -2239,7 +2239,9 @@ static void update_connection_quality(u32 estimated_bw_bps)
         recovery_pct = (d_success * 100) / d_attempts;
     }
 
-    /* Frame rate must come from the decoder, not RTP frame indexes. */
+    /* Frame rate is tracked for diagnostics/HUD only.  Do not feed decode-side
+     * stalls back into transport quality classification or the network
+     * controller will punish clean links for CPU/content bottlenecks. */
     u32 decoded_now = 0;
     u32 dropped_now = 0;
     sw_decoder_get_stats(&decoded_now, &dropped_now);
@@ -2252,35 +2254,39 @@ static void update_connection_quality(u32 estimated_bw_bps)
             u32 visible_delivery_pct = (d_frames * 100) / total_frame_events;
 
             loss_rate_x10 = packet_loss_x10;
-            if (frame_loss_x10 > loss_rate_x10) {
-                loss_rate_x10 = frame_loss_x10;
-            }
-            if (visible_delivery_pct < recovery_pct) {
-                recovery_pct = visible_delivery_pct;
+            if (total_fec_pkts > 0 || packet_loss_x10 > 0 || d_attempts > 0) {
+                if (frame_loss_x10 > loss_rate_x10) {
+                    loss_rate_x10 = frame_loss_x10;
+                }
+                if (visible_delivery_pct < recovery_pct) {
+                    recovery_pct = visible_delivery_pct;
+                }
             }
         } else {
             loss_rate_x10 = packet_loss_x10;
         }
     }
 
-    /* Classify quality */
+    /* Classify transport quality from transport signals only.
+     * Decoder FPS is reported separately, but it must not drive bitrate
+     * collapse when the network path is healthy. */
     ConnQuality q;
-    if (loss_rate_x10 < 10 && d_dropped == 0 && fps >= 20) {
-        q = CONN_QUALITY_EXCELLENT;  /* <1.0% loss */
-    } else if (loss_rate_x10 < 30 && d_dropped <= 1 && fps >= 15) {
+    if (loss_rate_x10 < 10 && recovery_pct >= 99) {
+        q = CONN_QUALITY_EXCELLENT;  /* <1.0% loss, near-perfect recovery */
+    } else if (loss_rate_x10 < 30 && recovery_pct >= 97) {
         q = CONN_QUALITY_GOOD;       /* <3.0% loss */
-    } else if (loss_rate_x10 < 80 && d_dropped <= 2 && fps >= 12) {
+    } else if (loss_rate_x10 < 80 && recovery_pct >= 90) {
         q = CONN_QUALITY_FAIR;       /* <8.0% loss */
-    } else if (loss_rate_x10 < 150 && d_dropped <= 5 && fps >= 8) {
+    } else if (loss_rate_x10 < 150 && recovery_pct >= 75) {
         q = CONN_QUALITY_POOR;       /* <15% loss */
     } else {
         q = CONN_QUALITY_CRITICAL;   /* >15% loss */
     }
 
-    if (d_dropped > 0 && q < CONN_QUALITY_POOR) {
+    if (d_dropped > 0 && total_fec_pkts > 0 && q < CONN_QUALITY_POOR) {
         q = CONN_QUALITY_POOR;
     }
-    if (d_dropped >= 3) {
+    if (d_dropped >= 3 && total_fec_pkts > 0) {
         q = CONN_QUALITY_CRITICAL;
     }
 

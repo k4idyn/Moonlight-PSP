@@ -127,12 +127,33 @@ static int   g_reconnect_success = 0;              /* Successful reconnects */
 /* Phase 5.2: RTCP Receiver Report state */
 static volatile u32 s_rtcp_pkts_received = 0;
 static volatile u32 s_rtcp_pkts_lost_cum = 0;
-static u32 s_rtcp_highest_seq = 0;
-static u32 s_rtcp_jitter_us = 0;        /* EWMA inter-arrival jitter (us) */
+static u32 s_rtcp_highest_ext_seq = 0;
+static u32 s_rtcp_jitter_rtp = 0;       /* RFC3550 jitter in 90kHz RTP units */
 static u32 s_rtcp_last_arrival_us = 0;
+static u32 s_rtcp_last_rtp_timestamp = 0;
 static u32 s_rtcp_ssrc = 0;
-static u32 s_rtcp_last_seq = 0;
+static u32 s_rtcp_last_ext_seq = 0;
+static u32 s_rtcp_prev_rr_received = 0;
+static u32 s_rtcp_prev_rr_lost_cum = 0;
 static int s_rtcp_have_last_seq = 0;
+
+static u32 rtcp_us_to_rtp90k(u32 delta_us)
+{
+    return (u32)((((u64)delta_us) * 90000ULL + 500000ULL) / 1000000ULL);
+}
+
+static u32 rtcp_extend_seq(u16 seq, u32 reference_ext_seq)
+{
+    u32 candidate = (reference_ext_seq & 0xFFFF0000u) | seq;
+
+    if (candidate + 0x8000u < reference_ext_seq) {
+        candidate += 0x10000u;
+    } else if (candidate > reference_ext_seq + 0x8000u && candidate >= 0x10000u) {
+        candidate -= 0x10000u;
+    }
+
+    return candidate;
+}
 
 /* Phase 5.8: Session resume state */
 #define SESSION_STATE_ACTIVE       0
@@ -583,16 +604,30 @@ static void send_rtcp_rr(void)
 {
     unsigned char buf[32];
     u32 frac_lost = 0;
+    u32 total_received;
+    u32 total_lost;
+    u32 interval_received;
+    u32 interval_lost;
+    u32 expected_interval;
     u32 cum_lost;
     struct sockaddr_in rtcp_dst;
 
     if (udp_socket_rtcp < 0 || g_video_server_ip[0] == '\0') return;
 
-    cum_lost = s_rtcp_pkts_lost_cum;
-    if (s_rtcp_pkts_received + cum_lost > 0) {
-        frac_lost = (cum_lost * 256) / (s_rtcp_pkts_received + cum_lost);
+    total_received = s_rtcp_pkts_received;
+    total_lost = s_rtcp_pkts_lost_cum;
+    interval_received = total_received - s_rtcp_prev_rr_received;
+    interval_lost = total_lost - s_rtcp_prev_rr_lost_cum;
+    expected_interval = interval_received + interval_lost;
+
+    if (expected_interval > 0) {
+        frac_lost = (interval_lost * 256) / expected_interval;
     }
     if (frac_lost > 255) frac_lost = 255;
+    cum_lost = total_lost;
+    if (cum_lost > 0x7FFFFFU) {
+        cum_lost = 0x7FFFFFU;
+    }
 
     /* RTCP RR header: V=2, P=0, RC=1, PT=201, length=7 */
     buf[0]  = 0x81;  buf[1] = 201;
@@ -608,11 +643,11 @@ static void send_rtcp_rr(void)
     buf[14] = (u8)((cum_lost >> 8) & 0xFF);
     buf[15] = (u8)(cum_lost & 0xFF);
     /* Highest seq */
-    buf[16] = (u8)(s_rtcp_highest_seq >> 24); buf[17] = (u8)(s_rtcp_highest_seq >> 16);
-    buf[18] = (u8)(s_rtcp_highest_seq >> 8);  buf[19] = (u8)s_rtcp_highest_seq;
+    buf[16] = (u8)(s_rtcp_highest_ext_seq >> 24); buf[17] = (u8)(s_rtcp_highest_ext_seq >> 16);
+    buf[18] = (u8)(s_rtcp_highest_ext_seq >> 8);  buf[19] = (u8)s_rtcp_highest_ext_seq;
     /* Jitter */
-    buf[20] = (u8)(s_rtcp_jitter_us >> 24); buf[21] = (u8)(s_rtcp_jitter_us >> 16);
-    buf[22] = (u8)(s_rtcp_jitter_us >> 8);  buf[23] = (u8)s_rtcp_jitter_us;
+    buf[20] = (u8)(s_rtcp_jitter_rtp >> 24); buf[21] = (u8)(s_rtcp_jitter_rtp >> 16);
+    buf[22] = (u8)(s_rtcp_jitter_rtp >> 8);  buf[23] = (u8)s_rtcp_jitter_rtp;
     /* LSR = 0, DLSR = 0 (no SR received from server) */
     buf[24] = 0; buf[25] = 0; buf[26] = 0; buf[27] = 0;
     buf[28] = 0; buf[29] = 0; buf[30] = 0; buf[31] = 0;
@@ -629,8 +664,10 @@ static void send_rtcp_rr(void)
         if (tx < 0) {
             net_log("[PHASE5-RTCP] RR send failed errno=%d\n", sceNetInetGetErrno());
         } else {
-            net_log("[PHASE5-RTCP] sent RR: frac_lost=%u cum_lost=%u jitter=%u\n",
-                    (unsigned)frac_lost, (unsigned)cum_lost, (unsigned)s_rtcp_jitter_us);
+            s_rtcp_prev_rr_received = total_received;
+            s_rtcp_prev_rr_lost_cum = total_lost;
+            net_log("[PHASE5-RTCP] sent RR: frac_lost=%u cum_lost=%u jitter90k=%u\n",
+                    (unsigned)frac_lost, (unsigned)cum_lost, (unsigned)s_rtcp_jitter_rtp);
         }
     }
 }
@@ -1186,31 +1223,49 @@ static int network_recv_thread(SceSize args, void *argp)
             s_rtcp_pkts_received++;
             if ((u32)n >= 12) {
                 u16 rtp_seq = (u16)((recv_buf[2] << 8) | recv_buf[3]);
+                u32 rtp_timestamp = (u32)((recv_buf[4] << 24) | (recv_buf[5] << 16) |
+                                          (recv_buf[6] << 8) | recv_buf[7]);
                 u32 ssrc = (u32)((recv_buf[8] << 24) | (recv_buf[9] << 16) |
                                   (recv_buf[10] << 8) | recv_buf[11]);
+                u32 ext_seq = s_rtcp_have_last_seq ?
+                              rtcp_extend_seq(rtp_seq, s_rtcp_last_ext_seq) :
+                              (u32)rtp_seq;
                 s_rtcp_ssrc = ssrc;
                 if (s_rtcp_have_last_seq) {
-                    int gap = (int)(u16)(rtp_seq - s_rtcp_last_seq) - 1;
+                    int gap = (int)(ext_seq - s_rtcp_last_ext_seq) - 1;
                     if (gap > 0 && gap < 1000)
                         s_rtcp_pkts_lost_cum += (u32)gap;
                 }
-                if (rtp_seq > (u16)s_rtcp_highest_seq ||
-                    ((u16)s_rtcp_highest_seq > 0xF000 && rtp_seq < 0x1000)) {
-                    s_rtcp_highest_seq = rtp_seq;
+                if (!s_rtcp_have_last_seq || ext_seq > s_rtcp_highest_ext_seq) {
+                    s_rtcp_highest_ext_seq = ext_seq;
                 }
-                s_rtcp_last_seq = rtp_seq;
+                s_rtcp_last_ext_seq = ext_seq;
                 s_rtcp_have_last_seq = 1;
-                /* Inter-arrival jitter EWMA (microseconds) */
+                /* RFC3550 inter-arrival jitter in RTP timestamp units. */
                 {
                     u32 now_us = sceKernelGetSystemTimeLow();
                     if (s_rtcp_last_arrival_us != 0) {
                         u32 delta = now_us - s_rtcp_last_arrival_us;
-                        int diff = (int)delta - (int)s_rtcp_jitter_us;
+                        u32 arrival_delta_rtp = rtcp_us_to_rtp90k(delta);
+                        u32 rtp_delta = rtp_timestamp - s_rtcp_last_rtp_timestamp;
+                        s64 diff = (s64)arrival_delta_rtp - (s64)rtp_delta;
+                        s64 adjust;
+
                         if (diff < 0) diff = -diff;
-                        s_rtcp_jitter_us = s_rtcp_jitter_us +
-                                           ((u32)diff - s_rtcp_jitter_us + 8) / 16;
+
+                        adjust = diff - (s64)s_rtcp_jitter_rtp;
+                        if (adjust >= 0) {
+                            s_rtcp_jitter_rtp += (u32)((adjust + 8) / 16);
+                        } else {
+                            u32 decay = (u32)(((-adjust) + 8) / 16);
+                            if (decay > s_rtcp_jitter_rtp)
+                                s_rtcp_jitter_rtp = 0;
+                            else
+                                s_rtcp_jitter_rtp -= decay;
+                        }
                     }
                     s_rtcp_last_arrival_us = now_us;
+                    s_rtcp_last_rtp_timestamp = rtp_timestamp;
                 }
             }
         }

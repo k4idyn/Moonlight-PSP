@@ -1,12 +1,19 @@
 # Architecture
 
-_PSP Moonlight v1.0.0_
+_PSP Moonlight v1.1.0_
 
 ## Overview
 
 PSP Moonlight uses an **asymmetric dual-core software H.264 decode pipeline** to sustain real-time video on the PSP's constrained hardware. The two processors run distinct, complementary workloads concurrently.
 
 This is a fully custom implementation — no `moonlight-common-c`, no sceMpeg, no external Moonlight library. The network stack, RTSP negotiation, RTP reassembly, FEC repair, H.264 decode, and color conversion are all purpose-built for the PSP's constraints.
+
+Recent networking refinements in this tree:
+
+- Launch/transport bitrate starts from the configured client bitrate without hidden startup downscale.
+- Connection quality classification is transport-focused (loss/FEC recovery), while decoder FPS remains diagnostic.
+- RTCP Receiver Reports use interval loss accounting and jitter in RTP clock units for more accurate host feedback.
+- Adaptive fast-drop threshold is tuned to reduce overreaction to brief transient loss.
 
 ---
 
@@ -17,7 +24,7 @@ Main CPU (Allegrex MIPS32R2 @ 333 MHz)
   Network receive (UDP socket, 512-slot ring)
   RTP reassembly + frame boundary detection
   Reed-Solomon FEC repair (up to 66% parity) + predictive loss detection
-  OpenH264 H.264 decode (Baseline, CAVLC required for normal PSP v1.0 playback)
+  OpenH264 H.264 decode (Baseline, CAVLC required for normal PSP v1.1 playback)
   Control stream (Moonlight protocol, input forward)
   Opus stereo audio decode (48 kHz, fixed-point) + adaptive PLC
   PID-based adaptive bitrate controller
@@ -69,12 +76,14 @@ src/
 │     Ping / IDR request / input packets
 │     IDR exponential backoff (500ms ceiling)
 │     Quality hysteresis (3-reading minimum)
+│     Transport-first quality classification (decode FPS is diagnostic-only)
 │     Enhanced watchdog credit restoration (FEC-weighted)
 │
 ├── network_connect.c        ← RTSP + TLS session establishment
 │     ServerChallenge / ServerChallengeResponse
 │     AES-GCM key negotiation
 │     Sunshine Gen7 (clientVersion 19)
+│     Launch bitrate uses client-selected target directly
 │
 ├── stream_crypto.c          ← AES-GCM video decryption + AES-CBC control
 ├── stream_resolution.c      ← Dynamic resolution scaling (4-step ladder)
@@ -83,10 +92,11 @@ src/
 ├── signal_strength.c        ← PID adaptive bitrate controller
 │     Composite quality: 40% RSSI + 30% CQ + 30% FEC
 │     Anti-windup integral clamping, dead-zone prevention
+│     Fast-drop trigger tuned for consecutive-loss confirmation
 ├── network_me.c             ← Network ME ping thread + ME watchdog
 │     Dynamic SO_RCVBUF (128KB–512KB, capped by runtime-applied socket limit)
 │     Packet prioritization (IDR/SOF preferred)
-│     RTCP receiver reports
+│     RTCP receiver reports (interval loss + RTP-clock jitter)
 │     WiFi power save disable during streaming
 ├── main.c                   ← Entry point, display loop, watchdog integration
 │     Quick relaunch: cached hosts + skip_rescan on intentional exits

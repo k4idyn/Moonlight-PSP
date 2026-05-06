@@ -4,6 +4,14 @@
 
 AMD AMF (Advanced Media Framework) is the hardware video encoder in AMD Radeon GPUs (RX 400 series and newer). It uses the Video Core Engine (VCE) for H.264/HEVC encoding with minimal CPU overhead. For PSP streaming, AMF works well when configured correctly — our A/B testing showed some default settings cause failures while others deliver excellent performance.
 
+This is one backend-specific guide in the full host-encoder guidance set:
+
+- NVIDIA users: see `docs/NVENC_SETTINGS_GUIDE.md`
+- Intel users: see `docs/QSV_SETTINGS_GUIDE.md`
+- Software encoder users: see `docs/SOFTWARE_ENCODING_GUIDE.md`
+
+For all backends, the shared compatibility baseline is the same: H.264 Baseline + CAVLC with conservative starting bitrate/resolution.
+
 > **Sunshine vs Apollo:** All AMD encoder settings are identical between Sunshine and Apollo (ClassicOldSong fork). The encoding pipeline is shared code.
 
 ## Settings

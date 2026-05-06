@@ -1,8 +1,8 @@
-# Installation Guide — PSP Moonlight v1.0.0
+# Installation Guide — PSP Moonlight v1.1.0
 
 ## Prerequisites
 
-- **PSP** with custom firmware installed (ARK-4, PRO-C2, ME/LME, or Infinity)
+- **PSP** with ARK-4 custom firmware installed
 - **Memory Stick** (or internal storage on PSP Go)
 - **Wi-Fi network** (2.4 GHz — the PSP does not support 5 GHz)
 - **Host PC** running [Sunshine](https://github.com/LizardByte/Sunshine) v0.20+
@@ -13,13 +13,12 @@
 
 If your PSP already has custom firmware, skip to Step 2.
 
-ARK-4 is recommended because it has the most reliable kernel plugin loading.
+ARK-4 is the current supported CFW target for this project.
 
 1. Download the latest ARK-4 release from [github.com/PSP-Archive/ARK-4](https://github.com/PSP-Archive/ARK-4/releases).
-2. Follow the ARK-4 installation instructions for your PSP model:
-   - **PSP-1000 / 2000 (hackable):** Use the permanent install (writes to flash).
-   - **PSP-2000 (unhackable) / 3000:** Use the EBOOT-based loader (runs from Memory Stick).
-3. Verify CFW is working: you should see the version string on the XMB (e.g., `6.61 ARK-4`).
+2. Follow the official ARK-4 installation instructions for your exact PSP model/firmware.
+3. Prefer reversible install paths unless you explicitly understand flash-write risks on your device.
+4. Verify CFW is working: you should see the version string on the XMB (e.g., `6.61 ARK-4`).
 
 ---
 
@@ -69,7 +68,7 @@ PSP Moonlight streams from a Sunshine server. Configure Sunshine for optimal PSP
 | **Frame Rate** | 15 fps | Optimal for PSP-1000 (17.9 fps peak) |
 | **Bitrate** | 384 kbps | WiFi-safe default for 802.11b |
 
-### Changing Entropy Coding (CABAC → CAVLC)
+### Changing Entropy Coding (CABAC -> CAVLC)
 
 Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. The PSP decode pipeline is significantly more stable on **CAVLC**, while CABAC can trigger freezes, stutter, or rubber-banding under real Wi-Fi conditions. **Use CAVLC for best reliability.**
 
@@ -79,7 +78,7 @@ Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. 
 2. Log in with your Sunshine credentials.
 3. Go to **Configuration** (the gear icon or "Configuration" tab).
 4. Scroll down to the **Encoder** section.
-5. Look for a setting called **Encoder Coder Type** or **AMD Coder** (the exact name depends on your GPU and Sunshine version).
+5. Look for the H.264 entropy/coder setting for your active encoder backend.
 6. Change it from **CABAC** to **CAVLC**.
 7. Click **Save** and restart Sunshine.
 
@@ -88,10 +87,17 @@ Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. 
 Open `sunshine.conf` (usually in `C:\Users\<you>\Applications\Files\Apollo\config\sunshine.conf` on Windows, or `~/.config/sunshine/sunshine.conf` on Linux) and add or change:
 
 ```ini
+# AMD AMF
 amd_coder = cavlc
+
+# NVIDIA NVENC
+nvenc_h264_cavlc = enabled
+
+# Intel QSV
+qsv_coder = cavlc
 ```
 
-> **Why?** CABAC is a more complex entropy coding method that saves bandwidth but increases decode complexity. On PSP, CAVLC is the practical reliability-first choice.
+> **Why?** CABAC is more decode-intensive. On PSP, CAVLC is the practical reliability-first choice across host GPU vendors.
 
 ### UPnP for Hotspot / Remote Sessions
 
@@ -160,7 +166,7 @@ min_fps_factor = 1
 - Reduce bitrate to **384 kbps** if packet loss is high (check the HUD stats).
 
 ### Application crashes on launch
-- Ensure your CFW is **6.60** or **6.61** based. ARK-4 on 6.61 is recommended.
+- Ensure ARK-4 is installed correctly for your firmware/model and currently active.
 - The PRX requires kernel-mode plugin access — some older CFW versions restrict this.
 
 ---
