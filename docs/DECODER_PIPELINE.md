@@ -52,7 +52,7 @@ Throughput = `max(OpenH264_decode_ms, ME_convert_ms)` - not their sum.
 | Internal buffering | May buffer frames for reordering | No reorder buffering (streaming mode) |
 | Thread overhead | Thread-safe mutexes (unused on PSP) | Compiled with DISABLE_DECODER_MT, zero sync |
 | Error concealment | Full re-decode on error | SLICE_COPY - copies previous slice, no re-decode |
-| CABAC support | Not available in PSP build | CABAC+CAVLC supported, but CABAC is unstable on PSP (~25% success rate, causes stalls and rubber-banding). **Use CAVLC.** |
+| CABAC support | Not available in PSP build | CAVLC is required for normal PSP v1.0 playback. CABAC test runs exist only to verify host-side detection and fail-fast behavior; normal-mode CABAC streams are treated as unsupported and aborted. |
 | Trace logging | Always active | Disabled via DECODER_OPTION_TRACE_LEVEL=0 |
 | Source control | Binary cross-compiled library | Full source - recompilable with PSP-specific flags |
 

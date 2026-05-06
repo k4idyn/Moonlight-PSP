@@ -1,4 +1,4 @@
-# Installation Guide — PSP Moonlight v0.2.0-beta
+# Installation Guide — PSP Moonlight v1.0.0
 
 ## Prerequisites
 
@@ -64,14 +64,14 @@ PSP Moonlight streams from a Sunshine server. Configure Sunshine for optimal PSP
 |---|---|---|
 | **Video Codec** | H.264 | Only codec the PSP can decode |
 | **Encoder Profile** | Baseline | PSP OpenH264 build supports Baseline only |
-| **Entropy Coding** | CAVLC | **CAVLC strongly recommended.** CABAC is technically supported but only works about 25% of the time — it causes frequent stalls, choppy video, and rubber-banding on PSP hardware. See "Changing Entropy Coding" below. |
+| **Entropy Coding** | CAVLC | **CAVLC strongly recommended.** CABAC can be unstable on PSP workloads and may cause stalls or heavy jitter. See "Changing Entropy Coding" below. |
 | **Resolution** | 480×272 | Native PSP LCD resolution |
 | **Frame Rate** | 15 fps | Optimal for PSP-1000 (17.9 fps peak) |
 | **Bitrate** | 384 kbps | WiFi-safe default for 802.11b |
 
 ### Changing Entropy Coding (CABAC → CAVLC)
 
-Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. The PSP technically supports CABAC, but it only works about 25% of the time — the other 75% you'll see the video freeze, stutter, rubber-band, or stall completely. **You need to switch to CAVLC.**
+Your streaming server (Sunshine, etc.) may default to **CABAC** entropy coding. The PSP decode pipeline is significantly more stable on **CAVLC**, while CABAC can trigger freezes, stutter, or rubber-banding under real Wi-Fi conditions. **Use CAVLC for best reliability.**
 
 **How to change it in Sunshine's Web UI:**
 
@@ -91,7 +91,25 @@ Open `sunshine.conf` (usually in `C:\Users\<you>\Applications\Files\Apollo\confi
 amd_coder = cavlc
 ```
 
-> **Why?** CABAC is a more complex entropy coding method that saves bandwidth but requires significantly more CPU to decode. The PSP's 333 MHz MIPS processor simply can't keep up with CABAC decoding in real-time for most streams. CAVLC is lighter and works reliably.
+> **Why?** CABAC is a more complex entropy coding method that saves bandwidth but increases decode complexity. On PSP, CAVLC is the practical reliability-first choice.
+
+### UPnP for Hotspot / Remote Sessions
+
+PSP Moonlight can request temporary UPnP IGD UDP mappings for RTP/RTCP ports during session setup.
+
+Use this when streaming over:
+
+- Mobile hotspot networks
+- Public/WAN routes
+- NAT environments that need explicit inbound UDP mapping
+
+Checklist:
+
+1. Enable UPnP on your router/hotspot (if supported).
+2. Ensure Sunshine is running and reachable on the selected route.
+3. Start with conservative stream settings (Baseline + CAVLC + moderate bitrate).
+
+If UPnP is unavailable or blocked by network policy, LAN streaming may still work normally, but remote NAT traversal can fail depending on gateway behavior.
 
 ### Sunshine Configuration
 

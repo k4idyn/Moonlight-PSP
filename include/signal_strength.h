@@ -44,8 +44,8 @@ extern "C" {
 #define PID_MAX_DELTA_KBPS  150
 
 /* Phase 4: Adaptive bitrate constants */
-#define ADAPT_FAST_DROP_THRESHOLD  3      /* consecutive drops to trigger halve */
-#define ADAPT_SLOW_RECOVER_KBPS   50     /* kbps per second recovery rate (was 25) */
+#define ADAPT_FAST_DROP_THRESHOLD  2      /* consecutive drops to trigger halve */
+#define ADAPT_SLOW_RECOVER_KBPS   25     /* kbps per second recovery rate */
 #define ADAPT_GREEN_HOLDOFF_US    (5 * 1000 * 1000) /* 5s green before recovery */
 #define ADAPT_DEADZONE_PCT        15     /* +/-15% stability band */
 #define ADAPT_CEILING_MAX_KBPS    4000   /* absolute bitrate ceiling */
@@ -107,6 +107,16 @@ typedef struct {
  * Must be called after WiFi connection is established.
  */
 void signal_strength_init(int base_bitrate_kbps);
+
+/*
+ * signal_strength_get_launch_bitrate_kbps - Derive the conservative PSP launch bitrate
+ *
+ * @configured_bitrate_kbps: User-selected stream bitrate from config
+ *
+ * Returns: Initial runtime bitrate budget in kbps used by both RTSP launch
+ * and the adaptive signal-strength controller.
+ */
+int signal_strength_get_launch_bitrate_kbps(int configured_bitrate_kbps);
 
 /*
  * signal_strength_update - Check signal and adjust bitrate

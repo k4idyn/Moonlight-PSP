@@ -1,123 +1,83 @@
 # Known Issues
 
-_PSP Moonlight v0.2.3-beta_
+_PSP Moonlight v1.0.0_
 
-This document tracks confirmed bugs, hardware limitations, and fixed issues. All issues listed under "Fixed" were resolved during internal development and are included in the current release.
-
----
-
-## Critical / Active Blockers
-
-### No display double-buffering
-**Status:** Not implemented  
-**Impact:** Tearing visible during fast motion. The GE/GU display pipeline writes directly to the active framebuffer. Double-buffering requires allocating a second buffer and flipping on vsync, which interacts with the ME output pipeline.
-
-### 30 fps ceiling (network-bound)
-**Status:** By design at current architecture  
-**Impact:** RTP/FEC/reassembly processing overhead on the main CPU limits practical sustained frame rate to ~15–18 fps on PSP-1000 at 500 kbps. Internal decode speed (OpenH264 + VFPU) can sustain 40+ fps; the bottleneck is network processing.  
-**Run 073 data:** At 30 fps target, actual delivery was 7.8 fps with constant ring overflow (1023/1024). Decoder itself capable of 40.6 fps.  
-**Mitigation:** Lower resolution (368×208) reduces RTP packet count and improves network throughput.
+This document lists user-facing limitations, compatibility notes, and practical guidance for stable streaming on PSP hardware.
 
 ---
 
-## Known Hardware Quirks
+## Current Limitations
 
-### `mfv` returns 0 on ME core
-Reading a VFPU scalar register into a MIPS GP register via `mfv` always returns 0 on the Media Engine. This is a PSP-specific hardware bug not documented in Sony's official SDK. Workaround: extract VFPU data via `sv.s`/`sv.q` to cached memory, then `lw`.
+### CAVLC host output is required for stable normal playback
+**Impact:** CABAC streams are intentionally treated as unsupported in normal playback mode.
+**Guidance:** Configure Sunshine entropy coding to CAVLC (`amd_coder=cavlc`, `nvenc_h264_cavlc=enabled`, `qsv_coder=cavlc`).
 
-### `vi2uc.q` wrong output on real PSP
-The `vi2uc.q` instruction (vector int-to-unsigned char pack) does `val >> 23` before byte packing on real hardware, producing garbage for normal float ranges. Not usable for YUV→RGBA on hardware. Workaround: use `sv.s` stores + manual byte packing.
+### Icon download/cache behavior
+**Impact:** Game-library icons use the normal Sunshine box-art path with static-memory decode and raw RGB565 cache files.
+**Guidance:** If icons appear stale or missing, clear `ms0:/PSP/GAME/Moonlight/cache/` and refresh the game library.
 
-### ME crash on uncached addresses
-Passing `0x48xxxxxx` (uncached alias) to ME code causes a bus error and ME halt. Always use cached addresses (`0x00xxxxxx`) for ME data. Verified repeatedly across ME development.
+### No tearless double buffering yet
+**Impact:** Fast horizontal motion can show tearing.
+**Status:** Planned future improvement.
 
-### WiFi degradation during active streaming
-802.11b packet loss increases over time during streaming sessions, particularly after 40–45 seconds of continuous RTP traffic. Observed consistently across test runs. FEC absorbs most loss but burst losses trigger IDR recovery cycles. Use a strong 2.4 GHz signal or 802.11g.
+### Practical performance ceiling on PSP hardware
+**Impact:** Effective framerate depends on stream profile, signal quality, and host encode settings. Overly aggressive settings can cause stutter or delayed recovery.
+**Guidance:** Start with 480x272 at 15 fps and tune upward only if stable.
 
-### Audio PLC static at high packet loss
-**Status:** Partially mitigated  
-**Impact:** When WiFi drops >3 consecutive audio packets, PLC (Packet Loss Concealment) generates synthetic audio that sounds like static. Volume ducking (87.5% → 68.75% → 50%) reduces but doesn't eliminate the artifact. At ~37% WiFi packet loss (typical for 802.11b), PLC generates ~14% of audio timeline as synthetic frames.  
-**Mitigation:** PLC threshold is now quality-adaptive (35ms good / 45ms fair / 60ms poor) instead of fixed 45ms. Volume ducking fades PLC output. Further improvement would require increasing `packetDuration` from 20ms to 40ms (halving packet count) but requires buffer resize.
+### High resolutions are not practical on PSP
+**Impact:** Resolutions significantly above 480x272 can exceed decode/network limits and degrade usability.
+**Guidance:** 368x208 and 480x272 are recommended operating ranges.
 
-### Resolutions above 480×272
-**Status:** Hardware limitation  
-**Impact:** The PSP decode pipeline cannot sustain video at 640×360 or above. Testing confirms 640×360 shows only the initial app splash, 854×480 fails to receive any video frames, and 1280×720 is far beyond capability. The practical maximum for custom resolutions is 368×208; at 480×272 native the decoder runs near its ceiling.  
-**Mitigation:** Dynamic resolution scaling automatically steps down when decode time or loss rate exceeds thresholds.
-
-### 8 protocol features untriggered in automated testing
-**Status:** By design (edge-case scenarios)  
-**Impact:** Graceful Disconnect, IDR Suppression, P-Frame Skip, Frame Pacing, RTP Stats API, Predictive Frame Drop, Audio Crypto Sep, and Session Resume are implemented but require specific edge-case conditions (e.g., server-initiated disconnect, intra-refresh mode, deliberate crypto failure) not exercised in standard streaming tests. 31/39 features verified ACTIVE across 8-stage automated test.
+### Wi-Fi quality remains the primary bottleneck
+**Impact:** Burst loss or weak 2.4 GHz conditions can still cause occasional recovery events and audio artifacts.
+**Guidance:** Improve signal quality, reduce bitrate, and avoid congested channels.
 
 ---
 
-## Fixed (included in v0.2.2-beta)
+## Hotspot and Remote Session Notes (UPnP)
 
-### IDR flood with exponential backoff — Fixed in v0.2.2-beta
-IDR requests were rate-limited to 1/sec but still flooded at ~40–100/min on lossy WiFi. Replaced with exponential backoff (500ms → 1000ms → 2000ms → 4000ms) with automatic cooldown on successful frame delivery. Reduced IDR requests to ~5–15/min.
+PSP Moonlight supports UPnP IGD port mapping assistance for hotspot and remote/NAT-constrained sessions.
 
-### Config resolution index defaulting to 272p — Fixed in v0.2.2-beta
-Custom resolutions always mapped to `resolutionIndex=0` (480×272) on INI reload. Three bugs: (1) width-only switch missed height, (2) fpsIndex rebuilder values mismatched `FPS_VALUES[]` array, (3) INI write order incorrect. All three fixed in `config.c`.
+### What UPnP assist does
 
-### Decode stall on P-frame backlog — Fixed in v0.2.2-beta
-When packet loss caused >256 packets to queue, decoder wasted time on stale P-frames with corrupted references. Now scans forward to next IDR/SPS/PPS instead of decoding sequentially.
+- Requests temporary UDP mappings for active video/audio RTP/RTCP ports
+- Cleans mappings on session teardown/failure
+- Improves connection reliability when direct inbound NAT traversal is required
 
----
+### When UPnP assist may not work
 
-## Fixed (included in v0.2.3-beta)
+- Gateway/hotspot does not implement UPnP IGD
+- UPnP is disabled by network policy
+- Carrier-grade NAT or restricted ISP/mobile network behavior blocks expected routing
 
-### Deblocking filter re-enabled — Fixed in v0.2.3-beta
-Deblocking was compile-time disabled (`PSP_SKIP_DEBLOCKING`) for ~15% decode speed improvement. At sub-native resolutions (256×144, 368×208) the CPU cost is only ~2–3ms/frame, which is acceptable. Re-enabled by removing the compile flag. Removes blocking artifacts at low bitrates.
+### Recommended remote-session checklist
 
-### Stale pairing data on 401 response — Fixed in v0.2.3-beta
-Three separate 401-response handlers now remove the specific host IP from the paired array (shift + decrement) instead of just clearing a single field. Prevents stale pairing data for other hosts in the multi-host pairing system.
-
-### Quit+relaunch slow (two loading screens) — Fixed in v0.2.3-beta
-Quitting a stream and relaunching the same game took ~15–24s (host re-probe + Resume/Quit popup + cancel + 6s wait + launch). Fixed: host list is cached across stream exits (skip_rescan=1), and same-app relaunch auto-resumes without the popup.
-
-### Offline hosts showing "Unpaired" — Fixed in v0.2.3-beta
-Offline hosts displayed "Unpaired" in the host list, which was misleading since their pairing status can't be verified. Paired/Unpaired label now hidden for offline hosts (status 0).
-
-### Back from game list error triggers full re-discovery — Fixed in v0.2.3-beta
-Pressing back from "Failed to Load Games" triggered a full host re-discovery (3–8s rescan). Now returns instantly to the cached host list. Square button still available for manual rescan.
+- Enable UPnP on the gateway/hotspot if available
+- Confirm Sunshine host is reachable on the intended route
+- Keep host profile conservative first (H.264 Baseline, CAVLC, moderate bitrate)
 
 ---
 
-## Fixed (included in v0.2.1-beta)
+## Host Compatibility Guidance
 
-### Server-side stream stall — Fixed in v0.2.1-beta
-WiFi keepalive was disabled during streaming, causing Sunshine to time out and stop sending video after ~35 seconds. Fixed by keeping the keepalive thread active during streaming with 3-second check intervals.
+### Recommended baseline stream profile
 
-### Audio underruns (31% → 0%) — Fixed in v0.2.1-beta
-Audio playback thread starved due to low priority and inefficient polling. Fixed through progressive optimization: thread priority tuning (0x1A), polling backoff (500µs/1ms/2ms), ring buffer management (64 slots), and FEC recovery. Final rate: 0.0–0.5% underruns.
+- Codec: H.264
+- Profile: Baseline
+- Entropy: CAVLC (required; CABAC is treated as unsupported in normal PSP mode)
+- Initial target: 480x272 @ 15 fps
+- Initial bitrate: around 384 kbps
 
-### IDR flood during streaming — Fixed in v0.2.1-beta
-Three-part fix: (1) RTP FEC unrecoverable drops check `g_refs_corrupted` before requesting IDR, (2) RTP reassembly seq-gap frames set corruption flag, (3) control stream rate-limits IDR requests to 1/sec after initial 5 rapid-fire. Reduced IDR requests from 66+ to near-zero.
+### If video is unstable
 
-## Fixed (included in v0.2.0-beta)
-
-### Display freeze after queue overrun (run 070) — Fixed in internal 0.3.0-alpha
-Queue overrun handler flushed RTP state but not OpenH264's internal codec context. The decoder entered a permanent error state, triggering an infinite overrun loop that destroyed each arriving IDR before reassembly completed. Fixed by calling `oh264_pipeline_flush_buffers()` (which flushes the decoder and clears ME state) from the overrun handler.
-
-### ME permanent disable after first crash — Fixed in internal 0.3.0-alpha
-ME was permanently disabled after the first timeout. Replaced with KillME+reinit+retry (up to 3 recoveries). 11/11 ME timeouts recovered in extended testing.
-
-### ME bus error at 640×360 — Fixed in internal 0.3.0-alpha
-ME YUV conversion used uncached buffer pointers. At 640×360 (1.7 MB/frame uncached traffic), the ME bus saturated and crashed. Fixed by switching to cached addresses with dcache flush protocol.
-
-### ENet per-channel sequence desync (all input dropped) — Fixed in internal 0.2.0-alpha
-Two shared reliable sequence counters (one for channel 0x01, one shared for all others) caused channel 0x10 (input) to arrive with seq 200+ when server expected seq 1 on that channel. Server buffered packet forever. All button input silently dropped. Fixed with per-channel array.
-
-### Green/magenta artifact frames (VQ#5b) — Fixed in internal 0.1.5-alpha
-RS failures and sequence gaps did not set `g_refs_corrupted`. P-frames decoded against corrupted DPB produced horizontal banding. Fixed by gating `g_refs_corrupted` on both RS failures and seq gaps.
-
-### IDR flooding 802.11b (123 IDR requests, 0 delivered) — Fixed in internal 0.1.5-alpha
-Each unrecoverable FEC drop set `g_idr_fully_decoded = 0`, triggering full IDR requests every 5s. IDRs at 480×272 are 17–20 packets (~23 KB) — too large to survive 802.11b burst loss. Fixed with RFI (Reference Frame Invalidation) for the non-corrupted case.
+- Reduce bitrate first
+- Then reduce resolution to 368x208
+- Verify Wi-Fi strength and channel congestion
 
 ---
 
-## Won't Fix / Out of Scope
+## Out of Scope
 
-- **PSP Go support:** Different Wi-Fi hardware. Not a target platform.
-- **H.265/AV1 decode:** PSP hardware cannot decode these; far beyond CPU capability in software.
-- **NVIDIA GameStream backend:** Untested; Sunshine is the supported host. GameStream is deprecated.
-- **Encrypted audio channel:** Audio stream received unencrypted in current sessions; no change planned.
+- H.265/AV1 decode on PSP
+- Full parity with modern desktop-class hardware decoders
+- Non-PSP platform-specific support requirements

@@ -15,12 +15,12 @@
 #include <pspkernel.h>
 #include <pspthreadman.h>
 #include <pspiofilemgr.h>
-#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "safety_buffer.h"
 #include "shared.h"
+#include "diag_log.h"
 
 /* GU UI owns the framebuffer during normal runtime; avoid direct debug-screen writes. */
 #define pspDebugScreenPrintf(...) ((void)0)
@@ -35,8 +35,8 @@ volatile int g_storage_fault = 0;
  * Write-Queue for async MemStick spill
  *============================================================================*/
 
-#define WRITE_QUEUE_SLOTS   16      /* Max pending writes before dropping */
-#define WRITE_QUEUE_BUF_SZ  (16 * 1024)  /* 16KB — covers >99% of NAL sizes (H-1) */
+#define WRITE_QUEUE_SLOTS   12      /* Max pending writes before dropping; trimmed to reclaim PSP-1000 headroom */
+#define WRITE_QUEUE_BUF_SZ  (64 * 1024)  /* Larger slot reduces oversized NAL drops */
 
 typedef struct {
     u8  buf[WRITE_QUEUE_BUF_SZ];
@@ -47,6 +47,7 @@ typedef struct {
 static WriteQueueSlot      s_wq_slots[WRITE_QUEUE_SLOTS];
 static volatile u32        s_wq_head = 0;   /* producer writes */
 static volatile u32        s_wq_tail = 0;   /* consumer reads  */
+static u8                  s_ram_pool[SAFETY_BUFFER_SIZE_BYTES] __attribute__((aligned(64)));
 
 /* Semaphore: signalled by producer, waited on by consumer */
 static SceUID              s_wq_sem = -1;
@@ -139,17 +140,41 @@ static int write_to_fallback(u8 *nal_data, u32 nal_len)
 {
     u32 next_head;
     WriteQueueSlot *slot;
+    static u32 s_queue_full_consec = 0;
 
     if (g_safety_buffer.fallback_fd < 0)
         return -1;
 
-    /* Silently drop NALs that exceed per-slot capacity */
-    if (nal_len > WRITE_QUEUE_BUF_SZ)
+    if (nal_len > WRITE_QUEUE_BUF_SZ) {
+        static u32 s_oversize_drop_count = 0;
+        s_oversize_drop_count++;
+        g_safety_buffer.fallback_drops++;
+        if (s_oversize_drop_count <= 5 || (s_oversize_drop_count % 200) == 0) {
+            diag_log_write("SAFE", "fallback drop: oversize NAL len=%u limit=%u (#%u)",
+                           (unsigned)nal_len, (unsigned)WRITE_QUEUE_BUF_SZ,
+                           (unsigned)s_oversize_drop_count);
+        }
         return -1;
+    }
 
     next_head = (s_wq_head + 1) % WRITE_QUEUE_SLOTS;
-    if (next_head == s_wq_tail)
+    if (next_head == s_wq_tail) {
+        static u32 s_queue_full_drop_count = 0;
+        s_queue_full_drop_count++;
+        s_queue_full_consec++;
+        g_safety_buffer.fallback_drops++;
+        if (s_queue_full_drop_count <= 5 || (s_queue_full_drop_count % 200) == 0) {
+            diag_log_write("SAFE", "fallback drop: queue full head=%u tail=%u (#%u)",
+                           (unsigned)s_wq_head, (unsigned)s_wq_tail,
+                           (unsigned)s_queue_full_drop_count);
+        }
+        if (s_queue_full_consec >= WRITE_QUEUE_SLOTS) {
+            /* Sustained saturation means spill path can't keep up. Surface this
+             * as a storage fault so higher layers can switch recovery strategy. */
+            g_storage_fault = 1;
+        }
         return -1; /* Queue full — drop rather than block */
+    }
 
     slot = &s_wq_slots[s_wq_head];
     memcpy(slot->buf, nal_data, nal_len);
@@ -157,6 +182,7 @@ static int write_to_fallback(u8 *nal_data, u32 nal_len)
 
     /* Publish: advance head AFTER data is written (memory barrier via volatile) */
     s_wq_head = next_head;
+    s_queue_full_consec = 0;
 
     /* Wake writer thread */
     if (s_wq_sem >= 0)
@@ -325,32 +351,13 @@ int safety_buffer_init(void)
         return -1;
     }
 
-    /* Allocate RAM pool (500 KB for 2 seconds of video) */
+    /* Use a fixed RAM pool (500 KB for 2 seconds of video). v1.0 policy:
+     * no first-party heap allocation in the streaming path. */
     g_safety_buffer.ram_pool_size = SAFETY_BUFFER_SIZE_BYTES;
-    g_safety_buffer.ram_pool = (u8*)memalign(64, g_safety_buffer.ram_pool_size);
-    
-    if (!g_safety_buffer.ram_pool) {
-        pspDebugScreenPrintf("safety_buf: RAM allocation failed, using fallback\n");
-        
-        /* Open fallback file on Memory Stick */
-        g_safety_buffer.fallback_fd = sceIoOpen(
-            SAFETY_BUFFER_FALLBACK_PATH,
-            PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
-            0777
-        );
-        
-        if (g_safety_buffer.fallback_fd < 0) {
-            pspDebugScreenPrintf("safety_buf: fallback file open failed\n");
-            sceKernelDeleteSema(g_safety_buffer.mutex_id);
-            return -2;
-        }
-        
-        g_safety_buffer.using_fallback = 1;
-        pspDebugScreenPrintf("safety_buf: using MS fallback file\n");
-    } else {
-        pspDebugScreenPrintf("safety_buf: allocated %d KB RAM pool\n", 
-                             g_safety_buffer.ram_pool_size / 1024);
-    }
+    g_safety_buffer.ram_pool = s_ram_pool;
+    g_safety_buffer.using_fallback = 0;
+    pspDebugScreenPrintf("safety_buf: using static %d KB RAM pool\n",
+                         g_safety_buffer.ram_pool_size / 1024);
     
     /* Initialize slot pointers to NULL */
     for (int i = 0; i < SAFETY_BUFFER_SLOTS; i++) {
@@ -369,7 +376,7 @@ int safety_buffer_init(void)
     g_safety_buffer.writer_thread_id = sceKernelCreateThread(
         "safety_buf_writer",
         writer_thread,
-        0x20,           /* Low priority */
+        0x1C,           /* Below decode, but high enough to drain queue bursts */
         0x4000,         /* 16 KB stack */
         PSP_THREAD_ATTR_USER,
         NULL
@@ -433,10 +440,15 @@ void safety_buffer_store_nal(u8 *nal_data, u32 nal_len, u64 pts, u8 is_keyframe)
             );
             
             if (g_safety_buffer.fallback_fd >= 0) {
+                int wq_ret;
                 g_safety_buffer.using_fallback = 1;
                 
                 /* Write current NAL to fallback */
-                write_to_fallback(nal_data, nal_len);
+                wq_ret = write_to_fallback(nal_data, nal_len);
+                if (wq_ret < 0) {
+                    release_mutex();
+                    return;
+                }
             }
             
             release_mutex();
@@ -447,7 +459,10 @@ void safety_buffer_store_nal(u8 *nal_data, u32 nal_len, u64 pts, u8 is_keyframe)
         memcpy(data_copy, nal_data, nal_len);
     } else {
         /* Using fallback file - write asynchronously */
-        write_to_fallback(nal_data, nal_len);
+        if (write_to_fallback(nal_data, nal_len) < 0) {
+            release_mutex();
+            return;
+        }
         data_copy = NULL; /* Data is on disk, not in RAM */
     }
     
@@ -632,6 +647,7 @@ void safety_buffer_clear(void)
     /* Reset statistics */
     g_safety_buffer.total_nals_buffered = 0;
     g_safety_buffer.total_bytes_buffered = 0;
+    g_safety_buffer.fallback_drops = 0;
     
     /* Clear fallback file if using it */
     if (g_safety_buffer.using_fallback && g_safety_buffer.fallback_fd >= 0) {
@@ -678,11 +694,7 @@ void safety_buffer_shutdown(void)
         sceIoRemove(SAFETY_BUFFER_FALLBACK_PATH);
     }
 
-    /* Free RAM pool */
-    if (g_safety_buffer.ram_pool) {
-        free(g_safety_buffer.ram_pool);
-        g_safety_buffer.ram_pool = NULL;
-    }
+    g_safety_buffer.ram_pool = NULL;
 
     /* Delete mutex */
     if (g_safety_buffer.mutex_id >= 0) {

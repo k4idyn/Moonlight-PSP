@@ -35,7 +35,6 @@ extern "C" {
 #include <pspsdk.h>
 #include <psprtc.h>
 #include <string.h>
-#include <malloc.h>
 
 #include "sw_decode_pipeline.h"
 #include "stream_resolution.h"
@@ -61,6 +60,8 @@ static ISVCDecoder *g_decoder = NULL;
 /* RGBA double-buffer — sized from g_stream_res at init */
 static u8 *g_rgba_buf[2] = {NULL, NULL};
 static int  g_rgba_idx   = 0;
+#define OH264_MAX_RGBA_SIZE (FRAME_STRIDE * FRAME_HEIGHT * PIXEL_SIZE)
+static u8 g_rgba_static[2][OH264_MAX_RGBA_SIZE] __attribute__((aligned(64)));
 
 /* Statistics */
 static int g_frames_decoded = 0;
@@ -187,6 +188,8 @@ typedef struct {
 static volatile struct me_struct *g_me_ctrl        = NULL;
 static volatile struct me_struct *g_me_ctrl_cached = NULL;
 static MeYuv2RgbaParams          *g_me_params      = NULL;
+static struct me_struct           g_me_ctrl_storage __attribute__((aligned(64)));
+static MeYuv2RgbaParams           g_me_params_storage __attribute__((aligned(64)));
 static int  g_me_available = 0;
 static int  g_me_pending   = 0;
 static u8  *g_me_rgba_out  = NULL;
@@ -275,11 +278,20 @@ extern "C" int oh264_pipeline_init(void)
     }
     diag_log_write("OH264", "OpenH264 decoder initialized (threads=0, trace=off)");
 
-    /* RGBA double-buffer */
-    g_rgba_buf[0] = (u8 *)memalign(64, g_stream_res.rgba_size);
-    g_rgba_buf[1] = (u8 *)memalign(64, g_stream_res.rgba_size);
+    /* RGBA double-buffer. Fixed static storage keeps the stream path out of
+     * the heap; g_stream_res.rgba_size is validated against the PSP LCD max. */
+    if (g_stream_res.rgba_size > OH264_MAX_RGBA_SIZE) {
+        diag_log_write("OH264", "RGBA static buffer too small (%d > %d)",
+                       g_stream_res.rgba_size, OH264_MAX_RGBA_SIZE);
+        g_decoder->Uninitialize();
+        WelsDestroyDecoder(g_decoder);
+        g_decoder = NULL;
+        return -3;
+    }
+    g_rgba_buf[0] = g_rgba_static[0];
+    g_rgba_buf[1] = g_rgba_static[1];
     if (!g_rgba_buf[0] || !g_rgba_buf[1]) {
-        diag_log_write("OH264", "RGBA buffer alloc failed (%d bytes each)",
+        diag_log_write("OH264", "RGBA static buffer unavailable (%d bytes each)",
                        g_stream_res.rgba_size);
         g_decoder->Uninitialize();
         WelsDestroyDecoder(g_decoder);
@@ -339,8 +351,8 @@ extern "C" int oh264_pipeline_init(void)
 #endif
     }
 
-    g_me_ctrl_cached = (volatile struct me_struct *)memalign(64, sizeof(struct me_struct));
-    g_me_params      = (MeYuv2RgbaParams *)memalign(64, sizeof(MeYuv2RgbaParams));
+    g_me_ctrl_cached = (volatile struct me_struct *)&g_me_ctrl_storage;
+    g_me_params      = &g_me_params_storage;
 
     if (g_me_ctrl_cached && g_me_params) {
         g_me_ctrl = (volatile struct me_struct *)((u32)g_me_ctrl_cached | 0x40000000u);
@@ -402,8 +414,9 @@ extern "C" void oh264_pipeline_shutdown(void)
         g_me_available = 0;
         diag_log_write("OH264", "Media Engine shut down");
     }
-    if (g_me_ctrl_cached) { free((void *)g_me_ctrl_cached); g_me_ctrl_cached = NULL; g_me_ctrl = NULL; }
-    if (g_me_params)      { free(g_me_params); g_me_params = NULL; }
+    g_me_ctrl_cached = NULL;
+    g_me_ctrl = NULL;
+    g_me_params = NULL;
     g_me_pending  = 0;
     g_last_rgba   = NULL;
     g_me_rgba_out = NULL;
@@ -415,7 +428,7 @@ extern "C" void oh264_pipeline_shutdown(void)
     }
 
     for (int i = 0; i < 2; i++) {
-        if (g_rgba_buf[i]) { free(g_rgba_buf[i]); g_rgba_buf[i] = NULL; }
+        g_rgba_buf[i] = NULL;
     }
 }
 
@@ -425,26 +438,29 @@ extern "C" void oh264_pipeline_shutdown(void)
 
 extern "C" void oh264_pipeline_abandon(void)
 {
-    diag_log_write("OH264", "ABANDON: leaking old pipeline (decoded=%d dropped=%d)",
+    diag_log_write("OH264", "ABANDON: resetting old pipeline (decoded=%d dropped=%d)",
                    g_frames_decoded, g_frames_dropped);
 
     if (g_me_ctrl) { KillME(g_me_ctrl); }
 
-    /* Free RGBA double-buffers so reinit can allocate fresh ones.
-     * Safe after KillME — ME is stopped, display thread sees g_last_rgba
-     * go NULL below so it won't deref stale pointers. */
-    if (g_rgba_buf[0]) { free(g_rgba_buf[0]); }
-    if (g_rgba_buf[1]) { free(g_rgba_buf[1]); }
+    /* Static RGBA buffers are retained; display thread sees g_last_rgba go
+     * NULL below so it won't dereference stale contents during reinit. */
     g_rgba_buf[0] = NULL;
     g_rgba_buf[1] = NULL;
     g_rgba_idx    = 0;
 
-    /* Decoder itself is leaked (may be stuck in DecodeFrame2) — can't free */
-    g_decoder     = NULL;
+    /* Decoder thread is terminated before abandon; release decoder resources
+     * to prevent watchdog-restart heap growth. */
+    if (g_decoder) {
+        g_decoder->Uninitialize();
+        WelsDestroyDecoder(g_decoder);
+        g_decoder = NULL;
+    }
 
     g_me_ctrl_cached = NULL;
+    g_me_params = NULL;
+
     g_me_ctrl        = NULL;
-    g_me_params      = NULL;
     g_me_available   = 0;
     g_me_pending     = 0;
     g_last_rgba      = NULL;
@@ -456,7 +472,7 @@ extern "C" void oh264_pipeline_abandon(void)
     g_idr_fully_decoded = 0;
     g_refs_corrupted    = 1;
 
-    diag_log_write("OH264", "ABANDON: all state nulled, ready for full reinit");
+    diag_log_write("OH264", "ABANDON: resources released, ready for full reinit");
 }
 
 /* ============================================================================
@@ -477,6 +493,70 @@ extern "C" void oh264_pipeline_flush_buffers(void)
 /* ============================================================================
  * oh264_pipeline_invalidate_refs — Force wait for next IDR
  * ============================================================================*/
+
+extern "C" int oh264_pipeline_reset_codec(void)
+{
+    diag_log_write("OH264", "codec reset: begin");
+
+    if (g_me_available && g_me_pending && g_me_ctrl) {
+        int loops = 0;
+        while (!CheckME(g_me_ctrl) && loops < 500000) {
+            loops++;
+            if ((loops & 63) == 0)
+                sceKernelDelayThread(0);
+        }
+        if (loops >= 500000) {
+            KillME(g_me_ctrl);
+            memset((void *)g_me_ctrl_cached, 0, sizeof(struct me_struct));
+            sceKernelDcacheWritebackInvalidateAll();
+            if (InitME(g_me_ctrl) != 0) {
+                g_me_available = 0;
+            }
+        }
+        g_me_pending = 0;
+    }
+
+    if (g_decoder) {
+        g_decoder->Uninitialize();
+        WelsDestroyDecoder(g_decoder);
+        g_decoder = NULL;
+    }
+
+    long ret = WelsCreateDecoder(&g_decoder);
+    if (ret != 0 || !g_decoder) {
+        diag_log_write("OH264", "codec reset: WelsCreateDecoder failed %ld", ret);
+        return -1;
+    }
+
+    SDecodingParam param;
+    memset(&param, 0, sizeof(param));
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
+    param.eEcActiveIdc = ERROR_CON_FRAME_COPY_CROSS_IDR;
+    param.bParseOnly   = false;
+
+    long iret = g_decoder->Initialize(&param);
+    if (iret != 0) {
+        diag_log_write("OH264", "codec reset: Initialize failed %ld", iret);
+        WelsDestroyDecoder(g_decoder);
+        g_decoder = NULL;
+        return -2;
+    }
+
+    int num_threads = 0;
+    g_decoder->SetOption(DECODER_OPTION_NUM_OF_THREADS, &num_threads);
+    int trace_level = 0;
+    g_decoder->SetOption(DECODER_OPTION_TRACE_LEVEL, &trace_level);
+
+    g_last_rgba = NULL;
+    g_me_rgba_out = NULL;
+    g_saw_first_idr = 0;
+    g_idr_fully_decoded = 0;
+    g_refs_corrupted = 1;
+    g_current_frame_is_corrupt = 0;
+
+    diag_log_write("OH264", "codec reset: complete");
+    return 0;
+}
 
 extern "C" void oh264_pipeline_invalidate_refs(void)
 {
@@ -502,6 +582,7 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     if (!g_decoder || !nal_data || nal_len <= 0 || !out_rgba) return -1;
 
     *out_rgba = NULL;
+    int collected_me_frame = 0;
 
     /* Clear per-frame corruption flag (snapshot not needed here) */
     g_current_frame_is_corrupt = 0;
@@ -514,7 +595,6 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             if ((loops & 63) == 0)
                 sceKernelDelayThread(0);
         }
-        sceKernelDcacheInvalidateRange(g_me_rgba_out, g_stream_res.rgba_size);
         if (loops >= 5000000) {
             diag_log_write("OH264", "ME TIMEOUT — resetting");
             KillME(g_me_ctrl);
@@ -529,8 +609,11 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             } else {
                 g_me_available = 0;
             }
+        } else {
+            sceKernelDcacheInvalidateRange(g_me_rgba_out, g_stream_res.rgba_size);
+            g_last_rgba = g_me_rgba_out;
+            collected_me_frame = 1;
         }
-        g_last_rgba = g_me_rgba_out;
         g_me_pending = 0;
     }
 
@@ -633,17 +716,19 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
                 s_last_idr_req_us = now_us;
             }
         }
-        /* Return previous frame if we had one (keeps display alive) */
-        if (g_last_rgba) {
+        if (collected_me_frame && g_last_rgba) {
             *out_rgba = g_last_rgba;
+            g_frames_decoded++;
             return 0;
         }
         return -4;
     } else {
         /* ds == dsErrorFree but no output (frame buffered internally).
-         * Return previous frame so display loop isn't starved. */
-        if (g_last_rgba) {
+         * Only report success if async ME completed a fresh frame at entry.
+         * Re-emitting stale RGBA hides frozen playback from telemetry. */
+        if (collected_me_frame && g_last_rgba) {
             *out_rgba = g_last_rgba;
+            g_frames_decoded++;
             return 0;
         }
         /* No frame yet — still waiting for first IDR */

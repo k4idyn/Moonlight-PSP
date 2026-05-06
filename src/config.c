@@ -15,6 +15,7 @@
 #include "ui_manager.h"
 #include "diag_log.h"
 #include "settings_menu.h"  /* RESOLUTION_COUNT */
+#include "stream_resolution.h"
 
 /*--------------------------------------------------------------------------
  * INI Parser Helpers
@@ -395,6 +396,15 @@ int loadConfig(PspConfig *config)
     /* Clamp resolutionIndex to valid range */
     if (config->resolutionIndex < 0 || config->resolutionIndex >= RESOLUTION_COUNT)
         config->resolutionIndex = 0;
+
+    /* Normalize dimensions to the selected mode so runtime launch/display
+     * paths never receive unsupported sizes from a hand-edited config. */
+    if (config->resolutionIndex == RESOLUTION_CUSTOM_INDEX) {
+        stream_resolution_normalize(&config->width, &config->height);
+    } else {
+        config->width = RESOLUTION_WIDTHS[config->resolutionIndex];
+        config->height = RESOLUTION_HEIGHTS[config->resolutionIndex];
+    }
     
     rememberLoadedConfig(config);
 

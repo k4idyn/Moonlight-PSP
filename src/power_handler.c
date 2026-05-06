@@ -24,6 +24,9 @@
 #include "power_handler.h"
 #include "shared.h"
 #include "client_identity.h"
+#include "diag_log.h"
+
+#define pwr_log(fmt, ...) diag_log_write("PWR", fmt, ##__VA_ARGS__)
 
 extern void network_me_shutdown(void);
 extern void network_me_init(PacketRingBuffer *rb);
@@ -102,7 +105,10 @@ static int rtsp_reconnect_play(int sock)
              g_cached_token.session_id);
     
     ret = sceNetInetSend(sock, request, strlen(request), 0);
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        pwr_log("[RESUME] RTSP PLAY send failed errno=%d\n", sceNetInetGetErrno());
+        return -1;
+    }
     
     memset(response, 0, sizeof(response));
     while (total_recv < sizeof(response) - 1)

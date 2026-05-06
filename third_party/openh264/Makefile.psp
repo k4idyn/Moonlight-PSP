@@ -38,7 +38,6 @@ CXXFLAGS += -MMD -MP
 
 # PSP platform defines
 CXXFLAGS += -DPSP
-CXXFLAGS += -DGENERATED_VERSION_HEADER    # suppress auto-detect version include
 CXXFLAGS += -DDISABLE_ENCODER_SIDE        # exclude any encoder-only code paths
 
 # *** KEY: single-threaded decoder ***

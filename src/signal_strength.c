@@ -115,6 +115,17 @@ static int read_signal_percent(void)
  * Public API Implementation
  *============================================================================*/
 
+int signal_strength_get_launch_bitrate_kbps(int configured_bitrate_kbps)
+{
+    int launch_bitrate_kbps = configured_bitrate_kbps > 0 ? configured_bitrate_kbps : 1600;
+
+    launch_bitrate_kbps = (launch_bitrate_kbps * 50 + 99) / 100;
+    if (launch_bitrate_kbps < BITRATE_MIN_KBPS)
+        launch_bitrate_kbps = BITRATE_MIN_KBPS;
+
+    return launch_bitrate_kbps;
+}
+
 void signal_strength_init(int base_bitrate_kbps)
 {
     memset(&g_signal_state, 0, sizeof(g_signal_state));
@@ -126,10 +137,10 @@ void signal_strength_init(int base_bitrate_kbps)
     g_signal_state.icon_show_time = 0;
     g_signal_state.last_check_time = sceKernelGetSystemTimeLow();
 
-    /* PID controller: target 70% quality setpoint (balanced for 802.11b) */
+    /* PID controller: target 75% quality setpoint for release-stability bias. */
     g_signal_state.pid_error_prev = 0;
     g_signal_state.pid_integral = 0;
-    g_signal_state.pid_target_quality = 70;
+    g_signal_state.pid_target_quality = 75;
 
     /* Phase 4: Adaptive bitrate controller init */
     g_signal_state.adapt_consecutive_drops = 0;
@@ -153,6 +164,8 @@ int signal_strength_update(void)
     u32 current_time;
     int signal_percent;
     int composite_quality;
+    int cq_score = 50;
+    int fec_score = 50;
     int error, derivative, pid_output, delta_kbps;
 
     if (!g_initialized)
@@ -237,8 +250,6 @@ int signal_strength_update(void)
 
     {
         ConnQualityState cq = control_stream_get_quality();
-        int cq_score;
-        int fec_score;
 
         /* Map ConnQuality enum to 0-100 scale */
         switch (cq.quality) {
@@ -253,8 +264,10 @@ int signal_strength_update(void)
         /* FEC recovery percentage is already 0-100 */
         fec_score = (int)cq.fec_recovery_pct;
 
-        /* Weighted composite: RSSI 40% + conn quality 30% + FEC recovery 30% */
-        composite_quality = (signal_percent * 40 + cq_score * 30 + fec_score * 30) / 100;
+        /* Weighted composite: RSSI 20% + conn quality 45% + FEC recovery 35%.
+         * Favor transport/decode health over raw RSSI to reduce optimistic bitrate.
+         */
+        composite_quality = (signal_percent * 20 + cq_score * 45 + fec_score * 35) / 100;
     }
 
     /* ── PID controller ────────────────────────────────────────────
@@ -429,8 +442,8 @@ int signal_strength_update(void)
     if (g_signal_log_counter >= SIGNAL_LOG_INTERVAL) {
         diag_log_write("SIG", "PID: rssi=%d%% cq=%d%% fec=%d%% composite=%d%% err=%d I=%d delta=%dkbps bitrate=%dkbps\n",
                        signal_percent,
-                       (int)(control_stream_get_quality().quality),
-                       (int)(control_stream_get_quality().fec_recovery_pct),
+                       cq_score,
+                       fec_score,
                        composite_quality, error,
                        g_signal_state.pid_integral / PID_SCALE,
                        delta_kbps, g_signal_state.current_bitrate);

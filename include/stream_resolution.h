@@ -29,6 +29,13 @@ extern "C" {
 #define PSP_LCD_HEIGHT      272
 #define PSP_LCD_STRIDE      512     /* VRAM pitch (power-of-2) */
 
+/* Active renderer path supports up to 1024 source width (2x512 pages) and
+ * 512 source height (PSP GU max texture height without vertical tiling). */
+#define STREAM_MIN_WIDTH     128
+#define STREAM_MIN_HEIGHT     80
+#define STREAM_MAX_WIDTH    1024
+#define STREAM_MAX_HEIGHT    512
+
 typedef struct {
     /* Base dimensions (from config) */
     int width;              /* Stream width  (e.g. 368, 480, 640) */
@@ -63,6 +70,10 @@ extern StreamResolution g_stream_res;
  * Must be called before oh264_pipeline_init() and sw_pipeline_init().
  */
 void stream_resolution_init(int width, int height);
+
+/* Clamp and align a resolution to the renderer-safe runtime contract.
+ * Dimensions are rounded down to mod-16 and then clamped to STREAM_* bounds. */
+void stream_resolution_normalize(int *inout_width, int *inout_height);
 
 /*============================================================================
  * Phase 4: Smart Resolution Scaling

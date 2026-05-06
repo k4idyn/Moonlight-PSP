@@ -11,7 +11,6 @@
 #include <psptypes.h>
 #include <string.h>
 #include <stdio.h>
-#include <malloc.h>
 #include "shared.h"
 #include "rtp_reassembly.h"
 #include "safety_buffer.h"
@@ -19,6 +18,7 @@
 #include "sw_decode_pipeline.h"
 #include "control_stream.h"
 #include "decode_flags.h"
+#include "signal_strength.h"
 
 #define RTP_LOG(fmt, ...) diag_log_write("RTP", fmt, ##__VA_ARGS__)
 
@@ -41,6 +41,7 @@ static u16 expected_seq = 0;
 static int reassembling = 0;
 static int g_frame_had_gaps = 0;
 static int g_saw_first_sof = 0;
+static int g_frame_overflow = 0;
 static unsigned int s_consec_gap_frames = 0; /* consecutive frames with seq gaps */
 
 /* External dependencies */
@@ -67,12 +68,12 @@ static int is_annexb_start(const u8 *data, int len, int offset) {
 static inline void append_to_frame(const u8 *data, int len) {
     if (len <= 0) return;
     if (assembly_pos + (u32)len > MAX_ASSEMBLY_SIZE) {
-        /* Truncate — frame is too large for our buffer.
-         * The frame will decode with errors; decoder handles this gracefully. */
-        diag_log_write("RTP", "assembly overflow: pos=%u + len=%d > %u — truncating",
-                       assembly_pos, len, (unsigned)MAX_ASSEMBLY_SIZE);
-        len = (int)(MAX_ASSEMBLY_SIZE - assembly_pos);
-        if (len <= 0) return;
+        if (!g_frame_overflow) {
+            diag_log_write("RTP", "assembly overflow: pos=%u + len=%d > %u -- dropping frame",
+                           assembly_pos, len, (unsigned)MAX_ASSEMBLY_SIZE);
+        }
+        g_frame_overflow = 1;
+        return;
     }
     memcpy(assembly_buffer + assembly_pos, data, len);
     assembly_pos += (u32)len;
@@ -123,8 +124,9 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         return;
     }
 
-    /* Match reference isFirstPacket(): require fecBlockNumber == 0 */
-    u8 fec_block_num = nv[11]; /* multiFecBlocks */
+    /* First packet for a frame is SOF on FEC block 0. The current FEC
+     * block lives in NV_VIDEO_PACKET.multiFecBlocks bits 4-5. */
+    u8 fec_block_num = (nv[11] >> 4) & 0x03;
     int first_packet = (flags & FLAG_SOF) != 0 && fec_block_num == 0;
     int last_packet  = (flags & FLAG_EOF) != 0;
 
@@ -160,20 +162,20 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
     if (frame_id != current_frame_id) {
         if (reassembling && assembly_pos > 0) {
             RTP_LOG("[RTP] Dropping partial frame %u (switch to %u)\n", current_frame_id, frame_id);
-            /* Partial frame drop — FEC will recover the data in most cases.
-             * At 256x144@500kbps, frames are 1 data packet + 3 parity.
-             * FEC recovery has 100% success rate for single-packet loss.
-             * Do NOT set g_refs_corrupted here — it causes a doom spiral:
-             *   partial drop → g_refs_corrupted=1 → ALL P-frames REF-SKIPped
-             *   → only IDRs decoded → effective ~1 fps instead of 30.
-             * Instead, request IDR as a precaution but let P-frames through.
-             * OpenH264's error concealment handles occasional missing refs. */
-            control_stream_request_idr();
+            /* Partial frame loss is usually transient; prefer targeted RFI so
+             * we avoid forcing frequent full-IDR bursts on borderline WiFi. */
+            if (g_last_good_frame == 0) {
+                control_stream_request_idr();
+            } else {
+                control_stream_request_rfi(current_frame_id, current_frame_id);
+            }
+            signal_strength_report_frame_drop();
         }
         assembly_pos = 0;
         current_frame_id = frame_id;
         reassembling = 0;
         g_frame_had_gaps = 0;
+        g_frame_overflow = 0;
         g_saw_first_sof = 0;
         expected_seq = seq;
     }
@@ -194,6 +196,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         reassembling = 1;
         assembly_pos = 0;
         g_saw_first_sof = 1;
+        g_frame_overflow = 0;
 
         /* SOF diagnostic silenced for performance (was per-frame) */
 
@@ -268,6 +271,22 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
     /* 4. Complete Frame Delivery */
     if (last_packet || marker) {
         if (assembly_pos > 0 && reassembling) {
+            if (g_frame_overflow) {
+                /* Deterministic overflow policy: drop this frame and force
+                 * recovery rather than decoding a truncated bitstream. */
+                g_refs_corrupted = 1;
+                g_current_frame_is_corrupt = 1;
+                g_idr_fully_decoded = 0;
+                diag_log_write("RTP", "frame %u dropped due to assembly overflow", frame_id);
+                control_stream_request_idr();
+                g_fec_recovery_clean = 0;
+                s_consec_gap_frames = 0;
+                reassembling = 0;
+                assembly_pos = 0;
+                g_frame_overflow = 0;
+                return;
+            }
+
             /* Advance g_last_good_frame BEFORE the decode callback.
              * The callback blocks for the full CAVLC decode (up to 11s for
              * a complex IDR on the 333 MHz PSP).  The CTRL PING thread
@@ -317,20 +336,23 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
              * RS recovery is mathematically exact — don't mark corrupt. */
             if (g_frame_had_gaps && !g_fec_recovery_clean) {
                 s_consec_gap_frames++;
-                g_refs_corrupted = 1;
                 g_current_frame_is_corrupt = 1;
-                g_idr_fully_decoded = 0;
-                diag_log_write("RTP", "frame %u has seq gaps -- refs corrupted (consec=%u)",
-                               frame_id, s_consec_gap_frames);
-                control_stream_request_idr();
-                /* Preemptive IDR: after 2 consecutive gap frames, the
-                 * picture is severely degraded.  Force a second IDR
-                 * request to improve recovery odds on lossy WiFi. */
-                if (s_consec_gap_frames >= 2) {
-                    diag_log_write("RTP", "2+ consecutive gap frames -- preemptive IDR");
+
+                /* Escalate only on sustained corruption. Single-gap frames are
+                 * handled by decoder concealment plus RFI to avoid IDR storms. */
+                if (s_consec_gap_frames >= 2 || g_last_good_frame == 0) {
+                    g_refs_corrupted = 1;
+                    g_idr_fully_decoded = 0;
+                    diag_log_write("RTP", "frame %u has seq gaps -- refs corrupted (consec=%u), IDR",
+                                   frame_id, s_consec_gap_frames);
                     control_stream_request_idr();
                     s_consec_gap_frames = 0;
+                } else {
+                    diag_log_write("RTP", "frame %u has seq gaps (consec=%u), RFI",
+                                   frame_id, s_consec_gap_frames);
+                    control_stream_request_rfi(frame_id, frame_id);
                 }
+                signal_strength_report_frame_drop();
             } else if (g_frame_had_gaps && g_fec_recovery_clean) {
                 /* FEC recovered — seq gaps are expected but data is clean */
                 g_current_frame_is_corrupt = 0;
@@ -346,6 +368,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         }
         reassembling = 0;
         assembly_pos = 0;
+        g_frame_overflow = 0;
     }
 }
 
@@ -355,6 +378,7 @@ void rtp_reassembly_reset(void) {
     expected_seq = 0;
     reassembling = 0;
     g_frame_had_gaps = 0;
+    g_frame_overflow = 0;
     g_saw_first_sof = 0;
 }
 

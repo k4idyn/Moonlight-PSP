@@ -27,7 +27,6 @@
 #include <psprtc.h>
 #include <string.h>
 #include <stdio.h>
-#include <malloc.h>
 
 #include "sw_decode_pipeline.h"
 #include "stream_resolution.h"
@@ -38,6 +37,7 @@
 #include "control_stream.h"
 #include "settings_menu.h"  /* PspConfig */
 #include "decode_flags.h"
+#include "safety_buffer.h"
 
 extern PspConfig g_psp_config;
 
@@ -47,6 +47,7 @@ extern void oh264_pipeline_shutdown(void);
 extern int  oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 **out_rgba);
 extern void oh264_pipeline_invalidate_refs(void);
 extern void oh264_pipeline_flush_buffers(void);
+extern int  oh264_pipeline_reset_codec(void);
 extern void oh264_pipeline_abandon(void);
 
 /* Forward declaration — lightweight CABAC detection */
@@ -62,6 +63,13 @@ volatile int g_cabac_dialog_active = 0;
 
 #define FRAME_POOL_SIZE     4
 #define FRAME_BUF_SIZE      (PSP_LCD_STRIDE * PSP_LCD_HEIGHT * PIXEL_SIZE)
+
+#define PACKET_BACKLOG_PSKIP_CAVLC     192u
+#define PACKET_BACKLOG_PSKIP_CABAC      96u
+#define PACKET_BACKLOG_FLUSH_CAVLC     384u
+#define PACKET_BACKLOG_FLUSH_CABAC     224u
+#define DECODER_DRAIN_BATCH_LIMIT      128
+#define SW_DECODER_THREAD_PRIORITY     0x21
 
 #define dec_log(fmt, ...) diag_log_write("DEC", fmt, ##__VA_ARGS__)
 
@@ -82,6 +90,70 @@ static int              g_frames_decoded = 0;
 static int              g_frames_dropped = 0;
 static FrameRingBuffer *g_frame_rb = NULL;
 static PacketRingBuffer *g_packet_rb = NULL;
+
+static void nal_scan_headers(const u8 *nal_data, int nal_len,
+                             int *out_has_idr, int *out_has_sync_nal)
+{
+    int has_idr = 0;
+    int has_sync_nal = 0;
+    const u8 *p;
+    const u8 *end;
+
+    if (!nal_data || nal_len <= 4) {
+        if (out_has_idr) *out_has_idr = 0;
+        if (out_has_sync_nal) *out_has_sync_nal = 0;
+        return;
+    }
+
+    p = nal_data;
+    end = nal_data + nal_len;
+    while (p + 4 < end) {
+        int sc_len = 0;
+
+        if (p[0] == 0 && p[1] == 0) {
+            if (p[2] == 1) sc_len = 3;
+            else if (p + 4 < end && p[2] == 0 && p[3] == 1) sc_len = 4;
+        }
+
+        if (sc_len > 0 && p + sc_len < end) {
+            int nal_type = p[sc_len] & 0x1F;
+            if (nal_type == 5) {
+                has_idr = 1;
+                has_sync_nal = 1;
+                break;
+            }
+            if (nal_type == 7 || nal_type == 8) {
+                has_sync_nal = 1;
+            }
+
+            /* Stop once we hit the first VCL NAL in non-IDR units.
+             * This keeps scanning cheap on P-frames while still allowing
+             * large SPS/PPS/SEI preambles before IDR in CABAC streams. */
+            if (nal_type >= 1 && nal_type <= 5) {
+                break;
+            }
+
+            p += sc_len;
+        }
+
+        p++;
+    }
+
+    if (out_has_idr) *out_has_idr = has_idr;
+    if (out_has_sync_nal) *out_has_sync_nal = has_sync_nal;
+}
+
+static u32 decoder_pskip_threshold_packets(void)
+{
+    return g_cabac_detected ? PACKET_BACKLOG_PSKIP_CABAC
+                            : PACKET_BACKLOG_PSKIP_CAVLC;
+}
+
+static u32 decoder_flush_threshold_packets(void)
+{
+    return g_cabac_detected ? PACKET_BACKLOG_FLUSH_CABAC
+                            : PACKET_BACKLOG_FLUSH_CAVLC;
+}
 
 /* Timestamp of last decoded frame — read by main loop for latency display */
 volatile u32 g_last_frame_decode_us = 0;
@@ -144,10 +216,40 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     static u64 s_prev_done = 0;
     static int s_perf_count = 0;
     static int s_wait_count = 0;
+    static int s_no_output_streak = 0;
     static int s_cb_count = 0;
+    static u32 s_startup_pskip_count = 0;
     static u32 s_last_usb_yield_us = 0;
+    const u8 *decode_nal;
+    int decode_len;
+    int decode_has_idr = 0;
+    int decode_has_sync_nal = 0;
 
     if (!nal_data || nal_len <= 0) return;
+
+    decode_nal = nal_data;
+    decode_len = nal_len;
+
+    nal_scan_headers(nal_data, nal_len, &decode_has_idr, &decode_has_sync_nal);
+
+    {
+        u64 now_pts = 0;
+        sceRtcGetCurrentTick(&now_pts);
+        safety_buffer_store_nal((u8 *)nal_data, (u32)nal_len, now_pts, (u8)decode_has_idr);
+    }
+
+    if (safety_buffer_get_state() == SAFETY_BUFFER_REWIND && safety_buffer_can_rewind()) {
+        u32 rewind_len = 0;
+        u64 rewind_pts = 0;
+        u8 *rewind_nal = safety_buffer_rewind(&rewind_len, &rewind_pts);
+        if (rewind_nal && rewind_len > 0) {
+            decode_nal = rewind_nal;
+            decode_len = (int)rewind_len;
+            nal_scan_headers(decode_nal, decode_len, &decode_has_idr, &decode_has_sync_nal);
+            dec_log("SAFETY: rewind replay len=%u pts=%u\n",
+                    (unsigned)rewind_len, (unsigned)rewind_pts);
+        }
+    }
 
     /* Watchdog restart: reset stale callback counters so logging and
      * IDR request cadence start fresh after a pipeline reinit. */
@@ -157,19 +259,54 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             s_prev_done = 0;
             s_perf_count = 0;
             s_wait_count = 0;
+            s_no_output_streak = 0;
             s_cb_count = 0;
+            s_startup_pskip_count = 0;
             s_last_usb_yield_us = 0;
             g_decode_counters_reset_pending = 0;
         }
     }
 
-    /* Pause gate: when g_decode_paused is set (via pspsh pokew), sleep in a
-     * tight loop to free CPU for psplink USB commands (scrshot, meminfo).
-     * The frame is NOT dropped — it will be decoded once resumed. */
+    /* Pause gate: avoid blocking the decode callback while paused.
+     * Blocking here stalls ring draining, which causes packet backlog,
+     * queue overrun drops, and watchdog restarts on resume. */
     {
         extern volatile int g_decode_paused;
-        while (g_decode_paused) {
-            sceKernelDelayThread(5000);  /* 5ms sleep while paused */
+        static int s_pause_active = 0;
+        static int s_pause_drop_count = 0;
+
+        if (g_decode_paused) {
+            if (!s_pause_active) {
+                s_pause_active = 1;
+                s_pause_drop_count = 0;
+                dec_log("PAUSE: decode paused, dropping frames to avoid backlog\n");
+            }
+
+            s_pause_drop_count++;
+            if (s_pause_drop_count <= 3 || (s_pause_drop_count % 120) == 0) {
+                dec_log("PAUSE: dropped frame #%d len=%d\n",
+                        s_pause_drop_count, decode_len);
+            }
+            return;
+        }
+
+        if (s_pause_active) {
+            s_pause_active = 0;
+            dec_log("PAUSE: resume detected, flushing stale state + requesting IDR\n");
+
+            if (g_packet_rb) {
+                g_packet_rb->tail = g_packet_rb->head;
+            }
+            rtp_reassembly_reset();
+            rtp_fec_reset();
+            oh264_pipeline_flush_buffers();
+            {
+                extern volatile unsigned int g_last_good_frame;
+                g_last_good_frame = 0;
+            }
+            control_stream_request_idr();
+            s_wait_count = 0;
+            s_no_output_streak = 0;
         }
     }
 
@@ -177,7 +314,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     g_decoder_alive_counter++;
     /* Log every 120th callback to minimize I/O overhead in hot path */
     if (s_cb_count <= 3 || (s_cb_count % 120) == 0) {
-        dec_log("CB#%d len=%d\n", s_cb_count, nal_len);
+        dec_log("CB#%d len=%d\n", s_cb_count, decode_len);
     }
 
     /* Time-based USB yield: yield 1ms every 500ms to keep psplink responsive
@@ -193,9 +330,9 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
 
     /* Dump first 16 bytes to diagnose NAL structure (first 3 frames only) */
     if (s_cb_count <= 3) {
-        char hex[49]; int hx = nal_len < 16 ? nal_len : 16;
+        char hex[49]; int hx = decode_len < 16 ? decode_len : 16;
         for (int hi = 0; hi < hx; hi++)
-            snprintf(hex + hi * 3, 4, "%02X ", nal_data[hi]);
+            snprintf(hex + hi * 3, 4, "%02X ", decode_nal[hi]);
         hex[hx * 3] = '\0';
         dec_log("CB#%d hex: %s\n", s_cb_count, hex);
     }
@@ -208,36 +345,41 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     if (g_packet_rb) {
         u32 queued = (g_packet_rb->head + RING_BUFFER_SLOTS
                       - g_packet_rb->tail) % RING_BUFFER_SLOTS;
-        if (queued > 256 && nal_len > 4) {
-            /* Check if this is an IDR frame: scan first few bytes for
-             * NAL type 5 (IDR) or 7 (SPS) or 8 (PPS).  Annex-B format:
-             * 00 00 00 01 <nal_unit_type & 0x1F> */
-            int is_idr = 0;
-            const u8 *p = nal_data;
-            const u8 *end = nal_data + (nal_len < 64 ? nal_len : 64);
-            while (p + 4 < end) {
-                if (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) {
-                    int nal_type = p[4] & 0x1F;
-                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
-                        is_idr = 1;
-                        break;
-                    }
-                }
-                p++;
-            }
-            if (!is_idr) {
+        u32 pskip_threshold = decoder_pskip_threshold_packets();
+
+        if (queued > pskip_threshold && decode_len > 4) {
+            if (!decode_has_sync_nal) {
                 static u32 s_pskip_count = 0;
                 s_pskip_count++;
                 if (s_pskip_count <= 3 || (s_pskip_count % 50) == 0) {
-                    dec_log("P-SKIP: q=%u skipping P-frame #%u (len=%d) waiting for IDR\n",
-                            (unsigned)queued, s_pskip_count, nal_len);
+                    dec_log("P-SKIP: q=%u>%u skip=%u len=%d waiting for sync\n",
+                            (unsigned)queued, (unsigned)pskip_threshold,
+                            (unsigned)s_pskip_count, decode_len);
                 }
                 return;  /* skip this P-frame */
             } else {
                 /* IDR arrived while queue was overloaded — log recovery */
-                dec_log("P-SKIP: IDR arrived, resuming decode (q=%u)\n", (unsigned)queued);
+                dec_log("P-SKIP: sync NAL arrived, resuming decode (q=%u thr=%u)\n",
+                        (unsigned)queued, (unsigned)pskip_threshold);
             }
         }
+    }
+
+    if (!g_saw_first_idr && !decode_has_sync_nal) {
+        s_startup_pskip_count++;
+        if (s_startup_pskip_count <= 3 || (s_startup_pskip_count % 60) == 0) {
+            dec_log("STARTUP P-SKIP: skip=%u len=%d waiting for IDR/SPS\n",
+                    (unsigned)s_startup_pskip_count, decode_len);
+        }
+        if ((s_startup_pskip_count % 30) == 1) {
+            control_stream_request_idr();
+        }
+        g_frames_dropped++;
+        return;
+    } else if (!g_saw_first_idr && decode_has_sync_nal && s_startup_pskip_count > 0) {
+        dec_log("STARTUP P-SKIP: sync NAL arrived after %u skips\n",
+                (unsigned)s_startup_pskip_count);
+        s_startup_pskip_count = 0;
     }
 
 #ifdef MOONLIGHT_DEBUG_DUMP
@@ -269,7 +411,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         static int s_cabac_check_count = 0;
         if (s_cb_count <= 1) s_cabac_check_count = 0;  /* reset on restart */
         if (!g_cabac_detected && s_cabac_check_count < 10) {
-            check_nal_for_cabac(nal_data, nal_len);
+            check_nal_for_cabac(decode_nal, decode_len);
             s_cabac_check_count++;
         }
     }
@@ -282,7 +424,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
 
     u8 *rgba_out = NULL;
     g_decode_active_us = sceKernelGetSystemTimeLow();
-    int ret = oh264_pipeline_decode_frame(nal_data, nal_len, &rgba_out);
+    int ret = oh264_pipeline_decode_frame(decode_nal, decode_len, &rgba_out);
     g_decode_active_us = 0;  /* decode finished — watchdog can relax */
 
     if (s_cb_count <= 3 || (s_cb_count % 120) == 0 || ret < 0) {
@@ -291,7 +433,10 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
 
     if (ret == 0 && rgba_out) {
         push_sw_frame(rgba_out);
+        s_startup_pskip_count = 0;
         s_wait_count = 0;  /* Reset — decode succeeded, SPS/PPS is valid */
+        s_no_output_streak = 0;
+        s_startup_pskip_count = 0;
 
         u64 t_cb_done;
         sceRtcGetCurrentTick(&t_cb_done);
@@ -338,8 +483,11 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         if (g_packet_rb) {
             u32 queued = (g_packet_rb->head + RING_BUFFER_SLOTS
                           - g_packet_rb->tail) % RING_BUFFER_SLOTS;
-            if (queued > 512) {
-                dec_log("queue overrun: %u stale packets, flushing\n", (unsigned)queued);
+            u32 flush_threshold = decoder_flush_threshold_packets();
+
+            if (queued > flush_threshold) {
+                dec_log("queue overrun: %u stale packets (>%u), flushing\n",
+                        (unsigned)queued, (unsigned)flush_threshold);
                 g_packet_rb->tail = g_packet_rb->head;
                 rtp_reassembly_reset();
                 rtp_fec_reset();
@@ -370,6 +518,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
          * -6: P-frame without valid reference — expected after IDR failure
          * Request IDR every 30 consecutive failures so we don't wait forever. */
         s_wait_count++;
+        s_no_output_streak++;
         if (s_wait_count <= 10 || (s_wait_count % 30) == 0) {
             dec_log("waiting: ret=%d (count=%d)\n", ret, s_wait_count);
             control_stream_request_idr();
@@ -379,9 +528,54 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             dec_log("STUCK: %d frames without SPS/PPS, forcing IDR burst\n", s_wait_count);
             control_stream_request_idr();
         }
+        if (!g_saw_first_idr && s_no_output_streak >= 24 && (s_no_output_streak % 24) == 0) {
+            dec_log("STARTUP RECOVERY: no IDR after %d callbacks, flushing + IDR\n",
+                    s_no_output_streak);
+            if (g_packet_rb) {
+                g_packet_rb->tail = g_packet_rb->head;
+            }
+            rtp_reassembly_reset();
+            rtp_fec_reset();
+            oh264_pipeline_reset_codec();
+            {
+                extern volatile unsigned int g_last_good_frame;
+                g_last_good_frame = 0;
+            }
+            g_idr_fully_decoded = 0;
+            g_saw_first_idr = 0;
+            s_wait_count = 0;
+            s_no_output_streak = 0;
+            s_startup_pskip_count = 0;
+            control_stream_request_idr();
+        }
         /* Reset counter on any successful decode (handled above in ret==0 path) */
     } else if (ret < 0) {
         g_frames_dropped++;
+        s_no_output_streak++;
+        if (s_no_output_streak >= 18 && (s_no_output_streak == 18 || (s_no_output_streak % 60) == 0)) {
+            dec_log("NO-OUTPUT RECOVERY: failures=%d ret=%d saw_idr=%d, codec reset + IDR\n",
+                    s_no_output_streak, ret, g_saw_first_idr);
+            if (g_packet_rb) {
+                g_packet_rb->tail = g_packet_rb->head;
+            }
+            rtp_reassembly_reset();
+            rtp_fec_reset();
+            safety_buffer_clear();
+            if (oh264_pipeline_reset_codec() < 0) {
+                oh264_pipeline_flush_buffers();
+            }
+            {
+                extern volatile unsigned int g_last_good_frame;
+                g_last_good_frame = 0;
+            }
+            g_idr_fully_decoded = 0;
+            g_saw_first_idr = 0;
+            g_fec_requested_idr = 0;
+            s_wait_count = 0;
+            s_no_output_streak = 0;
+            s_startup_pskip_count = 0;
+            control_stream_request_idr();
+        }
         if ((g_frames_dropped % 30) == 1) {
             dec_log("decode failed: %d (dropped=%d)\n", ret, g_frames_dropped);
         }
@@ -438,7 +632,7 @@ static int sw_decoder_thread(SceSize args, void *argp)
         while (g_packet_rb &&
                g_packet_rb->tail != g_packet_rb->head &&
                g_dec_running &&
-               batch < 512) {
+               batch < DECODER_DRAIN_BATCH_LIMIT) {
 
             u16 pkt_len = g_packet_rb->slot_length[g_packet_rb->tail];
             if (pkt_len > 0) {
@@ -470,9 +664,11 @@ static int sw_decoder_thread(SceSize args, void *argp)
         if (processed && g_packet_rb) {
             u32 queued = (g_packet_rb->head + RING_BUFFER_SLOTS
                           - g_packet_rb->tail) % RING_BUFFER_SLOTS;
-            if (queued > 512) {
-                dec_log("RING BACKLOG %u/1024 (>512) -- flushing to prevent overflow\n",
-                        (unsigned)queued);
+            u32 flush_threshold = decoder_flush_threshold_packets();
+
+            if (queued > flush_threshold) {
+                dec_log("RING BACKLOG %u/1024 (>%u) -- flushing to prevent overflow\n",
+                        (unsigned)queued, (unsigned)flush_threshold);
                 g_packet_rb->tail = g_packet_rb->head;
                 rtp_reassembly_reset();
                 rtp_fec_reset();
@@ -510,7 +706,7 @@ static int sw_decoder_thread(SceSize args, void *argp)
 int sw_decoder_thread_init(FrameRingBuffer *rb)
 {
     g_packet_rb = &g_shared.packet_ring;
-    g_cabac_detected = 0;  /* Reset for new stream */
+    g_cabac_detected = 0;
     s_pps_checked = 0;     /* Allow re-detection on new stream */
 
     dec_log("Init: Software H.264 decode (CAVLC+VFPU dual-core)\n");
@@ -535,6 +731,9 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     /* Initialize FEC recovery subsystem (RS tables + slot buffers) */
     rtp_fec_init();
 
+    /* Start each stream with a clean rewind window. */
+    safety_buffer_clear();
+
     /* Create synchronization semaphore */
     g_dec_sema = sceKernelCreateSema("sw_dec_sema", 0, 0, 64, NULL);
     if (g_dec_sema < 0) {
@@ -548,9 +747,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     g_dec_running = 1;
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             0x18,        /* Priority 24: boosted to match control stream
-                                                           * for lowest decode latency.  Trades control
-                                                           * responsiveness for faster frame delivery. */
+                                             SW_DECODER_THREAD_PRIORITY,
                                              128 * 1024,  /* 128KB stack for VFPU recon */
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
@@ -563,7 +760,8 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     sceKernelStartThread(g_dec_thread_id, 0, NULL);
 
     g_decoder_ready = 1;
-    dec_log("Decoder init OK (sw_pipeline active, priority=0x18 boosted)\n");
+    dec_log("Decoder init OK (sw_pipeline active, priority=0x%02X batch=%d)\n",
+            SW_DECODER_THREAD_PRIORITY, DECODER_DRAIN_BATCH_LIMIT);
     return 0;
 }
 
@@ -579,7 +777,14 @@ void sw_decoder_thread_shutdown(void)
 
     /* Wait for thread to finish */
     if (g_dec_thread_id >= 0) {
-        sceKernelWaitThreadEnd(g_dec_thread_id, NULL);
+        SceUInt timeout = 2000000; /* 2s */
+        int wait_ret = sceKernelWaitThreadEnd(g_dec_thread_id, &timeout);
+        if (wait_ret < 0) {
+            dec_log("Decoder shutdown wait failed: 0x%08X, forcing terminate\n",
+                    (unsigned)wait_ret);
+            sceKernelTerminateThread(g_dec_thread_id);
+            sceKernelWaitThreadEnd(g_dec_thread_id, NULL);
+        }
         sceKernelDeleteThread(g_dec_thread_id);
         g_dec_thread_id = -1;
     }
@@ -593,6 +798,9 @@ void sw_decoder_thread_shutdown(void)
 
     /* Reset FEC state */
     rtp_fec_reset();
+
+    /* Drop cached rewind data for the ended stream. */
+    safety_buffer_clear();
 
     /* Frame pool REMOVED — zero-copy, nothing to free */
 
@@ -611,9 +819,9 @@ void sw_decoder_thread_shutdown(void)
  * Mode A: OpenH264 infinite-loop — g_decode_active_us stuck >3s
  * Mode B: RTP/ring stall — no frames produced for >5s (idle >300)
  *
- * Forcibly terminates the stuck thread, abandons old OpenH264 context
- * (leaking ~2MB), flushes ring, reinits fresh, starts new thread.
- * Limited to 5 restarts max (~10MB total leak on 24MB PSP).
+ * Forcibly terminates the stuck thread, abandons old OpenH264 context,
+ * releases its resources, flushes ring state, reinits fresh, and starts
+ * a new thread.
  * ============================================================================*/
 
 void sw_decoder_thread_force_restart(void)
@@ -621,17 +829,16 @@ void sw_decoder_thread_force_restart(void)
     dec_log("WATCHDOG: force-restarting decoder\n");
     diag_log_flush();
 
-    /* 0. Check free heap — each restart leaks ~2MB; abort if < 4MB remains */
+    /* 0. Log current heap pressure, but don't gate restart on it.
+     * The stalled decoder, codec context, and thread stack are still live at
+     * this point, so a pre-teardown free-memory check underestimates the
+     * headroom available for restart and can suppress recovery entirely. */
     {
         SceSize free_mem = sceKernelTotalFreeMemSize();
-        if (free_mem < 4 * 1024 * 1024) {
-            dec_log("WATCHDOG: only %uKB free — skipping restart to avoid OOM\n",
-                    (unsigned)(free_mem / 1024));
-            diag_log_flush();
-            return;
-        }
-        dec_log("WATCHDOG: %uKB free — proceeding with restart\n",
-                (unsigned)(free_mem / 1024));
+        SceSize max_free = sceKernelMaxFreeMemSize();
+        dec_log("WATCHDOG: pre-restart free=%uKB max_block=%uKB\n",
+                (unsigned)(free_mem / 1024),
+                (unsigned)(max_free / 1024));
     }
 
     /* 1. Kill the stuck decode thread */
@@ -640,6 +847,10 @@ void sw_decoder_thread_force_restart(void)
 
     if (g_dec_thread_id >= 0) {
         sceKernelTerminateThread(g_dec_thread_id);
+        {
+            SceUInt timeout = 500000; /* 500ms grace after terminate */
+            sceKernelWaitThreadEnd(g_dec_thread_id, &timeout);
+        }
         sceKernelDeleteThread(g_dec_thread_id);
         g_dec_thread_id = -1;
         dec_log("WATCHDOG: old thread terminated\n");
@@ -651,15 +862,26 @@ void sw_decoder_thread_force_restart(void)
         sceKernelDelayThread(2000);  /* 2ms — enough for kernel cleanup */
     }
 
-    /* 2. Abandon old OpenH264 context (leaks memory but avoids accessing
-     *    corrupted state).  ME is killed and reinited inside. */
+    /* 2. Abandon old OpenH264 context and release resources.
+     *    ME is killed and state is nulled inside. */
     oh264_pipeline_abandon();
     dec_log("WATCHDOG: pipeline abandoned\n");
+
+    /* 2b. Re-measure headroom after teardown. This is the memory state that
+     * actually matters for restart, because the dead decoder resources are
+     * gone and the retry path below already handles init/create failures. */
+    {
+        SceSize free_mem = sceKernelTotalFreeMemSize();
+        SceSize max_free = sceKernelMaxFreeMemSize();
+        dec_log("WATCHDOG: post-abandon free=%uKB max_block=%uKB\n",
+                (unsigned)(free_mem / 1024),
+                (unsigned)(max_free / 1024));
+    }
 
     /* 3. Allocate fresh OpenH264 codec context + RGBA buffers.
      *    oh264_pipeline_init skips ME PRX load (already loaded)
      *    but re-creates codec context, RGBA bufs.
-     *    ME ctrl/params are reused from abandon (not freed). */
+        *    ME ctrl/params are freshly allocated. */
     int sw_res = oh264_pipeline_init();
     if (sw_res < 0) {
         dec_log("WATCHDOG: oh264_pipeline_init FAILED %d -- decoder offline\n", sw_res);
@@ -671,6 +893,7 @@ void sw_decoder_thread_force_restart(void)
     /* 4. Reset RTP state so reassembly starts clean */
     rtp_reassembly_reset();
     rtp_fec_reset();
+    safety_buffer_clear();
     dec_log("WATCHDOG: RTP/FEC reset\n");
 
     /* 5. Flush stale packets from PACKET ring buffer */
@@ -680,8 +903,8 @@ void sw_decoder_thread_force_restart(void)
 
     /* 5b. Flush stale frames from FRAME ring buffer.
      * Old frames hold RGBA pointers from the abandoned pipeline.
-     * Displaying these after reinit is safe (leaked, not freed) but
-     * pointless — they show pre-crash content.  Flushing ensures the
+        * Displaying these after reinit is pointless — they show pre-crash
+        * content. Flushing ensures the
      * main loop gets only freshly-decoded frames. */
     if (g_frame_rb) {
         g_frame_rb->tail = g_frame_rb->head;
@@ -695,20 +918,17 @@ void sw_decoder_thread_force_restart(void)
     g_idr_fully_decoded = 0;
     g_decode_active_us = 0;
 
-    /* 6b. Preserve g_last_good_frame on restart.
-     * The CTRL PING thread piggybacks FEC status using lgf + stall_advance.
-     * If we reset lgf to 0, the piggybacked frame_index jumps backward
-     * (e.g. from 1502 to 10), which the server interprets as a corrupted
-     * client and permanently closes its send window.
-     *
-     * Instead, preserve lgf so the piggybacked frame_index continues
-     * monotonically from lgf + stall_advance.  When the RTP layer receives
-     * new frames after IDR, it will update lgf to the real frame index,
-     * which will be higher than the preserved value. */
+    /* 6b. Reset frame/corruption state on restart.
+     * Keeping stale lgf across a decoder reset can lock reassembly into
+     * dedup dropping when server frame IDs restart from a lower value.
+     * Resetting these flags guarantees a clean recovery path after IDR. */
     {
         extern volatile unsigned int g_last_good_frame;
-        dec_log("WATCHDOG: preserving lgf=%u (not resetting to 0)\n",
-                g_last_good_frame);
+        g_last_good_frame = 0;
+        g_refs_corrupted = 0;
+        g_current_frame_is_corrupt = 0;
+        g_fec_requested_idr = 0;
+        dec_log("WATCHDOG: reset lgf/corruption flags for clean resync\n");
     }
 
     /* 6b2. Reset alive counter so watchdog detects fresh activity */
@@ -735,7 +955,7 @@ void sw_decoder_thread_force_restart(void)
     g_dec_running = 1;
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             0x18,
+                                             SW_DECODER_THREAD_PRIORITY,
                                              128 * 1024,
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
@@ -748,6 +968,23 @@ void sw_decoder_thread_force_restart(void)
         dec_log("WATCHDOG: CreateThread failed 0x%08X -- decoder offline\n",
                 (unsigned)g_dec_thread_id);
         g_dec_running = 0;
+        g_decoder_ready = 0;
+
+        /* Restart failed after pipeline reinit: release fresh resources so
+         * we don't stay in a half-online state with decode buffers allocated. */
+        oh264_pipeline_shutdown();
+        rtp_reassembly_reset();
+        rtp_fec_reset();
+        safety_buffer_clear();
+        g_decode_active_us = 0;
+        g_decoder_alive_counter = 0;
+
+        if (g_frame_rb) {
+            g_frame_rb->tail = g_frame_rb->head;
+            g_frame_rb->frame_ready = 0;
+        }
+
+        dec_log("WATCHDOG: restart cleanup complete, decoder remains offline\n");
     }
     dec_log("WATCHDOG: force_restart complete\n");
     diag_log_flush();
@@ -779,33 +1016,62 @@ int decoder_is_cabac_detected(void)
  * No allocation, no state — just reads existing NAL buffer.
  * ============================================================================*/
 
-/* Exp-Golomb unsigned decode (minimal inline version) */
-static unsigned int nal_read_ue(const u8 *data, int total_bits, int *bit_pos)
+/* Exp-Golomb unsigned decode (minimal inline version).
+ * Returns 1 on success, 0 on parse failure. */
+static int nal_read_ue(const u8 *data, int total_bits, int *bit_pos, unsigned int *out_val)
 {
+    int pos;
     int zeros = 0;
-    while (*bit_pos < total_bits) {
-        int byte_idx = *bit_pos >> 3;
-        int bit_idx  = 7 - (*bit_pos & 7);
-        if ((data[byte_idx] >> bit_idx) & 1) break;
-        zeros++;
-        (*bit_pos)++;
-        if (zeros > 16) return 0; /* sanity limit */
-    }
-    (*bit_pos)++; /* skip the 1-bit */
     unsigned int val = 0;
-    for (int i = 0; i < zeros; i++) {
-        if (*bit_pos >= total_bits) return 0;
-        int byte_idx = *bit_pos >> 3;
-        int bit_idx  = 7 - (*bit_pos & 7);
-        val = (val << 1) | ((data[byte_idx] >> bit_idx) & 1);
-        (*bit_pos)++;
+
+    if (!data || !bit_pos || !out_val || total_bits <= 0) {
+        return 0;
     }
-    return (1u << zeros) - 1 + val;
+
+    pos = *bit_pos;
+
+    while (pos < total_bits) {
+        int byte_idx = pos >> 3;
+        int bit_idx  = 7 - (pos & 7);
+        if ((data[byte_idx] >> bit_idx) & 1) {
+            break;
+        }
+        zeros++;
+        pos++;
+        if (zeros > 16) {
+            return 0; /* sanity limit */
+        }
+    }
+
+    if (pos >= total_bits) {
+        return 0; /* stop bit missing */
+    }
+    pos++; /* consume stop bit */
+
+    for (int i = 0; i < zeros; i++) {
+        int byte_idx;
+        int bit_idx;
+        if (pos >= total_bits) {
+            return 0;
+        }
+        byte_idx = pos >> 3;
+        bit_idx  = 7 - (pos & 7);
+        val = (val << 1) | ((data[byte_idx] >> bit_idx) & 1);
+        pos++;
+    }
+
+    *out_val = ((1u << zeros) - 1u) + val;
+    *bit_pos = pos;
+    return 1;
 }
 
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len)
 {
     if (s_pps_checked || g_cabac_detected) return;
+
+    if (!nal_data || nal_len <= 6) {
+        return;
+    }
 
     /* Scan for PPS NAL units (start code + NAL type 8) */
     for (int i = 0; i < nal_len - 5; i++) {
@@ -821,24 +1087,89 @@ static void check_nal_for_cabac(const u8 *nal_data, int nal_len)
         int nal_type = nal_data[nal_start] & 0x1F;
 
         if (nal_type == 8) {  /* PPS */
+            int nal_end = nal_len;
+
+            /* Find this NAL's end (start of next Annex-B start code or buffer end). */
+            for (int j = nal_start + 1; j < nal_len - 3; j++) {
+                if (nal_data[j] == 0 && nal_data[j + 1] == 0 &&
+                    (nal_data[j + 2] == 1 ||
+                     (j + 3 < nal_len && nal_data[j + 2] == 0 && nal_data[j + 3] == 1))) {
+                    nal_end = j;
+                    break;
+                }
+            }
+
             /* Parse: skip NAL header byte, read pic_parameter_set_id (ue),
              * seq_parameter_set_id (ue), then entropy_coding_mode_flag (1 bit) */
             int pps_data_start = nal_start + 1;
-            int total_bits = (nal_len - pps_data_start) * 8;
-            if (total_bits < 10) continue;
+            int pps_payload_len = nal_end - pps_data_start;
+            if (pps_payload_len <= 0) {
+                s_pps_checked = 1;
+                dec_log("PPS parse skipped: empty payload\n");
+                return;
+            }
 
-            const u8 *pps = nal_data + pps_data_start;
-            int bit_pos = 0;
-            nal_read_ue(pps, total_bits, &bit_pos);  /* pic_parameter_set_id */
-            nal_read_ue(pps, total_bits, &bit_pos);  /* seq_parameter_set_id */
+            /* Convert NAL payload to RBSP by removing emulation-prevention bytes. */
+            u8 rbsp[256];
+            int rbsp_len = 0;
+            for (int k = 0; k < pps_payload_len && rbsp_len < (int)sizeof(rbsp); k++) {
+                if (k + 2 < pps_payload_len &&
+                    nal_data[pps_data_start + k] == 0x00 &&
+                    nal_data[pps_data_start + k + 1] == 0x00 &&
+                    nal_data[pps_data_start + k + 2] == 0x03) {
+                    rbsp[rbsp_len++] = 0x00;
+                    rbsp[rbsp_len++] = 0x00;
+                    k += 2;
+                    continue;
+                }
+                rbsp[rbsp_len++] = nal_data[pps_data_start + k];
+            }
 
-            /* Next bit = entropy_coding_mode_flag: 0=CAVLC, 1=CABAC */
-            if (bit_pos < total_bits) {
-                int byte_idx = bit_pos >> 3;
-                int bit_idx  = 7 - (bit_pos & 7);
-                int entropy_flag = (pps[byte_idx] >> bit_idx) & 1;
+            int total_bits = rbsp_len * 8;
+            if (total_bits < 10) {
+                s_pps_checked = 1;
+                dec_log("PPS parse skipped: RBSP too short (%d bytes)\n", rbsp_len);
+                return;
+            }
+
+            {
+                int bit_pos = 0;
+                unsigned int pps_id = 0;
+                unsigned int sps_id = 0;
+                int entropy_flag;
+                int pic_order_present_flag;
+
+                /* Parse must succeed through the first three PPS syntax elements.
+                 * If not, keep scanning; malformed data must not trigger CABAC. */
+                if (!nal_read_ue(rbsp, total_bits, &bit_pos, &pps_id) ||
+                    !nal_read_ue(rbsp, total_bits, &bit_pos, &sps_id)) {
+                    dec_log("PPS parse failed: invalid Exp-Golomb headers (rbsp=%d)\n", rbsp_len);
+                    continue;
+                }
+
+                /* Need entropy_coding_mode_flag plus pic_order_present_flag bit. */
+                if (bit_pos + 1 >= total_bits) {
+                    dec_log("PPS parse failed: missing entropy/order flags (rbsp=%d)\n", rbsp_len);
+                    continue;
+                }
+
+                {
+                    int byte_idx = bit_pos >> 3;
+                    int bit_idx  = 7 - (bit_pos & 7);
+                    entropy_flag = (rbsp[byte_idx] >> bit_idx) & 1;
+                    bit_pos++;
+                }
+
+                {
+                    int byte_idx = bit_pos >> 3;
+                    int bit_idx  = 7 - (bit_pos & 7);
+                    pic_order_present_flag = (rbsp[byte_idx] >> bit_idx) & 1;
+                }
 
                 s_pps_checked = 1;
+                dec_log("PPS parsed: pps_id=%u sps_id=%u entropy=%d pof=%d rbsp=%d\n",
+                        pps_id, sps_id, entropy_flag, pic_order_present_flag, rbsp_len);
+
                 if (entropy_flag) {
                     g_cabac_detected = 1;
                     dec_log("CABAC DETECTED in PPS NAL -- warning screen will show\n");

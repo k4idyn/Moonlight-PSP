@@ -32,12 +32,17 @@
 #include "stream_connect_ui.h"
 #include "ui_manager.h"
 #include "crypto_lite.h"
-#include "cert_client.h"
 #include "moonlight_ports.h"
 #include "moonlight_proto.h"
 #include "client_identity.h"
 #include "diag_log.h"
+#include "net_send.h"
+#include "signal_strength.h"
 #define pair_log(fmt, ...) diag_log_write("NET", fmt, ##__VA_ARGS__)
+
+#ifndef CLIENT_CERT_SIG_LEN
+#define CLIENT_CERT_SIG_LEN 256
+#endif
 
 extern int network_me_reserve_client_port(unsigned short *out_port);
 extern int network_me_send_video_ping_burst(const char *server_ip,
@@ -57,6 +62,7 @@ extern int network_me_send_video_ping_burst(const char *server_ip,
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "audio_thread.h"
+#include "upnp_client.h"
 
 #include <psprtc.h>
 
@@ -81,6 +87,7 @@ extern PspConfig g_psp_config;
 #define RTSP_CONNECT_TIMEOUT_MS 10000
 #define RTSP_RECV_TIMEOUT_MS    5000
 #define RTSP_CONNECT_MAX_RETRIES 3
+#define TLS_PIN_DIR         "ms0:/PSP/GAME/Moonlight/tls_pins"
 
 /* RTSP CSeq counter (increments per request) */
 static int rtsp_cseq = 1;
@@ -352,9 +359,16 @@ static int psp_bio_send(void *ctx, const unsigned char *buf, size_t len)
     int sock = *(int *)ctx;
     int ret  = sceNetInetSend(sock, buf, (int)len, 0);
     if (ret < 0) {
+        static unsigned int s_bio_send_failures = 0;
         int err = sceNetInetGetErrno();
         if (err == EAGAIN || err == EWOULDBLOCK)
             return MBEDTLS_ERR_SSL_WANT_WRITE;
+
+        s_bio_send_failures++;
+        if (s_bio_send_failures <= 3 || (s_bio_send_failures % 16) == 0) {
+            pair_log("[TLS BIO] send failed ret=%d len=%u errno=%d fails=%u\n",
+                     ret, (unsigned)len, err, s_bio_send_failures);
+        }
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
     return ret;
@@ -373,12 +387,207 @@ static int psp_bio_recv(void *ctx, unsigned char *buf, size_t len)
     return ret;
 }
 
+static void sha256_hex_upper(const unsigned char *in32, char *out65)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int i;
+    for (i = 0; i < 32; i++) {
+        out65[i * 2]     = hex[(in32[i] >> 4) & 0x0F];
+        out65[i * 2 + 1] = hex[in32[i] & 0x0F];
+    }
+    out65[64] = '\0';
+}
+
+static void sanitize_host_for_filename(const char *host, char *out, int out_size)
+{
+    int i, j;
+    if (!out || out_size <= 1) return;
+
+    j = 0;
+    for (i = 0; host && host[i] != '\0' && j < out_size - 1; i++) {
+        char c = host[i];
+        int ok = ((c >= '0' && c <= '9') ||
+                  (c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z') ||
+                  c == '.' || c == '-' || c == '_');
+        out[j++] = ok ? c : '_';
+    }
+    out[j] = '\0';
+
+    if (j == 0) {
+        strncpy(out, "unknown", out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
+static int load_tls_pin_file(const char *path, char *out, int out_size)
+{
+    SceUID fd;
+    int n;
+    char *nl;
+
+    if (!path || !out || out_size <= 1) return -1;
+
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd < 0) return -1;
+
+    n = sceIoRead(fd, out, out_size - 1);
+    sceIoClose(fd);
+    if (n <= 0) return -1;
+
+    out[n] = '\0';
+    nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+    return 0;
+}
+
+static int save_tls_pin_file(const char *path, const char *pin_hex)
+{
+    SceUID fd;
+    int len;
+
+    if (!path || !pin_hex) return -1;
+
+    fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) return -1;
+
+    len = (int)strlen(pin_hex);
+    if (sceIoWrite(fd, pin_hex, len) != len ||
+        sceIoWrite(fd, "\n", 1) != 1) {
+        sceIoClose(fd);
+        return -1;
+    }
+
+    sceIoClose(fd);
+    return 0;
+}
+
+/* Sunshine uses self-signed certs in many installs. To preserve compatibility
+ * while improving security, we use TOFU pinning: first cert is stored per host,
+ * subsequent connections must match the same SHA-256 fingerprint. */
+static int tls_verify_or_store_pin(const char *host, mbedtls_ssl_context *ssl)
+{
+    const mbedtls_x509_crt *peer;
+    unsigned char digest[32];
+    char pin_hex[65];
+    char saved_pin[80];
+    char safe_host[64];
+    char pin_path[160];
+
+    if (!host || !ssl) return -1;
+
+    peer = mbedtls_ssl_get_peer_cert(ssl);
+    if (!peer || !peer->raw.p || peer->raw.len == 0) {
+        pair_log("[TLS-PIN] host=%s missing peer cert; skipping pin validation (compat mode)\n", host);
+        return 0;
+    }
+
+    mbedtls_sha256(peer->raw.p, peer->raw.len, digest, 0);
+    sha256_hex_upper(digest, pin_hex);
+
+    sceIoMkdir("ms0:/PSP", 0777);
+    sceIoMkdir("ms0:/PSP/GAME", 0777);
+    sceIoMkdir("ms0:/PSP/GAME/Moonlight", 0777);
+    sceIoMkdir(TLS_PIN_DIR, 0777);
+
+    sanitize_host_for_filename(host, safe_host, sizeof(safe_host));
+    snprintf(pin_path, sizeof(pin_path), "%s/%s.sha256", TLS_PIN_DIR, safe_host);
+
+    if (load_tls_pin_file(pin_path, saved_pin, sizeof(saved_pin)) == 0) {
+        if (strcmp(saved_pin, pin_hex) != 0) {
+            pair_log("[TLS-PIN] host=%s pin mismatch (possible MITM or cert rotation)\n", host);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (save_tls_pin_file(pin_path, pin_hex) != 0) {
+        pair_log("[TLS-PIN] host=%s failed to save first-use pin\n", host);
+        return -1;
+    }
+
+    pair_log("[TLS-PIN] host=%s stored first-use cert pin\n", host);
+    return 0;
+}
+
+static const char *get_active_client_cert_hex(void)
+{
+    const char *cert_hex = client_identity_get_cert_hex();
+    if (!cert_hex || cert_hex[0] == '\0') {
+        pair_log("[IDENTITY] runtime client certificate unavailable\n");
+        return NULL;
+    }
+    return cert_hex;
+}
+
+static const char *get_active_client_key_pem(void)
+{
+    const char *key_pem = client_identity_get_key_pem();
+    if (!key_pem || key_pem[0] == '\0') {
+        pair_log("[IDENTITY] runtime client private key unavailable\n");
+        return NULL;
+    }
+    return key_pem;
+}
+
+static int get_active_client_cert_sig(unsigned char *sig_out, size_t sig_out_size)
+{
+    const char *runtime_cert_hex = client_identity_get_cert_hex();
+    mbedtls_x509_crt cert;
+    unsigned char pem_buf[1536];
+    size_t hex_len;
+    size_t pem_size;
+    int ret = -1;
+
+    if (!sig_out || sig_out_size < CLIENT_CERT_SIG_LEN) {
+        return -1;
+    }
+
+    if (!runtime_cert_hex || runtime_cert_hex[0] == '\0') {
+        pair_log("[PAIR] runtime cert unavailable for signature extraction\n");
+        return -1;
+    }
+
+    hex_len = strlen(runtime_cert_hex);
+    if ((hex_len % 2) != 0) {
+        return -1;
+    }
+    pem_size = (hex_len / 2) + 1;
+    if (pem_size > sizeof(pem_buf)) {
+        pair_log("[PAIR] runtime cert too large for parse buffer (%u bytes)\n",
+                 (unsigned)pem_size);
+        return -1;
+    }
+
+    hex_to_bytes_lite(runtime_cert_hex, pem_buf, hex_len);
+    pem_buf[pem_size - 1] = '\0';
+
+    mbedtls_x509_crt_init(&cert);
+    ret = mbedtls_x509_crt_parse(&cert, pem_buf, pem_size);
+    if (ret != 0) {
+        goto cleanup;
+    }
+
+    if (cert.sig.len != CLIENT_CERT_SIG_LEN) {
+        pair_log("[PAIR] unexpected cert signature length: %u\n", (unsigned)cert.sig.len);
+        ret = -1;
+        goto cleanup;
+    }
+
+    memcpy(sig_out, cert.sig.p, CLIENT_CERT_SIG_LEN);
+    ret = 0;
+
+cleanup:
+    mbedtls_x509_crt_free(&cert);
+    return ret;
+}
+
 /*
  * https_launch_get - Perform HTTPS GET with client certificate via mbedTLS.
  *
  * Sunshine's /launch endpoint runs on the HTTPS server (port 47984) and
- * requires mutual TLS: the client MUST present the certificate that was
- * registered during pairing (cert_client.h).  The PSP sceHttp* API does
+ * requires mutual TLS: the client MUST present the runtime identity
+ * certificate that was registered during pairing. The PSP sceHttp* API does
  * not support client-certificate authentication, so we do the TLS
  * handshake ourselves using mbedTLS which is already linked.
  *
@@ -411,6 +620,13 @@ int https_launch_get(const char *host, int port,
     int  raw_size = sizeof(raw_stack);
     int  total = 0;
     char *body;
+    const char *active_cert_hex = get_active_client_cert_hex();
+    const char *active_key_pem = get_active_client_key_pem();
+
+    if (!active_cert_hex || !active_key_pem) {
+        pair_log("[LAUNCH-TLS] runtime client identity unavailable\n");
+        return -1;
+    }
 
     /* Removed raw = malloc(...) and if (!raw) check */
 
@@ -429,15 +645,15 @@ int https_launch_get(const char *host, int port,
         goto tls_cleanup;
     }
 
-    /* Parse embedded PEM certificate (decode from hex to PEM first).
-     * g_client_cert_hex is the hex-encoded PEM string. */
+    /* Parse active PEM certificate from runtime identity.
+     * Certificate is provided as hex-encoded PEM string. */
     {
-        size_t hex_len = strlen(g_client_cert_hex);
+        size_t hex_len = strlen(active_cert_hex);
         size_t pem_size = (hex_len / 2) + 1;
         char pem_buf[1536]; /* Typical Moonlight client cert is ~1KB */
         if (pem_size > sizeof(pem_buf)) { ret = -1; goto tls_cleanup; }
         
-        hex_to_bytes_lite(g_client_cert_hex, (unsigned char*)pem_buf, hex_len);
+        hex_to_bytes_lite(active_cert_hex, (unsigned char*)pem_buf, hex_len);
         pem_buf[pem_size - 1] = '\0';
 
         ret = mbedtls_x509_crt_parse(&clicert, (unsigned char*)pem_buf, pem_size);
@@ -448,10 +664,10 @@ int https_launch_get(const char *host, int port,
         }
     }
 
-    /* Parse embedded PEM private key */
+    /* Parse runtime PEM private key */
     ret = mbedtls_pk_parse_key(&pkey,
-                                (const unsigned char *)g_client_key_pem,
-                                strlen(g_client_key_pem) + 1,
+                                (const unsigned char *)active_key_pem,
+                                strlen(active_key_pem) + 1,
                                 NULL, 0);
     if (ret != 0) {
         pair_log("[LAUNCH-TLS] private key parse failed: -0x%04X\n", -ret);
@@ -537,7 +753,9 @@ int https_launch_get(const char *host, int port,
         goto tls_cleanup;
     }
 
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    /* Keep Sunshine compatibility for self-signed deployments while still
+     * capturing native verification flags; TOFU pinning remains mandatory. */
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
 
     /* Present client certificate for mutual TLS */
@@ -581,6 +799,19 @@ int https_launch_get(const char *host, int port,
         sceKernelDelayThread(5000); /* Reduced from 10ms for speed */
     }
     pair_log("[LAUNCH-TLS] TLS handshake OK\n");
+
+    {
+        unsigned int verify_flags = (unsigned int)mbedtls_ssl_get_verify_result(&ssl);
+        if (verify_flags != 0) {
+            pair_log("[LAUNCH-TLS] peer verify flags=0x%08X (pin policy enforced)\n",
+                     verify_flags);
+        }
+    }
+
+    if (tls_verify_or_store_pin(host, &ssl) != 0) {
+        pair_log("[LAUNCH-TLS] pin verification failed\n");
+        goto tls_cleanup;
+    }
 
     /* --- send HTTP GET --- */
     snprintf(request, sizeof(request),
@@ -707,13 +938,18 @@ int https_launch_get_binary(const char *host, int port,
     mbedtls_entropy_context  entropy;
 
     char request[1536];
-    char *raw = NULL;
-    int  raw_size = resp_size + 4096; /* extra room for HTTP headers */
-    int  total = 0;
+    char header_buf[4096];
+    unsigned char io_buf[2048];
+    int  header_len = 0;
+    int  header_done = 0;
+    int  body_written = 0;
     int  body_len = -1;
+    const char *active_cert_hex = get_active_client_cert_hex();
+    const char *active_key_pem = get_active_client_key_pem();
 
-    raw = (char *)malloc(raw_size);
-    if (!raw) return -1;
+    if (!active_cert_hex || !active_key_pem) {
+        return -1;
+    }
 
     /* --- init mbedTLS objects --- */
     mbedtls_ssl_init(&ssl);
@@ -728,20 +964,19 @@ int https_launch_get_binary(const char *host, int port,
     if (ret != 0) { goto bin_cleanup; }
 
     {
-        size_t hex_len = strlen(g_client_cert_hex);
+        size_t hex_len = strlen(active_cert_hex);
         size_t pem_len = hex_len / 2;
-        unsigned char *pem_buf = (unsigned char *)malloc(pem_len + 1);
-        if (!pem_buf) { ret = -1; goto bin_cleanup; }
-        hex_to_bytes_lite(g_client_cert_hex, pem_buf, hex_len);
+        unsigned char pem_buf[1536];
+        if ((pem_len + 1) > sizeof(pem_buf)) { ret = -1; goto bin_cleanup; }
+        hex_to_bytes_lite(active_cert_hex, pem_buf, hex_len);
         pem_buf[pem_len] = '\0';
         ret = mbedtls_x509_crt_parse(&clicert, pem_buf, pem_len + 1);
-        free(pem_buf);
         if (ret != 0) { goto bin_cleanup; }
     }
 
     ret = mbedtls_pk_parse_key(&pkey,
-                                (const unsigned char *)g_client_key_pem,
-                                strlen(g_client_key_pem) + 1, NULL, 0);
+                                (const unsigned char *)active_key_pem,
+                                strlen(active_key_pem) + 1, NULL, 0);
     if (ret != 0) { goto bin_cleanup; }
 
     sock = sceNetInetSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -806,7 +1041,9 @@ int https_launch_get_binary(const char *host, int port,
                                        MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) { goto bin_cleanup; }
 
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    /* Keep Sunshine compatibility for self-signed deployments while still
+     * capturing native verification flags; TOFU pinning remains mandatory. */
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
     ret = mbedtls_ssl_conf_own_cert(&conf, &clicert, &pkey);
     if (ret != 0) { goto bin_cleanup; }
@@ -833,6 +1070,18 @@ int https_launch_get_binary(const char *host, int port,
         sceKernelDelayThread(10000);
     }
 
+    {
+        unsigned int verify_flags = (unsigned int)mbedtls_ssl_get_verify_result(&ssl);
+        if (verify_flags != 0) {
+            pair_log("[LAUNCH-TLS] binary peer verify flags=0x%08X (pin policy enforced)\n",
+                     verify_flags);
+        }
+    }
+
+    if (tls_verify_or_store_pin(host, &ssl) != 0) {
+        goto bin_cleanup;
+    }
+
     snprintf(request, sizeof(request),
              "GET %s HTTP/1.0\r\nHost: %s:%d\r\n"
              "User-Agent: PSPMoonlight/1.0\r\nConnection: close\r\n\r\n",
@@ -855,12 +1104,15 @@ int https_launch_get_binary(const char *host, int port,
         }
     }
 
-    /* Read full response (headers + binary body) */
-    memset(raw, 0, raw_size);
+    /* Stream response and copy only body bytes into caller buffer. */
+    memset(header_buf, 0, sizeof(header_buf));
+    if (resp_size > 0) {
+        memset(resp, 0, resp_size);
+    }
+
     u32 rd_t = sceKernelGetSystemTimeLow();
-    while (total < raw_size - 1) {
-        ret = mbedtls_ssl_read(&ssl, (unsigned char *)raw + total,
-                                raw_size - 1 - total);
+    while (1) {
+        ret = mbedtls_ssl_read(&ssl, io_buf, sizeof(io_buf));
         if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
             ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
             if (sceKernelGetSystemTimeLow() - rd_t > 5000000) break;
@@ -868,30 +1120,67 @@ int https_launch_get_binary(const char *host, int port,
             continue;
         }
         if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) break;
-        if (ret < 0) break;
-        total += ret;
+        if (ret < 0) {
+            pair_log("[LAUNCH-TLS] binary read failed: -0x%04X\n", -ret);
+            break;
+        }
+
+        if (!header_done) {
+            int i;
+            int search_start;
+
+            if (header_len + ret > (int)sizeof(header_buf) - 1) {
+                pair_log("[LAUNCH-TLS] binary response header too large (%d bytes)\n",
+                         header_len + ret);
+                ret = -1;
+                goto bin_cleanup;
+            }
+
+            memcpy(header_buf + header_len, io_buf, ret);
+            search_start = (header_len >= 3) ? (header_len - 3) : 0;
+            header_len += ret;
+            header_buf[header_len] = '\0';
+
+            for (i = search_start; i < header_len - 3; i++) {
+                if (header_buf[i] == '\r' && header_buf[i + 1] == '\n' &&
+                    header_buf[i + 2] == '\r' && header_buf[i + 3] == '\n') {
+                    int body_off = i + 4;
+                    int available = header_len - body_off;
+                    int copy_len = resp_size - body_written;
+                    header_done = 1;
+
+                    if (copy_len > available) copy_len = available;
+                    if (copy_len > 0) {
+                        memcpy(resp + body_written, header_buf + body_off, copy_len);
+                        body_written += copy_len;
+                    }
+                    break;
+                }
+            }
+        } else {
+            int copy_len = resp_size - body_written;
+            if (copy_len > ret) copy_len = ret;
+            if (copy_len > 0) {
+                memcpy(resp + body_written, io_buf, copy_len);
+                body_written += copy_len;
+            }
+        }
+
+        if (header_done && body_written >= resp_size) {
+            break;
+        }
+
         rd_t = sceKernelGetSystemTimeLow();
     }
 
-    /* Find header/body boundary and copy binary body with memcpy */
-    {
-        int i;
-        int header_end = -1;
-        for (i = 0; i < total - 3; i++) {
-            if (raw[i] == '\r' && raw[i+1] == '\n' &&
-                raw[i+2] == '\r' && raw[i+3] == '\n') {
-                header_end = i + 4;
-                break;
-            }
+    /* Fallback: no HTTP header delimiter found, keep captured bytes as-is. */
+    if (!header_done) {
+        body_len = (header_len > resp_size) ? resp_size : header_len;
+        if (body_len > 0) {
+            memcpy(resp, header_buf, body_len);
         }
-        if (header_end >= 0) {
-            body_len = total - header_end;
-            if (body_len > resp_size) body_len = resp_size;
-            memcpy(resp, raw + header_end, body_len);
-        } else {
-            body_len = (total > resp_size) ? resp_size : total;
-            memcpy(resp, raw, body_len);
-        }
+    } else {
+        body_len = body_written;
     }
 
     ret = body_len;
@@ -909,7 +1198,6 @@ bin_cleanup:
         sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         sceNetInetClose(sock);
     }
-    free(raw);
 
     return ret;
 }
@@ -924,7 +1212,10 @@ extern const char *game_grid_ui_get_selected_title(void);
 /* Returns: 0=resume, 1=quit current and relaunch, -1=back/cancel */
 static int prompt_existing_session_action(void)
 {
-    int selection = 0;
+    /* Prefer a clean relaunch by default.
+     * Resume frequently starts mid-GOP without SPS/PPS on some hosts, which
+     * can trap weak clients in prolonged no-output startup loops. */
+    int selection = 1;
 
     while (1) {
         UIEvent evt = ui_process_input();
@@ -1094,9 +1385,9 @@ static int sunshine_launch_session(int target_appid)
              rikeyid, (unsigned int)rikeyid, g_av_ri_key_id, g_av_ri_key_id, (void *)&g_av_ri_key_id);
 
     /* ------------------------------------------------------------------
-     * Step C: If an app is already running, resume or quit+relaunch.
-     * Same app → auto-resume (instant relaunch, no popup).
-     * Different app → show Resume / Quit popup.
+     * Step C: If an app is already running, ask the user whether to
+     * resume it or quit+relaunch. We always show the popup (including
+     * same-app relaunch) so session handling stays explicit.
      * ------------------------------------------------------------------ */
     if (current_game > 0) {
         pair_log("[LAUNCH] existing session detected (currentgame=%d, target=%d)\n",
@@ -1104,27 +1395,20 @@ static int sunshine_launch_session(int target_appid)
 
         int user_choice;
 
-        if (current_game == target_appid) {
-            /* Same app — auto-resume without popup for instant relaunch.
-             * Loading UI thread keeps running with the RTSP phase text. */
-            pair_log("[LAUNCH] same app, auto-resuming (skipping popup)\n");
-            user_choice = 0;
-        } else {
-            /* Different app — ask user whether to quit current + launch new.
-             * Stop the stream_connect render thread first to avoid two threads
-             * calling ui_begin_frame simultaneously (causes GU corruption). */
-            stream_connect_stop();
+        /* Ask user whether to quit current + launch new.
+         * Stop the stream_connect render thread first to avoid two threads
+         * calling ui_begin_frame simultaneously (causes GU corruption). */
+        stream_connect_stop();
 
-            user_choice = prompt_existing_session_action();
+        user_choice = prompt_existing_session_action();
 
-            if (user_choice == -1) {
-                /* User cancelled — back to host/game menu */
-                pair_log("[LAUNCH] user cancelled session action\n");
-                return -1;
-            }
-
-            stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
+        if (user_choice == -1) {
+            /* User cancelled — back to host/game menu */
+            pair_log("[LAUNCH] user cancelled session action\n");
+            return -1;
         }
+
+        stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
 
         if (user_choice == 0) {
             /* Resume existing session — send /resume instead of /launch */
@@ -1213,20 +1497,40 @@ static int sunshine_launch_session(int target_appid)
      * Step D: /launch (fresh start) — only if we did not /resume above.
      * ------------------------------------------------------------------ */
     if (current_game == 0) {
-        /* Defensive: force width/height from resolution array.
-         * Fixes ghost stale-config bug where g_psp_config.width/height
-         * can diverge from the selected resolution preset. */
+        /* Defensive: keep width/height and resolutionIndex consistent.
+         * If explicit width/height match a known preset, sync the index to
+         * that preset. Only force width/height from preset when the current
+         * dimensions are invalid/unmapped. */
         {
             int ri = g_psp_config.resolutionIndex;
+            int matched_ri = -1;
+            int i;
             if (ri < 0 || ri >= RESOLUTION_COUNT) ri = 0;
-            int expected_w = RESOLUTION_WIDTHS[ri];
-            int expected_h = RESOLUTION_HEIGHTS[ri];
-            if (g_psp_config.width != expected_w || g_psp_config.height != expected_h) {
-                pair_log("[LAUNCH] FIXUP: config w=%d h=%d != preset[%d] %dx%d, forcing preset\n",
+
+            for (i = 0; i < RESOLUTION_COUNT; i++) {
+                if (g_psp_config.width == RESOLUTION_WIDTHS[i] &&
+                    g_psp_config.height == RESOLUTION_HEIGHTS[i]) {
+                    matched_ri = i;
+                    break;
+                }
+            }
+
+            if (matched_ri >= 0) {
+                if (ri != matched_ri) {
+                    pair_log("[LAUNCH] FIXUP: syncing preset index %d -> %d for config %dx%d\n",
+                             ri, matched_ri, g_psp_config.width, g_psp_config.height);
+                    ri = matched_ri;
+                    g_psp_config.resolutionIndex = matched_ri;
+                }
+            } else {
+                int expected_w = RESOLUTION_WIDTHS[ri];
+                int expected_h = RESOLUTION_HEIGHTS[ri];
+                pair_log("[LAUNCH] FIXUP: unmapped config %dx%d, forcing preset[%d] %dx%d\n",
                          g_psp_config.width, g_psp_config.height, ri, expected_w, expected_h);
                 g_psp_config.width  = expected_w;
                 g_psp_config.height = expected_h;
             }
+
             pair_log("[LAUNCH] resolution=%dx%d@%d (preset[%d])\n",
                      g_psp_config.width, g_psp_config.height, g_psp_config.fps, ri);
         }
@@ -1411,7 +1715,7 @@ int wifi_connect(void)
     if (ret < 0 && ret != (int)0x80110F01) return ret;
 
     /*--- Initialize network stack (align with netconf_ui) -------------------*/
-    ret = sceNetInit(128 * 1024, 42, 4096, 42, 4096);
+    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
     if (ret < 0 && ret != (int)0x80410201)
     {
         pspDebugScreenPrintf("wifi: sceNetInit failed (0x%08X)\n", ret);
@@ -1591,24 +1895,16 @@ static int rtsp_send_and_recv(int sock, const char *request,
             }
         }
     } else {
+        int send_errno = 0;
         req_len = (int)strlen(request);
-        sent = 0;
-        while (sent < req_len) {
-            ret = sceNetInetSend(sock, request + sent, req_len - sent, 0);
-            if (ret > 0) {
-                sent += ret;
-                continue;
+        if (net_send_all_psp(sock, request, req_len,
+                             1, 1000, &send_errno, &sent) != 0) {
+            if (send_errno == 0) {
+                pair_log("[RTSP] send returned 0 before full request write\n");
+            } else {
+                pair_log("[RTSP] send failed at %d/%d (errno %d)\n",
+                         sent, req_len, send_errno);
             }
-            if (ret < 0) {
-                int err = sceNetInetGetErrno();
-                if (err == EAGAIN || err == EWOULDBLOCK) {
-                    sceKernelDelayThread(1000);
-                    continue;
-                }
-                pair_log("[RTSP] send failed (errno %d)\n", err);
-                return ret;
-            }
-            pair_log("[RTSP] send returned 0 before full request write\n");
             return -1;
         }
     }
@@ -2271,7 +2567,9 @@ static int rtsp_announce(int sock, int enc_enabled)
 
     {
         extern PspConfig g_psp_config;
-        int bitrate_kbps = g_psp_config.bitrate > 0 ? g_psp_config.bitrate : 1600;
+        int requested_bitrate_kbps = g_psp_config.bitrate > 0 ? g_psp_config.bitrate : 1600;
+        int launch_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(requested_bitrate_kbps);
+        int transport_bitrate_kbps = (launch_bitrate_kbps * 80 + 99) / 100;
         int packet_size = g_psp_config.packetSize > 0 ? g_psp_config.packetSize : 1392;
         /* Resolution from preset array — authoritative source of truth. */
         int ri = g_psp_config.resolutionIndex;
@@ -2285,6 +2583,12 @@ static int rtsp_announce(int sock, int enc_enabled)
         packet_size -= (packet_size % 16);
         if (packet_size <= 0) {
             packet_size = 1024;
+        }
+        if (packet_size > 1024) {
+            packet_size = 1024;
+        }
+        if (transport_bitrate_kbps < 32) {
+            transport_bitrate_kbps = 32;
         }
         /* Subtract ENC_VIDEO_HEADER (32 bytes) from packetSize only when
          * SS_ENC_VIDEO (0x02) is negotiated — matching moonlight-common-c
@@ -2303,16 +2607,35 @@ static int rtsp_announce(int sock, int enc_enabled)
             }
         }
 
-        pair_log("[RTSP] negotiated bitrate=%d kbps, resolution=%dx%d@%d\n",
-                 bitrate_kbps, stream_w, stream_h, stream_fps);
+        pair_log("[RTSP] negotiated bitrate requested=%d kbps launch=%d kbps transport=%d kbps, resolution=%dx%d@%d\n",
+             requested_bitrate_kbps, launch_bitrate_kbps,
+             transport_bitrate_kbps, stream_w, stream_h, stream_fps);
         pair_log("[RTSP] using packetSize=%d (enc_enabled=%d)\n",
                  packet_size, enc_enabled);
 
         {
             int announce_video_port = g_video_client_port > 0 ?
                                       g_video_client_port : MOONLIGHT_VIDEO_PORT;
-            unsigned short announce_audio_port = 0;
-            audio_thread_reserve_client_port(&announce_audio_port);
+            char audio_media_sdp[96];
+            audio_media_sdp[0] = '\0';
+            if (g_psp_config.audioEnabled && g_audio_rtsp_ok) {
+                unsigned short announce_audio_port = 0;
+                if (audio_thread_reserve_client_port(&announce_audio_port) == 0 &&
+                    announce_audio_port > 0) {
+                    snprintf(audio_media_sdp, sizeof(audio_media_sdp),
+                             "m=audio %d\r\n"
+                             "a=rtpmap:97 opus/48000/2\r\n",
+                             (int)announce_audio_port);
+                    pair_log("[RTSP] audio media enabled in SDP on port=%d\n",
+                             (int)announce_audio_port);
+                } else {
+                    pair_log("[RTSP] WARN: audio port unavailable; omitting audio SDP\n");
+                }
+            } else if (!g_psp_config.audioEnabled) {
+                pair_log("[RTSP] audio disabled by config; omitting audio SDP\n");
+            } else {
+                pair_log("[RTSP] audio SETUP unavailable; omitting audio SDP\n");
+            }
 
 
 
@@ -2337,7 +2660,7 @@ static int rtsp_announce(int sock, int enc_enabled)
              *   - enableRecoveryMode:0         recovery mode breaks FEC queue
              *   - videoQualityScoreUpdateTime:5000  quality scoring interval
              *   - minimumBitrateKbps           latch bitrate (no server scaling)
-             *   - configuredBitrateKbps        original bitrate for FEC calc
+             *   - configuredBitrateKbps        launch bitrate for FEC calc
              */
             /* Profile/entropy selection: Baseline+CAVLC by default,
              * Main+CABAC only in test mode (config cabacTestMode=1). */
@@ -2364,14 +2687,15 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "a=x-nv-audio.surround.numChannels:2\r\n"
                 "a=x-nv-audio.surround.channelMask:3\r\n"
                 "a=x-nv-audio.surround.AudioQuality:0\r\n"
-                "a=x-nv-aqos.packetDuration:20\r\n"
+                "a=x-nv-audio.surround.enable:0\r\n"
+                "a=x-nv-aqos.packetDuration:10\r\n"
                 /* --- Transport: ENet reliable UDP, no qWAVE DSCP --- */
                 "a=x-nv-general.useReliableUdp:1\r\n"
                 "a=x-nv-aqos.qosTrafficType:0\r\n"
                 "a=x-nv-vqos[0].qosTrafficType:0\r\n"
                 /* --- FEC: critical for 802.11b packet loss --- */
                 "a=x-nv-vqos[0].fec.enable:1\r\n"
-                "a=x-nv-vqos[0].fec.minRequiredFecPackets:5\r\n"
+                "a=x-nv-vqos[0].fec.minRequiredFecPackets:2\r\n"
                 "a=x-nv-vqos[0].bllFec.enable:0\r\n"
                 /* --- Feature flags --- */
                 "a=x-ml-general.featureFlags:0\r\n"
@@ -2411,21 +2735,20 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "m=video %d\r\n"
                 "a=rtpmap:96 H264/90000\r\n"
                 "a=fmtp:96 packetization-mode=1;profile-level-id=%s\r\n"
-                /* --- Audio media line (tells Sunshine where to send audio) --- */
-                "m=audio %d\r\n"
-                "a=rtpmap:97 opus/48000/2\r\n",
+                /* --- Optional audio media line --- */
+                "%s",
                 CLIENT_VERSION,
                 stream_w, stream_h, stream_fps,
                 packet_size,
                 enc_enabled,
                 h264_profile, entropy_mode,
                 g_psp_config.clientRefreshRateX100 > 0 ? g_psp_config.clientRefreshRateX100 : 6000,
-                bitrate_kbps, bitrate_kbps,
-                bitrate_kbps, bitrate_kbps,
-                bitrate_kbps,
+                transport_bitrate_kbps, transport_bitrate_kbps,
+                transport_bitrate_kbps, transport_bitrate_kbps,
+                launch_bitrate_kbps,
                 announce_video_port,
                 profile_level_id,
-                (int)announce_audio_port);
+                audio_media_sdp);
             }
 
             if (sdp_len >= (int)sizeof(sdp_payload))
@@ -2490,6 +2813,8 @@ static int g_rtsp_persistent_sock = -1;
 
 void rtsp_session_close(void)
 {
+    upnp_remove_stream_mappings();
+
     if (g_rtsp_persistent_sock >= 0) {
         /* Optional: send TEARDOWN before closing if the server is still there. */
         sceNetInetClose(g_rtsp_persistent_sock);
@@ -2599,7 +2924,10 @@ int rtsp_session(void)
 {
     int sock = -1;
     int ret;
+    int upnp_ret;
     char sdp_buf[SDP_BUF_SIZE];
+    unsigned short upnp_video_port = 0;
+    unsigned short upnp_audio_port = 0;
 
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
 
@@ -2676,8 +3004,15 @@ int rtsp_session(void)
     pair_log("[RTSP] DESCRIBE done, delaying 100ms before SETUP...\n");
     sceKernelDelayThread(100 * 1000);
 
-    /* 3a. SETUP audio (non-fatal — video continues if audio SETUP fails) */
+    /* 3a. SETUP audio (non-fatal — video continues if audio SETUP fails).
+     * Sunshine/Apollo starts an audio session thread for every stream and will
+     * tear down the whole session if the client never sends the audio ping.
+     * Even when local playback is disabled, keep RTSP audio SETUP/ping alive;
+     * audioEnabled=0 only skips Opus decode/playback on the PSP. */
     g_audio_rtsp_ok = 0;
+    if (!g_psp_config.audioEnabled) {
+        pair_log("[RTSP] audio playback disabled by config; keeping SETUP for host session validity\n");
+    }
     pair_log("[RTSP] connecting for SETUP audio...\n");
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_VIDEO);
     sock = rtsp_connect();
@@ -2704,7 +3039,8 @@ int rtsp_session(void)
         }
     }
 
-    pair_log("[RTSP] SETUP audio done, delaying 50ms before SETUP video...\n");
+    pair_log("[RTSP] SETUP audio %s, delaying 50ms before SETUP video...\n",
+             g_audio_rtsp_ok ? "done" : "skipped/failed");
     sceKernelDelayThread(50 * 1000);
 
     /* 3b. SETUP video */
@@ -2740,6 +3076,25 @@ int rtsp_session(void)
     }
 
     sceKernelDelayThread(100 * 1000);
+
+    upnp_video_port = (g_video_client_port > 0 && g_video_client_port <= 65535)
+                         ? (unsigned short)g_video_client_port
+                         : 0;
+    if (g_audio_rtsp_ok) {
+        audio_thread_reserve_client_port(&upnp_audio_port);
+    }
+
+    upnp_ret = upnp_prepare_stream_mappings(g_sunshine_host,
+                                            upnp_video_port,
+                                            g_audio_rtsp_ok,
+                                            upnp_audio_port);
+    if (upnp_ret > 0) {
+        pair_log("[UPNP] mapped %d UDP ports for remote/hotspot stream\n", upnp_ret);
+    } else if (upnp_ret == 0) {
+        pair_log("[UPNP] skipped (private/LAN target)\n");
+    } else {
+        pair_log("[UPNP] unavailable (%d), continuing without mapping\n", upnp_ret);
+    }
 
     /* 4. ANNOUNCE */
     {
@@ -2824,6 +3179,7 @@ int rtsp_session(void)
     return 0;
 
 rtsp_fail:
+    upnp_remove_stream_mappings();
     if (sock >= 0) sceNetInetClose(sock);
     diag_log_flush();
     return ret;
@@ -2988,28 +3344,29 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
     {
         const char *method   = "GET ";
         char        hdr[256];
-        int         hdr_len, written, piece_len;
+        int         hdr_len, piece_len;
+        int         send_errno, send_off;
 
-        written = 0; piece_len = 4; /* "GET " */
-        while (written < piece_len) {
-            ret = (int)sceNetInetSend(sock, method + written,
-                                      piece_len - written, 0);
-            if (ret <= 0) {
-                pair_log("[HTTP] send failed\n");
-                sceNetInetClose(sock); return -1;
-            }
-            written += ret;
+        piece_len = 4; /* "GET " */
+        send_errno = 0;
+        send_off = 0;
+        if (net_send_all_psp(sock, method, piece_len,
+                             0, 0, &send_errno, &send_off) != 0) {
+            pair_log("[HTTP] send failed at %d/%d errno=%d\n",
+                     send_off, piece_len, send_errno);
+            sceNetInetClose(sock);
+            return -1;
         }
 
-        written = 0; piece_len = (int)strlen(path);
-        while (written < piece_len) {
-            ret = (int)sceNetInetSend(sock, path + written,
-                                      piece_len - written, 0);
-            if (ret <= 0) {
-                pair_log("[HTTP] send path failed\n");
-                sceNetInetClose(sock); return -1;
-            }
-            written += ret;
+        piece_len = (int)strlen(path);
+        send_errno = 0;
+        send_off = 0;
+        if (net_send_all_psp(sock, path, piece_len,
+                             0, 0, &send_errno, &send_off) != 0) {
+            pair_log("[HTTP] send path failed at %d/%d errno=%d\n",
+                     send_off, piece_len, send_errno);
+            sceNetInetClose(sock);
+            return -1;
         }
 
         hdr_len = snprintf(hdr, sizeof(hdr),
@@ -3017,15 +3374,14 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
                            "User-Agent: PSPMoonlight/1.0\r\n"
                            "Connection: close\r\n\r\n",
                            host, port);
-        written = 0;
-        while (written < hdr_len) {
-            ret = (int)sceNetInetSend(sock, hdr + written,
-                                      hdr_len - written, 0);
-            if (ret <= 0) {
-                pair_log("[HTTP] send hdr failed\n");
-                sceNetInetClose(sock); return -1;
-            }
-            written += ret;
+        send_errno = 0;
+        send_off = 0;
+        if (net_send_all_psp(sock, hdr, hdr_len,
+                             0, 0, &send_errno, &send_off) != 0) {
+            pair_log("[HTTP] send hdr failed at %d/%d errno=%d\n",
+                     send_off, hdr_len, send_errno);
+            sceNetInetClose(sock);
+            return -1;
         }
     }
 
@@ -3117,10 +3473,11 @@ static int xml_get_value_safe(const char *buf, const char *tag,
 }
 
 /*
- * do_rsa_sign - RSA-PKCS#1v15-SHA256 sign 'client_secret' with the embedded key.
+ * do_rsa_sign - RSA-PKCS#1v15-SHA256 sign 'client_secret' with client key.
  *
- * Parses g_client_key_pem, SHA-256 hashes client_secret (16 bytes), signs
- * the hash, and writes the 256 byte signature into sig_out.
+ * Parses active runtime client key,
+ * SHA-256 hashes client_secret (16 bytes), signs the hash, and writes
+ * the 256 byte signature into sig_out.
  *
  * Returns 0 on success, non-zero mbedTLS error code on failure.
  */
@@ -3132,6 +3489,11 @@ static int do_rsa_sign(const unsigned char *client_secret,
     mbedtls_entropy_context  entropy;
     unsigned char cs_hash[32];
     int ret;
+    const char *active_key_pem = get_active_client_key_pem();
+
+    if (!active_key_pem) {
+        return -1;
+    }
 
     mbedtls_pk_init(&pk);
     mbedtls_ctr_drbg_init(&ctr_drbg);
@@ -3142,8 +3504,8 @@ static int do_rsa_sign(const unsigned char *client_secret,
     if (ret != 0) goto cleanup;
 
     ret = mbedtls_pk_parse_key(&pk,
-                                (const unsigned char *)g_client_key_pem,
-                                strlen(g_client_key_pem) + 1, /* include NUL */
+                                (const unsigned char *)active_key_pem,
+                                strlen(active_key_pem) + 1, /* include NUL */
                                 NULL, 0);
     if (ret != 0) goto cleanup;
 
@@ -3176,8 +3538,8 @@ static int pairing_thread_func(SceSize args, void *argp)
     PairingThreadArgs *ta = *(PairingThreadArgs **)argp;
     const char *host = ta->host;
     const char *pin  = ta->pin;
-    char *resp = NULL;
-    char *url  = NULL;
+    char resp[4096];
+    char url[8192];
     int ret;
 
     /* Declare all locals at the top to avoid goto-over-declaration issues */
@@ -3193,6 +3555,7 @@ static int pairing_thread_func(SceSize args, void *argp)
     unsigned char cr_enc[64];
     unsigned char cr_dec[64];
     unsigned char client_secret[16];
+    unsigned char client_cert_sig[CLIENT_CERT_SIG_LEN];
     unsigned char crdata[288];
     unsigned char resp_hash[32];
     unsigned char resp_enc[32];
@@ -3205,21 +3568,16 @@ static int pairing_thread_func(SceSize args, void *argp)
     unsigned char salt_pin[20];
     unsigned char aes_key_full[32];
     const char   *pair_uuid;
-
-    /* Allocate large buffers from heap (thread stack is 64 KB) */
-    resp = (char *)malloc(4096);
-    url  = (char *)malloc(8192);
-    if (!resp || !url) {
-        pair_log("[PAIR] malloc failed\n");
-        ta->result = -1;
-        ta->thread_done = 1;
-        if (resp) free(resp);
-        if (url)  free(url);
-        return 0;
-    }
+    const char   *active_cert_hex;
 
     pair_log("[PAIR] Thread started host=%s pin=****\n", host);
     pair_uuid = client_identity_get_uuid();
+    active_cert_hex = get_active_client_cert_hex();
+    if (!pair_uuid || !pair_uuid[0] || !active_cert_hex || !active_cert_hex[0]) {
+        pair_log("[PAIR] runtime identity unavailable\n");
+        ta->result = -1;
+        goto done;
+    }
 
     /* ---------- Random salt + AES key derivation ---------- */
     ret = fill_random_bytes(salt, 16);
@@ -3243,7 +3601,7 @@ static int pairing_thread_func(SceSize args, void *argp)
              "http://%s:%d/pair?uniqueid=%s&uuid=%s&devicename=%s&updateState=1"
              "&phrase=getservercert&salt=%s&clientcert=%s",
              host, SUNSHINE_HTTP_PORT, CLIENT_UNIQUE_ID,
-             pair_uuid, DEVICE_NAME, salt_hex, g_client_cert_hex);
+             pair_uuid, DEVICE_NAME, salt_hex, active_cert_hex);
 
     ret = http_pair_get(url, resp, 4096);
     if (ret < 0) {
@@ -3337,8 +3695,14 @@ static int pairing_thread_func(SceSize args, void *argp)
      * Build: challenge_resp_data = server_challenge(16) ||
      *                              client_cert_sig(256) ||
      *                              client_secret(16)     = 288 bytes */
+    if (get_active_client_cert_sig(client_cert_sig, sizeof(client_cert_sig)) != 0) {
+        pair_log("[PAIR] failed to load client certificate signature\n");
+        ta->result = -5;
+        goto done;
+    }
+
     memcpy(crdata,        cr_dec + 32,        16); /* server_challenge */
-    memcpy(crdata + 16,   g_client_cert_sig,  CLIENT_CERT_SIG_LEN); /* 256 */
+    memcpy(crdata + 16,   client_cert_sig,    CLIENT_CERT_SIG_LEN); /* 256 */
     memcpy(crdata + 272,  client_secret,      16);
 
     sha256_hash(crdata, 288, resp_hash);
@@ -3414,8 +3778,6 @@ static int pairing_thread_func(SceSize args, void *argp)
     ta->result = 0;
 
 done:
-    free(resp);
-    free(url);
     ta->thread_done = 1;
     return 0;
 }

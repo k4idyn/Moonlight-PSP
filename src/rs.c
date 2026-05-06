@@ -81,6 +81,14 @@ static gf __declspec(align (256)) gf_mul_table[(GF_SIZE + 1)*(GF_SIZE + 1)];
 static gf gf_mul_table[(GF_SIZE + 1)*(GF_SIZE + 1)] __attribute__((aligned (256)));
 #endif
 
+/* Static RS workspaces (PSP-1000 deterministic memory policy).
+ * We maintain a single active reed_solomon context in fixed storage. */
+static reed_solomon s_rs_ctx;
+static gf s_rs_vm_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+static gf s_rs_top_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+static gf s_rs_matrix_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+static gf s_rs_parity_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+
 /*
  * modnn(x) computes x % GF_SIZE, where GF_SIZE is 2**GF_BITS - 1,
  * without a slow divide.
@@ -123,18 +131,21 @@ static gf* multiply1(gf *a, int ar, int ac, gf *b, int br, int bc) {
     int r, c, i, ptr = 0;
 
     /* assert(ac == br); */
-    new_m = (gf*) calloc(1, ar*bc);
-    if (NULL != new_m) {
+    if (ac != br || ar <= 0 || bc <= 0 || ar > DATA_SHARDS_MAX || bc > DATA_SHARDS_MAX) {
+        return NULL;
+    }
 
-        /* this multiply is slow */
-        for (r = 0; r < ar; r++) {
-            for (c = 0; c < bc; c++) {
-                tg = 0;
-                for (i = 0; i < ac; i++)
-                    tg ^= gf_mul(a[r*ac+i], b[i*bc+c]);
+    new_m = s_rs_matrix_buf;
+    memset(new_m, 0, (size_t)(ar * bc));
 
-                new_m[ptr++] = tg;
-            }
+    /* this multiply is slow */
+    for (r = 0; r < ar; r++) {
+        for (c = 0; c < bc; c++) {
+            tg = 0;
+            for (i = 0; i < ac; i++)
+                tg ^= gf_mul(a[r*ac+i], b[i*bc+c]);
+
+            new_m[ptr++] = tg;
         }
     }
 
@@ -341,12 +352,23 @@ static int invert_mat(gf *src, int k) {
  * */
 static gf* sub_matrix(gf* matrix, int rmin, int cmin, int rmax, int cmax,  int nrows, int ncols) {
     int i, j, ptr = 0;
-    gf* new_m = (gf*) malloc((rmax-rmin) * (cmax-cmin));
-    if (NULL != new_m) {
-        for (i = rmin; i < rmax; i++) {
-            for (j = cmin; j < cmax; j++) {
-                new_m[ptr++] = matrix[i*ncols + j];
-            }
+    int rows = rmax - rmin;
+    int cols = cmax - cmin;
+    gf* new_m;
+
+    (void)nrows;
+
+    if (rows <= 0 || cols <= 0 || rows > DATA_SHARDS_MAX || cols > DATA_SHARDS_MAX) {
+        return NULL;
+    }
+
+    /* First extraction in reed_solomon_new() is "top", second is "parity". */
+    new_m = (rmin == 0) ? s_rs_top_buf : s_rs_parity_buf;
+    memset(new_m, 0, (size_t)(rows * cols));
+
+    for (i = rmin; i < rmax; i++) {
+        for (j = cmin; j < cmax; j++) {
+            new_m[ptr++] = matrix[i*ncols + j];
         }
     }
 
@@ -376,103 +398,59 @@ void reed_solomon_init(void) {
 }
 
 reed_solomon* reed_solomon_new(int data_shards, int parity_shards) {
-    gf* vm = NULL;
-    gf* top = NULL;
-    int err = 0;
-    reed_solomon* rs = NULL;
+    gf* vm = s_rs_vm_buf;
+    gf* top;
+    reed_solomon* rs = &s_rs_ctx;
 
-    do {
-        rs = malloc(sizeof(reed_solomon));
-        if (NULL == rs)
-            return NULL;
+    memset(rs, 0, sizeof(*rs));
+    rs->data_shards = data_shards;
+    rs->parity_shards = parity_shards;
+    rs->shards = (data_shards + parity_shards);
 
-        rs->data_shards = data_shards;
-        rs->parity_shards = parity_shards;
-        rs->shards = (data_shards + parity_shards);
-        rs->m = NULL;
-        rs->parity = NULL;
+    if (rs->shards > DATA_SHARDS_MAX || data_shards <= 0 || parity_shards <= 0) {
+        return NULL;
+    }
 
-        if (rs->shards > DATA_SHARDS_MAX || data_shards <= 0 || parity_shards <= 0) {
-            err = 1;
-            break;
-        }
-
-        vm = (gf*)malloc(data_shards * rs->shards);
-
-        if (NULL == vm) {
-            err = 2;
-            break;
-        }
-        
+    memset(vm, 0, (size_t)(data_shards * rs->shards));
+    {
         int ptr = 0;
         for (int row = 0; row < rs->shards; row++) {
             for (int col = 0; col < data_shards; col++)
                 vm[ptr++] = row == col ? 1 : 0;
         }
-
-        top = sub_matrix(vm, 0, 0, data_shards, data_shards, rs->shards, data_shards);
-        if (NULL == top) {
-            err = 3;
-            break;
-        }
-
-        err = invert_mat(top, data_shards);
-        /* assert(0 == err); */
-
-        rs->m = multiply1(vm, rs->shards, data_shards, top, data_shards, data_shards);
-        if (NULL == rs->m) {
-            err = 4;
-            break;
-        }
-
-        for (int j = 0; j < parity_shards; j++) {
-            for (int i = 0; i < data_shards; i++)
-                rs->m[(data_shards + j)*data_shards + i] = inverse[(parity_shards + i) ^ j];
-        }
-
-        rs->parity = sub_matrix(rs->m, data_shards, 0, rs->shards, data_shards, rs->shards, data_shards);
-        if (NULL == rs->parity) {
-            err = 5;
-            break;
-        }
-
-        free(vm);
-        free(top);
-        vm = NULL;
-        top = NULL;
-        return rs;
-
-    } while(0);
-
-    (void)0;
-    if (NULL != vm)
-        free(vm);
-
-    if (NULL != top)
-        free(top);
-
-    if (NULL != rs) {
-        if (NULL != rs->m)
-            free(rs->m);
-
-        if (NULL != rs->parity)
-            free(rs->parity);
-
-        free(rs);
     }
 
-    return NULL;
+    top = sub_matrix(vm, 0, 0, data_shards, data_shards, rs->shards, data_shards);
+    if (NULL == top) {
+        return NULL;
+    }
+
+    if (invert_mat(top, data_shards) != 0) {
+        return NULL;
+    }
+
+    rs->m = multiply1(vm, rs->shards, data_shards, top, data_shards, data_shards);
+    if (NULL == rs->m) {
+        return NULL;
+    }
+
+    for (int j = 0; j < parity_shards; j++) {
+        for (int i = 0; i < data_shards; i++)
+            rs->m[(data_shards + j)*data_shards + i] = inverse[(parity_shards + i) ^ j];
+    }
+
+    rs->parity = sub_matrix(rs->m, data_shards, 0, rs->shards, data_shards, rs->shards, data_shards);
+    if (NULL == rs->parity) {
+        return NULL;
+    }
+
+    return rs;
 }
 
 void reed_solomon_release(reed_solomon* rs) {
     if (NULL != rs) {
-        if (NULL != rs->m)
-            free(rs->m);
-
-        if (NULL != rs->parity)
-            free(rs->parity);
-
-        free(rs);
+        rs->m = NULL;
+        rs->parity = NULL;
     }
 }
 

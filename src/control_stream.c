@@ -32,6 +32,8 @@
 #include "diag_log.h"
 #include "shared.h"
 #include "decode_flags.h"
+#include "signal_strength.h"
+#include "sw_decode_pipeline.h"
 
 /* ── Globals from network_connect.c ──────────────────────────────── */
 extern char          g_video_server_ip[64];
@@ -54,7 +56,7 @@ static u32 s_quality_prev_fec_recovered = 0;
 static u32 s_quality_prev_fec_failed    = 0;
 static u32 s_quality_prev_fec_dropped   = 0;
 static u32 s_quality_prev_fec_attempts  = 0;
-static u32 s_quality_prev_lgf           = 0;
+static u32 s_quality_prev_decoded       = 0;
 static u32 s_quality_prev_time_us       = 0;
 
 /* Phase 5.9: Quality-based BW report scaling (100=normal, 50=halve) */
@@ -140,8 +142,42 @@ static unsigned int get_le32(const unsigned char *p)
            ((unsigned int)p[3] << 24);
 }
 
+/* Declared early for helpers that transmit before the state section. */
+static int ctrl_socket = -1;
+
+/* Shared UDP send helper with rate-limited diagnostics for lossy WiFi.
+ * Logs first few failures quickly, then periodically, and logs recovery. */
+static int ctrl_sendto_with_diag(const void *buf,
+                                 int len,
+                                 const struct sockaddr_in *dst,
+                                 const char *tag,
+                                 unsigned int *fail_count)
+{
+    int tx = (int)sceNetInetSendto(ctrl_socket, buf, len, 0,
+                                   (const struct sockaddr *)dst, sizeof(*dst));
+
+    if (!fail_count) {
+        return tx;
+    }
+
+    if (tx < 0) {
+        unsigned int fails = ++(*fail_count);
+        if (fails <= 3 || (fails % 100) == 0) {
+            ctrl_log("[CTRL TX] %s send failed tx=%d errno=%d fails=%u\n",
+                     tag ? tag : "unknown", tx, sceNetInetGetErrno(), fails);
+        }
+    } else if (*fail_count) {
+        if (*fail_count >= 3) {
+            ctrl_log("[CTRL TX] %s recovered after %u failures\n",
+                     tag ? tag : "unknown", *fail_count);
+        }
+        *fail_count = 0;
+    }
+
+    return tx;
+}
+
 /* ── State ───────────────────────────────────────────────────────── */
-static int           ctrl_socket = -1;
 static SceUID        ctrl_thread_id = -1;
 static SceUID        ctrl_recv_thread_id = -1;
 static SceUID        ctrl_seq_sem_id = -1;
@@ -314,11 +350,22 @@ static int retx_scan(int sock, const struct sockaddr_in *dst)
         }
 
         /* Retransmit */
-        sceNetInetSendto(sock, e->data, e->len, 0,
-                         (const struct sockaddr *)dst, sizeof(*dst));
+        {
+            int tx = (int)sceNetInetSendto(sock, e->data, e->len, 0,
+                                           (const struct sockaddr *)dst, sizeof(*dst));
+            if (tx < 0) {
+                int err = sceNetInetGetErrno();
+                if (e->retries < 3 || (e->retries % 8) == 0) {
+                    ctrl_log("[CTRL RETX] send failed seq=%u ch=%u try=%u errno=%d\n",
+                             (unsigned)e->seq, (unsigned)e->channel,
+                             (unsigned)e->retries + 1, err);
+                }
+            } else {
+                retransmitted++;
+            }
+        }
         e->send_time_us = now;
         e->retries++;
-        retransmitted++;
     }
     return retransmitted;
 }
@@ -971,7 +1018,11 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                         int ack_tx = (int)sceNetInetSendto(ctrl_socket, ack_buf, ack_len, 0,
                                          (struct sockaddr *)&server_addr, sizeof(server_addr));
                         /* Log ACK failures and DISCONNECT ACKs only */
-                        if (ack_tx < 0 || cmd_num == ENET_CMD_DISCONNECT) {
+                        if (ack_tx < 0) {
+                            ctrl_log("[CTRL RX] ACK sent=%d for cmd=0x%02X ch=%u seq=%u errno=%d\n",
+                                     ack_tx, cmd, channel_id, (unsigned)rel_seq,
+                                     sceNetInetGetErrno());
+                        } else if (cmd_num == ENET_CMD_DISCONNECT) {
                             ctrl_log("[CTRL RX] ACK sent=%d for cmd=0x%02X ch=%u seq=%u\n",
                                      ack_tx, cmd, channel_id, (unsigned)rel_seq);
                         }
@@ -1099,8 +1150,13 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                                         pkt_get_channel_seq(reply_buf, reply_len, &rch, &rseq);
                                         retx_store(reply_buf, reply_len, rch, rseq);
                                     }
-                                    ctrl_log("[CTRL RX] 0x010E server-hello: echoed %d bytes tx=%d\n",
-                                             echo_len, tx);
+                                    if (tx < 0) {
+                                        ctrl_log("[CTRL RX] 0x010E server-hello: echoed %d bytes tx=%d errno=%d\n",
+                                                 echo_len, tx, sceNetInetGetErrno());
+                                    } else {
+                                        ctrl_log("[CTRL RX] 0x010E server-hello: echoed %d bytes tx=%d\n",
+                                                 echo_len, tx);
+                                    }
                                 } else {
                                     ctrl_log("[CTRL RX] 0x010E server-hello: reply build failed\n");
                                 }
@@ -1316,6 +1372,7 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             extern volatile u16 g_fec_last_parity_pkts;
             extern volatile u16 g_fec_last_recv_data;
             extern volatile u16 g_fec_last_recv_parity;
+            extern volatile u16 g_fec_last_missing_before_highest;
             extern volatile u8  g_fec_last_fec_pct;
 
             /* Stall recovery: advance frame_index when lgf is frozen.
@@ -1338,24 +1395,25 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                 /* lgf frozen — advance by 30 each half-second (60/sec)
                  * to outpace the server's frame counter (~30fps) and keep
                  * Sunshine's send window comfortably open during stalls. */
-                if (s_stall_advance < 7200)
-                    s_stall_advance += 30;
+                s_stall_advance = 0;
             }
-            piggy_frame = g_last_good_frame + s_stall_advance;
+            piggy_frame = g_last_good_frame;
 
-            control_stream_send_fec_status(
-                piggy_frame,
-                g_fec_last_highest_seq,      /* real highestReceivedSequenceNumber */
-                g_fec_last_next_contig_seq,  /* real nextContiguousSequenceNumber */
-                0,                           /* missingPacketsBeforeHighestReceived */
-                g_fec_last_data_pkts > 0 ? g_fec_last_data_pkts : 1,
-                g_fec_last_parity_pkts,
-                g_fec_last_recv_data > 0 ? g_fec_last_recv_data : 1,
-                g_fec_last_recv_parity,
-                g_fec_last_fec_pct,
-                0,      /* multiFecBlockIndex */
-                1       /* multiFecBlockCount */
-            );
+            if (piggy_frame > 0 && g_fec_last_data_pkts > 0) {
+                control_stream_send_fec_status(
+                    piggy_frame,
+                    g_fec_last_highest_seq,      /* real highestReceivedSequenceNumber */
+                    g_fec_last_next_contig_seq,  /* real nextContiguousSequenceNumber */
+                    g_fec_last_missing_before_highest,
+                    g_fec_last_data_pkts,
+                    g_fec_last_parity_pkts,
+                    g_fec_last_recv_data,
+                    g_fec_last_recv_parity,
+                    g_fec_last_fec_pct,
+                    0,      /* multiFecBlockIndex */
+                    1       /* multiFecBlockCount */
+                );
+            }
         }
 
         /* ── Bandwidth estimation: compute throughput over 5s window ───
@@ -1383,22 +1441,46 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                     {
                         unsigned char bw_buf[20];
                         u32 reported_bw = s_estimated_bw_bps;
-#define BW_REPORT_SCALE_PCT 115  /* inflate 15% to prevent premature server downgrade */
+                        int sig_br_kbps = signal_strength_get_bitrate();
+                        u32 min_reported_bw = 30000; /* 240 kbps floor in bytes/sec */
+#define BW_REPORT_SCALE_PCT 100  /* report the real PSP transport budget */
                         reported_bw = (u32)((u64)reported_bw * BW_REPORT_SCALE_PCT / 100);
                         /* Phase 5.9: Apply quality-based BW scaling */
                         reported_bw = (u32)((u64)reported_bw * (u32)s_quality_bw_scale_pct / 100);
+                        /* Cap by adaptive signal-strength controller target. */
+                        if (sig_br_kbps > 0) {
+                            u32 sig_cap_bps = (u32)sig_br_kbps * 125U;
+                            if (reported_bw > sig_cap_bps) {
+                                reported_bw = sig_cap_bps;
+                            }
+                            if (min_reported_bw > sig_cap_bps) {
+                                min_reported_bw = sig_cap_bps;
+                            }
+                        }
+
+                        /* Avoid collapse-to-zero feedback loops during stalls.
+                         * If we report near-zero BW, Sunshine can keep sending
+                         * tiny bursts forever and never recover decoder cadence. */
+                        if (reported_bw < min_reported_bw) {
+                            reported_bw = min_reported_bw;
+                        }
                         int bw_len = build_bandwidth_limit(bw_buf, sizeof(bw_buf),
                                                            reported_bw, 0);
                         if (bw_len > 0) {
-                            sceNetInetSendto(ctrl_socket, bw_buf, bw_len, 0,
-                                             (struct sockaddr *)&dst, sizeof(dst));
+                            int bw_tx = (int)sceNetInetSendto(ctrl_socket, bw_buf, bw_len, 0,
+                                                              (struct sockaddr *)&dst, sizeof(dst));
+                            if (bw_tx < 0 && (count <= 10 || (count % 300) == 0)) {
+                                ctrl_log("[CTRL BW] send failed errno=%d\n", sceNetInetGetErrno());
+                            }
                         }
 
                         if (count <= 10 || (count % 300) == 0) {
-                            ctrl_log("[CTRL BW] raw=%ukbps scaled=%ukbps (x%d%%) rto=%uus\n",
+                            ctrl_log("[CTRL BW] raw=%ukbps scaled=%ukbps (x%d%% qscale=%d%% sig_cap=%dkbps) rto=%uus\n",
                                      s_estimated_bw_bps * 8 / 1000,
                                      reported_bw * 8 / 1000,
                                      BW_REPORT_SCALE_PCT,
+                                     s_quality_bw_scale_pct,
+                                     sig_br_kbps,
                                      s_rto_us);
                         }
                     }
@@ -1413,31 +1495,20 @@ static int ctrl_ping_thread(SceSize args, void *argp)
 
         if (count % 50 == 0) { /* 50 × 100ms = 5 seconds */
             if (!g_idr_fully_decoded) {
-                ctrl_log("[CTRL PING] IDR accumulation incomplete, requesting IDR...\n");
-                control_stream_request_idr();
+                /* Startup-only assist: request IDR while stream is still
+                 * bootstrapping. Once frames are flowing, avoid forced IDR
+                 * churn that can create large keyframe bursts on weak WiFi. */
+                if (g_last_good_frame < 120) {
+                    ctrl_log("[CTRL PING] startup IDR assist (lgf=%u)\n", g_last_good_frame);
+                    control_stream_request_idr();
+                }
             }
         }
 
-        /* Periodic IDR refresh: every 5 seconds during normal streaming,
-         * force-request an IDR to reset the H.264 reference chain.
-         * At low bitrate on 802.11b WiFi, quantization errors accumulate
-         * in P-frame references (especially without HEVC intra-refresh).
-         * Without periodic IDR, the picture progressively washes out.
-         *
-         * Only fires when g_idr_fully_decoded is set (normal streaming).
-         * Must clear g_idr_fully_decoded before requesting, otherwise
-         * the request is silently suppressed by control_stream_request_idr().
-         *
-         * Reduced from 60s to 5s for fast-motion gaming: rapid scene
-         * changes cause P-frame drift to accumulate faster, and the
-         * IDR backoff cap (now 1s) prevents flooding. */
-        if (count > 0 && (count % 50) == 0 && g_idr_fully_decoded) {
-            ctrl_log("[CTRL PING] Periodic IDR refresh (5s)\n");
-            g_idr_fully_decoded = 0;
-            control_stream_request_idr();
-        }
+        /* Periodic IDR refresh disabled for v1.0 stability.
+         * Recovery is driven by explicit stall/drop signals only. */
 
-        /* Stall recovery: if no new frames in 5 seconds, request IDR.
+        /* Stall recovery: if no new frames for a prolonged period, request IDR.
          * The host may have stopped sending because it missed the ack
          * for the next frame, or a control message was lost.
          *
@@ -1449,17 +1520,21 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             static unsigned int stall_ticks = 0;
             if (g_last_good_frame > 0 && g_last_good_frame == stall_lgf) {
                 stall_ticks++;
-                if (stall_ticks == 50) { /* 50 × 100ms = 5 seconds */
-                    ctrl_log("[CTRL PING] STALL lgf=%u for 5s, requesting IDR\n",
-                             g_last_good_frame);
-                    g_idr_fully_decoded = 0;
-                    control_stream_request_idr();
+                if (stall_ticks == 80) { /* 80 × 100ms = 8 seconds */
+                    if (s_conn_quality.frames_per_sec <= 8) {
+                        ctrl_log("[CTRL PING] STALL lgf=%u for 8s, requesting IDR\n",
+                                 g_last_good_frame);
+                        g_idr_fully_decoded = 0;
+                        control_stream_request_idr();
+                    }
                 }
-                if (stall_ticks == 100) { /* 100 × 100ms = 10 seconds */
-                    ctrl_log("[CTRL PING] STALL lgf=%u for 10s, requesting IDR (urgent)\n",
-                             g_last_good_frame);
-                    g_idr_fully_decoded = 0;
-                    control_stream_request_idr();
+                if (stall_ticks == 160) { /* 160 × 100ms = 16 seconds */
+                    if (s_conn_quality.frames_per_sec <= 4) {
+                        ctrl_log("[CTRL PING] STALL lgf=%u for 16s, requesting IDR (urgent)\n",
+                                 g_last_good_frame);
+                        g_idr_fully_decoded = 0;
+                        control_stream_request_idr();
+                    }
                 }
             } else {
                 stall_lgf = g_last_good_frame;
@@ -1518,6 +1593,7 @@ int control_stream_send_fec_status(unsigned int frame_index,
     unsigned char pkt[192];
     unsigned char payload[23];  /* SS_FRAME_FEC_STATUS is 23 bytes, all BE */
     int pkt_len;
+    static unsigned int s_fec_tx_failures = 0;
 
     if (!ctrl_crypto_ready || ctrl_socket < 0) return -1;
 
@@ -1548,9 +1624,8 @@ int control_stream_send_fec_status(unsigned int frame_index,
                                               0x5502, payload, 21, CTRL_CHANNEL_GENERIC);
     if (pkt_len <= 0) return -1;
 
-    return (int)sceNetInetSendto(ctrl_socket, pkt, pkt_len, 0,
-                                 (struct sockaddr *)&g_server_addr,
-                                 sizeof(g_server_addr));
+    return ctrl_sendto_with_diag(pkt, pkt_len, &g_server_addr,
+                                 "fec_status", &s_fec_tx_failures);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1569,6 +1644,7 @@ int control_stream_send_input(const unsigned char *payload, int payload_len,
     int pkt_len;
     struct sockaddr_in dst;
     int ret = 0;
+    static unsigned int s_input_tx_failures = 0;
 
     if (!ctrl_crypto_ready || ctrl_socket < 0) {
         return -1;
@@ -1587,8 +1663,8 @@ int control_stream_send_input(const unsigned char *payload, int payload_len,
         return -1;
     }
 
-    ret = (int)sceNetInetSendto(ctrl_socket, pkt, pkt_len, 0,
-                                (struct sockaddr *)&dst, sizeof(dst));
+    ret = ctrl_sendto_with_diag(pkt, pkt_len, &dst,
+                                "input", &s_input_tx_failures);
     return ret;
 }
 
@@ -1621,17 +1697,17 @@ int control_stream_request_idr(void)
     unsigned char idr_payload[] = { 0x00, 0x00 };
     int pkt_len;
     int ret_urgent = -1;
+    static unsigned int s_idr_tx_failures = 0;
 
     if (ctrl_socket < 0 || !ctrl_running) {
         return -1;
     }
 
     /* Rate-limit IDR requests with exponential backoff.
-     * Starts at 500ms, doubles on each consecutive request up to 4s max.
-     * Resets to 500ms when a new IDR decode succeeds (g_idr_fully_decoded
-     * goes from 0→1).  This prevents flooding Sunshine during bad WiFi
-     * while still allowing rapid recovery when signal improves.
-     * First 3 requests bypass throttle for rapid-fire during initial connection. */
+     * Starts at 500ms, doubles on consecutive requests up to 2s max.
+     * On successful IDR decode, gently relaxes (halves) instead of a hard
+     * reset to avoid bursty request loops on borderline WiFi.
+     * First 2 requests bypass throttle for rapid initial recovery. */
     {
         static u64 s_last_idr_tick = 0;
         static int s_idr_count = 0;
@@ -1640,14 +1716,19 @@ int control_stream_request_idr(void)
         u64 now;
         sceRtcGetCurrentTick(&now);
 
-        /* Reset backoff when an IDR decode succeeds */
+        /* Relax backoff when an IDR decode succeeds */
         if (g_idr_fully_decoded && !s_idr_prev_decoded) {
-            ctrl_log("[IDR BACKOFF] reset to 500ms (IDR decoded ok, count=%d)\n", s_idr_count);
-            s_idr_backoff_us = 500000; /* reset to 500ms */
+            u32 prev_backoff = s_idr_backoff_us;
+            if (s_idr_backoff_us > 500000)
+                s_idr_backoff_us /= 2;
+            if (s_idr_backoff_us < 500000)
+                s_idr_backoff_us = 500000;
+            ctrl_log("[IDR BACKOFF] relax %ums -> %ums (IDR decoded ok, count=%d)\n",
+                     prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
         }
         s_idr_prev_decoded = g_idr_fully_decoded;
 
-        if (s_idr_count >= 3 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < s_idr_backoff_us) {
+        if (s_idr_count >= 2 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < s_idr_backoff_us) {
             ctrl_log("[IDR BACKOFF] throttled (backoff=%ums count=%d)\n",
                      s_idr_backoff_us / 1000, s_idr_count);
             return 0; /* throttled — recent IDR already in flight */
@@ -1655,14 +1736,12 @@ int control_stream_request_idr(void)
         s_last_idr_tick = now;
         s_idr_count++;
 
-        /* Exponential backoff: double interval after each send, cap at 500ms.
-         * Reduced from 1s — log analysis shows corruption visible for ~6s
-         * with 1s cap; 500ms cap clears ghosting artifacts in ~3s. */
-        if (s_idr_count >= 3) {
+        /* Exponential backoff: double interval after each send, cap at 2s. */
+        if (s_idr_count >= 2) {
             u32 prev_backoff = s_idr_backoff_us;
             s_idr_backoff_us *= 2;
-            if (s_idr_backoff_us > 500000)
-                s_idr_backoff_us = 500000;
+            if (s_idr_backoff_us > 2000000)
+                s_idr_backoff_us = 2000000;
             ctrl_log("[IDR BACKOFF] %ums -> %ums (count=%d)\n",
                      prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
         }
@@ -1679,9 +1758,8 @@ int control_stream_request_idr(void)
     }
 
     /* Single send + retransmit buffer handles gap recovery on lossy WiFi. */
-    ret_urgent = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
-                                       (struct sockaddr *)&g_server_addr,
-                                       sizeof(g_server_addr));
+    ret_urgent = ctrl_sendto_with_diag(send_buf, pkt_len, &g_server_addr,
+                                       "idr_req", &s_idr_tx_failures);
     /* Store in retransmit buffer for gap recovery */
     if (ret_urgent > 0) {
         unsigned char rch = 0;
@@ -1713,22 +1791,23 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
     unsigned char rfi_payload[24];
     int pkt_len;
     int ret_urgent = -1;
+    static unsigned int s_rfi_tx_failures = 0;
 
     if (ctrl_socket < 0 || !ctrl_running) {
         return -1;
     }
 
-    /* Rate-limit same as IDR: max 2/sec */
+    /* Rate-limit RFI aggressively on PSP-1000 WiFi.  Dropped P-frames are
+     * already concealed locally; RFI is useful, but frequent urgent sends
+     * can create recovery bursts that cost more packets than they save. */
     {
         static u64 s_last_rfi_tick = 0;
-        static int s_rfi_count = 0;
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (s_rfi_count >= 5 && s_last_rfi_tick != 0 && (now - s_last_rfi_tick) < 500000) {
+        if (s_last_rfi_tick != 0 && (now - s_last_rfi_tick) < 1000000) {
             return 0;
         }
         s_last_rfi_tick = now;
-        s_rfi_count++;
     }
 
     /* Build SS_RFI_REQUEST payload (24 bytes, all LE32) */
@@ -1751,12 +1830,8 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
         return -2;
     }
 
-    for (int r = 0; r < 3; r++) {
-        ret_urgent = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
-                                           (struct sockaddr *)&g_server_addr,
-                                           sizeof(g_server_addr));
-        sceKernelDelayThread(1000);
-    }
+    ret_urgent = ctrl_sendto_with_diag(send_buf, pkt_len, &g_server_addr,
+                                       "rfi_req", &s_rfi_tx_failures);
 
     ctrl_log("[CTRL] RFI request (0x0301) frames %u-%u urgent=%d\n",
              start_frame, end_frame, ret_urgent);
@@ -1890,7 +1965,12 @@ int control_stream_start(void)
     for (attempt = 0; attempt < 5; attempt++) {
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
-        ctrl_log("[CTRL] CONNECT sent=%d (attempt %d)\n", ret, attempt + 1);
+        if (ret < 0) {
+            ctrl_log("[CTRL] CONNECT sent=%d (attempt %d) errno=%d\n",
+                     ret, attempt + 1, sceNetInetGetErrno());
+        } else {
+            ctrl_log("[CTRL] CONNECT sent=%d (attempt %d)\n", ret, attempt + 1);
+        }
 
         /* Poll for response with MSG_DONTWAIT + manual 2s timeout.
          * sceNetInetRecv blocks forever on PSP UDP sockets even with
@@ -1938,7 +2018,12 @@ int control_stream_start(void)
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
     }
-    ctrl_log("[CTRL] ACK sent=%d for VERIFY (triple-fire)\n", ret);
+    if (ret < 0) {
+        ctrl_log("[CTRL] ACK sent=%d for VERIFY (triple-fire) errno=%d\n",
+                 ret, sceNetInetGetErrno());
+    } else {
+        ctrl_log("[CTRL] ACK sent=%d for VERIFY (triple-fire)\n", ret);
+    }
 
     sceKernelDelayThread(50000); /* 50 ms settle */
 
@@ -1968,7 +2053,11 @@ int control_stream_start(void)
         }
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
-        ctrl_log("[CTRL] START_A sent=%d\n", ret);
+        if (ret < 0) {
+            ctrl_log("[CTRL] START_A sent=%d errno=%d\n", ret, sceNetInetGetErrno());
+        } else {
+            ctrl_log("[CTRL] START_A sent=%d\n", ret);
+        }
     }
 
     sceKernelDelayThread(50000); /* 50 ms */
@@ -1992,7 +2081,11 @@ int control_stream_start(void)
         }
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
-        ctrl_log("[CTRL] START_B sent=%d\n", ret);
+        if (ret < 0) {
+            ctrl_log("[CTRL] START_B sent=%d errno=%d\n", ret, sceNetInetGetErrno());
+        } else {
+            ctrl_log("[CTRL] START_B sent=%d\n", ret);
+        }
     }
 
     /* ── Step 5: Start control receive + periodic ping threads ───── */
@@ -2130,11 +2223,13 @@ static void update_connection_quality(u32 estimated_bw_bps)
     u32 d_dropped   = g_fec_frames_dropped    - s_quality_prev_fec_dropped;
     u32 d_attempts  = g_fec_recovery_attempts - s_quality_prev_fec_attempts;
 
-    /* Loss rate: failed / (recovered + failed), scaled x10 for 0.1% precision */
+    /* Loss rate: keep packet-level FEC loss, then fold in frame-level
+     * drops so quality accounting reflects what the user actually sees. */
     u32 total_fec_pkts = d_recovered + d_failed;
+    u32 packet_loss_x10 = 0;
     u32 loss_rate_x10 = 0;
     if (total_fec_pkts > 0) {
-        loss_rate_x10 = (d_failed * 1000) / total_fec_pkts;
+        packet_loss_x10 = (d_failed * 1000) / total_fec_pkts;
     }
 
     /* FEC recovery success rate */
@@ -2144,22 +2239,49 @@ static void update_connection_quality(u32 estimated_bw_bps)
         recovery_pct = (d_success * 100) / d_attempts;
     }
 
-    /* Frame rate: delta frames / delta time */
-    u32 d_frames = g_last_good_frame - s_quality_prev_lgf;
+    /* Frame rate must come from the decoder, not RTP frame indexes. */
+    u32 decoded_now = 0;
+    u32 dropped_now = 0;
+    sw_decoder_get_stats(&decoded_now, &dropped_now);
+    u32 d_frames = decoded_now - s_quality_prev_decoded;
     u32 fps = (d_frames * 1000000) / dt_us;
+    {
+        u32 total_frame_events = d_frames + d_dropped;
+        if (total_frame_events > 0) {
+            u32 frame_loss_x10 = (d_dropped * 1000) / total_frame_events;
+            u32 visible_delivery_pct = (d_frames * 100) / total_frame_events;
+
+            loss_rate_x10 = packet_loss_x10;
+            if (frame_loss_x10 > loss_rate_x10) {
+                loss_rate_x10 = frame_loss_x10;
+            }
+            if (visible_delivery_pct < recovery_pct) {
+                recovery_pct = visible_delivery_pct;
+            }
+        } else {
+            loss_rate_x10 = packet_loss_x10;
+        }
+    }
 
     /* Classify quality */
     ConnQuality q;
-    if (loss_rate_x10 < 10 && d_dropped == 0) {
+    if (loss_rate_x10 < 10 && d_dropped == 0 && fps >= 20) {
         q = CONN_QUALITY_EXCELLENT;  /* <1.0% loss */
-    } else if (loss_rate_x10 < 30 && d_dropped <= 1) {
+    } else if (loss_rate_x10 < 30 && d_dropped <= 1 && fps >= 15) {
         q = CONN_QUALITY_GOOD;       /* <3.0% loss */
-    } else if (loss_rate_x10 < 80 && d_dropped <= 3) {
+    } else if (loss_rate_x10 < 80 && d_dropped <= 2 && fps >= 12) {
         q = CONN_QUALITY_FAIR;       /* <8.0% loss */
-    } else if (loss_rate_x10 < 150) {
+    } else if (loss_rate_x10 < 150 && d_dropped <= 5 && fps >= 8) {
         q = CONN_QUALITY_POOR;       /* <15% loss */
     } else {
         q = CONN_QUALITY_CRITICAL;   /* >15% loss */
+    }
+
+    if (d_dropped > 0 && q < CONN_QUALITY_POOR) {
+        q = CONN_QUALITY_POOR;
+    }
+    if (d_dropped >= 3) {
+        q = CONN_QUALITY_CRITICAL;
     }
 
     /* Phase 5.9: Quality transition hysteresis — require 3 consecutive
@@ -2178,19 +2300,30 @@ static void update_connection_quality(u32 estimated_bw_bps)
             s_consecutive_at_pending = 1;
         }
 
-        if (s_consecutive_at_pending >= 3 && q != s_committed_quality) {
+        {
+            int required_consecutive = 3;
+            if (q > s_committed_quality) {
+                if (d_dropped > 0)
+                    required_consecutive = 1;
+                else
+                    required_consecutive = (q >= CONN_QUALITY_CRITICAL) ? 1 : 2;
+            }
+            if (s_consecutive_at_pending >= required_consecutive && q != s_committed_quality) {
             ctrl_log("[PHASE5-QUALITY] transition: %s -> %s (consecutive=%d)\n",
                      q_names[s_committed_quality], q_names[q], s_consecutive_at_pending);
 
             /* Phase 5.9: Scale BW reports on quality transitions.
              * POOR/CRITICAL → halve reported BW to make server reduce encoding.
              * EXCELLENT/GOOD → restore to normal. */
-            if (q >= CONN_QUALITY_POOR)
-                s_quality_bw_scale_pct = 50;
+            if (q >= CONN_QUALITY_CRITICAL)
+                s_quality_bw_scale_pct = 60;
+            else if (q >= CONN_QUALITY_POOR)
+                s_quality_bw_scale_pct = 75;
             else
                 s_quality_bw_scale_pct = 100;
 
             s_committed_quality = q;
+            }
         }
 
         q = s_committed_quality;
@@ -2233,7 +2366,7 @@ static void update_connection_quality(u32 estimated_bw_bps)
     s_quality_prev_fec_failed    = g_fec_packets_failed;
     s_quality_prev_fec_dropped   = g_fec_frames_dropped;
     s_quality_prev_fec_attempts  = g_fec_recovery_attempts;
-    s_quality_prev_lgf           = g_last_good_frame;
+    s_quality_prev_decoded       = decoded_now;
     s_quality_prev_time_us       = now_us;
 }
 
@@ -2265,9 +2398,15 @@ void control_stream_stop(void)
         p = put_be16(p, 0); /* reliableSeq = 0 for disconnect */
         p = put_be32(p, 0); /* data = 0 */
 
-        sceNetInetSendto(ctrl_socket, disc_pkt, (int)(p - disc_pkt), 0,
-                         (struct sockaddr *)&g_server_addr,
-                         sizeof(g_server_addr));
+        {
+            int disc_tx = (int)sceNetInetSendto(ctrl_socket, disc_pkt, (int)(p - disc_pkt), 0,
+                                                (struct sockaddr *)&g_server_addr,
+                                                sizeof(g_server_addr));
+            if (disc_tx < 0) {
+                ctrl_log("[CTRL] graceful ENet DISCONNECT send failed errno=%d\n",
+                         sceNetInetGetErrno());
+            }
+        }
 
         /* Brief linger: give the DISCONNECT packet time to reach Sunshine.
          * 50ms is enough for a single UDP packet on 802.11b even at

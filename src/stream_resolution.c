@@ -17,17 +17,32 @@
 /* Global resolution table — initialized once per stream session */
 StreamResolution g_stream_res = {0};
 
+void stream_resolution_normalize(int *inout_width, int *inout_height)
+{
+    int width = (inout_width && *inout_width > 0) ? *inout_width : PSP_LCD_WIDTH;
+    int height = (inout_height && *inout_height > 0) ? *inout_height : PSP_LCD_HEIGHT;
+
+    /* Enforce H.264 macroblock alignment first, then clamp to renderer bounds. */
+    width &= ~15;
+    height &= ~15;
+
+    if (width < STREAM_MIN_WIDTH) width = STREAM_MIN_WIDTH;
+    if (height < STREAM_MIN_HEIGHT) height = STREAM_MIN_HEIGHT;
+    if (width > STREAM_MAX_WIDTH) width = STREAM_MAX_WIDTH;
+    if (height > STREAM_MAX_HEIGHT) height = STREAM_MAX_HEIGHT;
+
+    if (inout_width) {
+        *inout_width = width;
+    }
+    if (inout_height) {
+        *inout_height = height;
+    }
+}
+
 void stream_resolution_init(int width, int height)
 {
-    /* Clamp to mod-16 (H.264 macroblock alignment) */
-    width  = (width  > 0) ? (width  & ~15) : PSP_LCD_WIDTH;
-    height = (height > 0) ? (height & ~15) : PSP_LCD_HEIGHT;
-
-    /* Enforce sane bounds: minimum 128x80, maximum 1920x1088 */
-    if (width  < 128)  width  = 128;
-    if (height < 80)   height = 80;
-    if (width  > 1920) width  = 1920;
-    if (height > 1088) height = 1088;
+    /* Normalize to renderer-safe bounds before deriving allocations/strides. */
+    stream_resolution_normalize(&width, &height);
 
     g_stream_res.width  = width;
     g_stream_res.height = height;

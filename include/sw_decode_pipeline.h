@@ -344,6 +344,11 @@ void sw_pipeline_get_stats(u32 *decoded, u32 *dropped,
                            u32 *cpu_us, u32 *me_us);
 
 /**
+ * Get software decoder thread output statistics.
+ */
+void sw_decoder_get_stats(u32 *decoded, u32 *dropped);
+
+/**
  * Check if the pipeline is initialized and ready.
  */
 int sw_pipeline_is_ready(void);

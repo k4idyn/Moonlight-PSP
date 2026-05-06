@@ -24,7 +24,9 @@ EXTRA_TARGETS   = EBOOT.PBP
 # Source Files
 # ============================================================================
 OBJS = src/main.o src/network_connect.o src/network_me.o \
+       src/net_send.o \
        src/sw_decoder_thread.o src/stream_resolution.o \
+       src/upnp_client.o \
        src/display_gpu.o src/input.o src/rtp_reassembly.o src/rtp_fec.o src/rs.o src/host_discovery.o \
        src/settings_menu.o src/config.o src/hud.o src/stream_session.o src/game_list_parser.o \
        src/signal_strength.o src/safety_buffer.o src/audio_thread.o src/power_handler.o \
@@ -50,7 +52,7 @@ MBEDTLS_CFLAGS  = -I$(MBEDTLS_ROOT)/include \
 
 MBEDTLS_NAMES = aes asn1parse asn1write base64 bignum cipher cipher_wrap \
                 constant_time ctr_drbg ecdh ecp ecp_curves entropy error gcm md md5 oid pem pk pk_wrap pkparse pkwrite \
-                platform platform_util rsa rsa_internal sha1 sha256 \
+                platform platform_util memory_buffer_alloc rsa rsa_internal sha1 sha256 \
                 ssl_ciphersuites ssl_cli ssl_cookie ssl_msg ssl_ticket ssl_tls \
                 x509 x509_create x509_crl x509_crt x509_csr x509write_crt x509write_csr
 
@@ -120,11 +122,23 @@ OPENH264_LIB     = $(OPENH264_ROOT)/libopenh264_dec_psp.a
 OPENH264_INCDIR  = -I$(OPENH264_ROOT)
 
 # ============================================================================
+# Build Mode
+# ============================================================================
+# RETAIL_BUILD=1 keeps diagnostics minimal and strips most log-file writes.
+# For hardware debugging/release verification, keep this at 0.
+RETAIL_BUILD ?= 0
+ifeq ($(RETAIL_BUILD),1)
+BUILD_MODE_DEFINES = -DRETAIL_BUILD
+else
+BUILD_MODE_DEFINES =
+endif
+
+# ============================================================================
 # Compiler Flags
 # ============================================================================
-CFLAGS  = -O2 -G0 -Wall -Werror -DPSP -DRETAIL_BUILD $(MBEDTLS_CFLAGS) \
+CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(MBEDTLS_CFLAGS) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
-CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP -DRETAIL_BUILD -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
+CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
            $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 
@@ -145,6 +159,10 @@ LIBS = $(OPENH264_LIB) \
 # Targets
 # ============================================================================
 all: me_helper $(TARGET).prx $(EXTRA_TARGETS)
+
+.PHONY: smoke
+smoke:
+	bash scripts/smoke_checks.sh
 
 # Build the Media Engine kernel PRX helper (provides InitME/KillME)
 .PHONY: me_helper

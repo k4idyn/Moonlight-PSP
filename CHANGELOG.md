@@ -2,11 +2,42 @@
 
 All notable changes to PSP Moonlight are documented here.
 
-v0.2.0-beta is the first public release of this codebase. For the history of the original
+v0.2.0-beta was the first public release of this codebase. For the history of the original
 `moonlight-psp-core` project (the prior public alpha that used `sceMpeg` + `moonlight-common-c`),
-see the [archived repo](https://github.com/k4idyn/Moonlight-PSP). Nothing from that codebase
-carries into this one — it's a clean-sheet rewrite. The internal dev milestones below were
-never published; they're documented here so the commit history makes sense.
+see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
+
+---
+
+## [1.0.0] — 2026-05-05 (public release refresh)
+
+### Release Hardening
+- Retail build mode is now the documented default for public packaging.
+- Public docs were normalized from internal audit wording to release wording.
+- CABAC compatibility documentation was clarified as normal-mode unsupported behavior with explicit CAVLC host guidance.
+
+### Fixed (vs v0.2.3-beta)
+- Pairing persistence now survives partial connection failures: successful pairing is saved even when launch/RTSP infrastructure fails later in the same attempt.
+- RTSP/launch infrastructure failures now return a dedicated retryable status (`-3`) distinct from user cancel (`-2`) and pairing failure (`-1`).
+- Settings UI now flushes controller state after OSK/button-mapping flows to prevent stale Start-edge saves on return.
+- Config bootstrap now remembers default-loaded config when no file exists so first-session host/pairing additions persist correctly.
+
+### Documentation
+- Updated README status badges and version history for public release posture.
+- Reworked release-validation documentation (`docs/RELEASE_READINESS.md`) to include retail build commands and git-tag comparison notes.
+- Removed internal blocker/audit wording from user-facing docs (`docs/KNOWN_ISSUES.md`, encoder settings guides, and UI/architecture headers).
+
+### Initial 1.0.0 publication (2026-05-04)
+
+### Release
+- Stable v1.0 public documentation set.
+- Security, memory, reliability, and architecture hardening work from the beta cycle is now integrated in the release branch.
+
+### Networking
+- UPnP IGD hotspot/remote assist is included for RTP/RTCP UDP mapping setup and cleanup during streaming sessions.
+
+### Documentation
+- Removed internal blocker-ID workflow references and test-only publication content from public docs.
+- Updated README, install flow, and known-issues content for v1.0 user-facing guidance.
 
 ---
 
@@ -15,6 +46,7 @@ never published; they're documented here so the commit history makes sense.
 ### Added — Host Discovery & Navigation
 - **mDNS host discovery:** New `mdnsDiscoverHosts()` sends multicast queries for `_nvstream._tcp.local.` on 224.0.0.251:5353 with multicast group join and 2s listen window (resend at 1s). Near-instant LAN discovery replacing the need for manual IP entry only.
 - **Quick subnet scan (Square button):** New `quickSubnetScan()` does sequential non-blocking TCP connect to port 47989 across the /24 subnet with 15ms timeout per host. Shows progress UI, interruptible via Circle. Manual-trigger only to avoid exhausting the PSP socket pool.
+- **UPnP hotspot assist (remote mode):** Added IGD SSDP/SOAP support to request UDP port mappings for PSP video/audio RTP+RTCP ports during RTSP setup, with automatic cleanup on session close/failure. Improves remote/hotspot compatibility when streaming via public host IP.
 - **Multi-host pairing (up to 8):** Replaced single `pairedHostIp[16]` with `pairedHostIps[8][16]` array + `pairedHostCount`. MRU ordering (slot 0 = most recent). New `config_is_host_paired()` and `config_add_paired_host()` APIs. Legacy `paired_host_ip` migrates to slot 0 on load.
 - **Paired status display:** Host cards show "Paired" (green) / "Unpaired" (muted red) label for online hosts. Uses config-based paired-host list because plain HTTP `/serverinfo` can't verify the TLS client cert.
 - **Back navigation (Host → Settings):** Circle button in host discovery returns to settings menu. WiFi state is checked first — if already connected (apctl state 4), the netconf dialog is skipped on re-entry.
@@ -124,7 +156,7 @@ never published; they're documented here so the commit history makes sense.
 | Input types | Gamepad only | Gamepad + keyboard + scroll + battery |
 | Resolution modes | Fixed | Auto-scale 4-step ladder |
 | HUD metrics | FPS, latency | +loss%, FEC%, battery, host latency |
-| Features verified | — | 31/39 ACTIVE across 8-stage test |
+| Feature coverage | — | Expanded and stabilized during v0.2.x cycle |
 
 ---
 
@@ -227,7 +259,7 @@ frontend. The ME is retained solely for YUV→RGBA, running concurrently with FF
 - `sw_decoder_thread.c` — complete rewrite: dual-mode watchdog, force-restart, ring backlog safety net
 
 #### Fixed
-- **Display freeze (run 070):** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` stuck in permanent `EAGAIN`, destroying arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` now called from overrun handler.
+- **Display freeze:** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` stuck in permanent `EAGAIN`, destroying arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` now called from overrun handler.
 - **ME data cache bug:** Switched ME buffer pointers from uncached (`0x48xxxxxx`) to cached addresses with pre/post dcache flush. YUV→RGBA went from 47,000 µs → 31 µs (1,500× improvement).
 - **ME crash recovery:** Single-shot ME disable replaced with KillME+reinit retry (up to 3 recoveries).
 
@@ -346,7 +378,7 @@ Replaced the hand-rolled CAVLC+VFPU orchestrated pipeline with **FFmpeg libavcod
 - `sw_decoder_thread.c` — complete rewrite: dual-mode watchdog, force-restart, ring backlog safety net, static-local reset via `g_decode_counters_reset_pending`
 
 #### Fixed
-- **Display freeze bug (run 070):** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` permanently returned `EAGAIN`, causing infinite overrun loop that destroyed arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` called from overrun handler.
+- **Display freeze bug:** Queue overrun handler flushed RTP state but not FFmpeg internal state. `avcodec_receive_frame` permanently returned `EAGAIN`, causing infinite overrun loop that destroyed arriving IDR packets. Fix: `ffmpeg_pipeline_flush_buffers()` called from overrun handler.
 - **ME crash recovery:** Permanent ME disable after first crash replaced with KillME+reinit retry (up to 3 recoveries). 11/11 ME timeouts recovered in testing.
 - **ME data cache bug:** Switched ME buffer pointers from uncached (`0x48xxxxxx`) to cached addresses with pre/post dcache flush. Eliminated bus-error ME crashes at 640×360. YUV→RGBA: 47,000 µs → 31 µs (1500× faster).
 - **Resume/quit dialog** re-enabled (`prompt_existing_session_action()`, `/resume` endpoint).

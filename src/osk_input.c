@@ -23,6 +23,7 @@
 #include <stdio.h>
 
 #include "osk_input.h"
+#include "stream_resolution.h"
 #include "ui_manager.h"
 
 /* =========================================================================
@@ -280,10 +281,10 @@ int osk_get_ip_input(char *out_ip, int max_len)
  * Resolution keypad — "width x height" entry
  *
  * Identical 3x4 grid but bottom-left key is "x" instead of "." and the
- * max length is shorter (e.g. "1920x1088" = 9 chars).  A faint tooltip
+ * max length is shorter (e.g. "1024x512" = 8 chars).  A faint tooltip
  * "width x height" sits in the text bar and vanishes on first key press.
  * ========================================================================= */
-#define RES_MAX_LEN 9   /* "1920x1088" */
+#define RES_MAX_LEN 9   /* covers "1024x512" plus separators */
 #define KP_SEP  12      /* sentinel for the 'x' separator key */
 
 static const int s_res_keys[KP_ROWS][KP_COLS] = {
@@ -332,10 +333,17 @@ static void draw_res_key(int row, int col, int selected)
 static int validate_resolution(const char *buf, int *out_w, int *out_h)
 {
     int w = 0, h = 0;
+    int norm_w, norm_h;
     const char *sep = strchr(buf, 'x');
     if (!sep || sep == buf || *(sep + 1) == '\0') return 0;
     if (sscanf(buf, "%dx%d", &w, &h) != 2) return 0;
-    if (w < 16 || w > 1920 || h < 16 || h > 1088) return 0;
+    norm_w = w;
+    norm_h = h;
+    stream_resolution_normalize(&norm_w, &norm_h);
+
+    /* Reject values that would be silently altered at runtime. */
+    if (w != norm_w || h != norm_h) return 0;
+
     *out_w = w;
     *out_h = h;
     return 1;
@@ -452,10 +460,15 @@ int osk_get_resolution_input(int *out_width, int *out_height)
             }
 
             if (flash_timer > 0) {
+                char limit_text[64];
+                snprintf(limit_text, sizeof(limit_text),
+                         "Use mod-16. Min %dx%d, Max %dx%d",
+                         STREAM_MIN_WIDTH, STREAM_MIN_HEIGHT,
+                         STREAM_MAX_WIDTH, STREAM_MAX_HEIGHT);
                 ui_draw_text_centered((float)IP_BOX_X, (float)IP_BOX_W,
                                       (float)(IP_BOX_Y + IP_BOX_H + 4),
                                       0xFF4040FFu,
-                                      "Min 16x16, Max 1920x1088");
+                                      limit_text);
             }
         }
 

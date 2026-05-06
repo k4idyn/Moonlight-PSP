@@ -21,13 +21,16 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Smoke checks
+      run: make smoke
+
     - name: Build ME helper PRX
       run: |
         cd moonlight_me_helper
         make -j$(nproc)
 
-    - name: Build main application
-      run: make -j$(nproc)
+    - name: Build main application (retail)
+      run: make -j$(nproc) RETAIL_BUILD=1
 
     - name: Verify outputs
       run: |

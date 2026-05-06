@@ -1,6 +1,6 @@
 # Building PSP Moonlight
 
-_v0.2.3-beta_
+_v1.0.0_
 
 This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
 
@@ -96,7 +96,13 @@ Expected output:
 
 ```bash
 cd ..
-make
+make RETAIL_BUILD=1
+```
+
+For local diagnostics and verbose logging during development, use:
+
+```bash
+make RETAIL_BUILD=0
 ```
 
 Expected output (abbreviated):

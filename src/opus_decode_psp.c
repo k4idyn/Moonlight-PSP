@@ -24,6 +24,9 @@ static int s_decode_error_logs = 0;
  * Used by the audio thread to invoke PLC with the correct frame duration. */
 static int s_last_frame_size = 240; /* default: 5 ms @ 48 kHz */
 
+#define OPUS_STATIC_DECODER_BYTES  (32 * 1024)
+static unsigned char s_decoder_storage[OPUS_STATIC_DECODER_BYTES] __attribute__((aligned(16)));
+
 #define opus_log(fmt, ...) diag_log_write("OPUS", fmt, ##__VA_ARGS__)
 
 int opus_psp_init(int sample_rate, int channels, int streams, int coupled_streams)
@@ -39,9 +42,22 @@ int opus_psp_init(int sample_rate, int channels, int streams, int coupled_stream
     s_channels = channels;
     s_decode_error_logs = 0;
 
-    s_decoder = opus_multistream_decoder_create(
+    {
+        int need = opus_multistream_decoder_get_size(streams, coupled_streams);
+        if (need <= 0 || need > OPUS_STATIC_DECODER_BYTES) {
+            opus_log("[OPUS] static decoder buffer too small: need=%d have=%d\n",
+                     need, OPUS_STATIC_DECODER_BYTES);
+            s_decoder = NULL;
+            return -1;
+        }
+    }
+
+    s_decoder = (OpusMSDecoder *)s_decoder_storage;
+    memset(s_decoder_storage, 0, sizeof(s_decoder_storage));
+    err = opus_multistream_decoder_init(
+        s_decoder,
         sample_rate, channels, streams, coupled_streams,
-        mapping, &err);
+        mapping);
 
     if (s_decoder == NULL || err != 0) {
         opus_log("[OPUS] decoder create failed: err=%d\n", err);
@@ -128,7 +144,6 @@ int opus_psp_last_frame_size(void)
 void opus_psp_shutdown(void)
 {
     if (s_decoder != NULL) {
-        opus_multistream_decoder_destroy(s_decoder);
         s_decoder = NULL;
     }
     s_initialized = 0;

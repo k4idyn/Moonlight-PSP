@@ -44,6 +44,7 @@
 #define HOST_GAP             6
 #define HTTP_PORT            47989
 #define CONNECT_TIMEOUT_MS   3000
+#define SEND_TIMEOUT_MS      1000
 #define RECV_TIMEOUT_MS      2000
 #define HTTP_FALLBACK_TIMEOUT_US 1500000
 #define PROBE_MIN_DISPLAY_MS 350
@@ -249,6 +250,8 @@ static void loadManualHosts(void)
 static int httpProbeHost(HostPC *host)
 {
     int sock, ret, total, nb;
+    int req_len;
+    int sent;
     struct sockaddr_in addr;
     char request[256];
     static char response[MAX_RESPONSE_SIZE];
@@ -308,25 +311,51 @@ static int httpProbeHost(HostPC *host)
         }
     }
 
-    /* Switch to blocking for request/response */
-    nb = 0;
-    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
-
     /* Send the HTTP GET /serverinfo request */
     snprintf(request, sizeof(request),
              "GET /serverinfo?uniqueid=%s&uuid=%s HTTP/1.0\r\n"
              "Host: %s:%d\r\n\r\n",
              CLIENT_UNIQUE_ID, client_identity_get_uuid(), host->ip, HTTP_PORT);
 
-    ret = sceNetInetSend(sock, request, strlen(request), 0);
-    if (ret <= 0) {
+    /* Keep non-blocking mode through send/recv so discovery cannot hang
+     * the UI thread if the network stack stalls after connect. */
+    req_len = (int)strlen(request);
+    sent = 0;
+    start_ms = sceKernelGetSystemTimeLow() / 1000;
+    while (sent < req_len) {
+        ret = sceNetInetSend(sock, request + sent, req_len - sent, 0);
+        if (ret > 0) {
+            sent += ret;
+            continue;
+        }
+        if (ret == 0) {
+            break;
+        }
+
+        {
+            int err = sceNetInetGetErrno();
+            if (err != EAGAIN && err != EWOULDBLOCK) {
+                diag_log_write("DISC", "probe %s: send err=%d\n", host->ip, err);
+                sceNetInetClose(sock);
+                return -1;
+            }
+        }
+
+        if ((sceKernelGetSystemTimeLow() / 1000) - start_ms > SEND_TIMEOUT_MS) {
+            diag_log_write("DISC", "probe %s: send timeout\n", host->ip);
+            sceNetInetClose(sock);
+            return -1;
+        }
+        sceKernelDelayThread(10000);
+    }
+
+    if (sent < req_len) {
+        diag_log_write("DISC", "probe %s: short send (%d/%d)\n", host->ip, sent, req_len);
         sceNetInetClose(sock);
         return -1;
     }
 
     /* Read response (non-blocking + timeout) */
-    nb = 1;
-    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
 
     total    = 0;
     start_ms = sceKernelGetSystemTimeLow() / 1000;
@@ -500,8 +529,10 @@ static void mdnsDiscoverHosts(void)
 
         /* Re-send query at ~1s for reliability */
         if (!resent && (sceKernelGetSystemTimeLow() / 1000) - start_ms >= 1000) {
-            sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
-                             (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+            int retry_tx = sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
+                                            (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+            diag_log_write("DISC", "mdns: retry query sent (%d bytes, err=%d)\n",
+                           retry_tx, retry_tx < 0 ? sceNetInetGetErrno() : 0);
             resent = 1;
         }
 

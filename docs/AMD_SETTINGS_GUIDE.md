@@ -91,7 +91,7 @@ This only affects H.264 streams (not HEVC or AV1). It controls how the compresse
 | `cavlc` | Less efficient | Faster to decode | Better for weak decoders |
 | `cabac` | More efficient (~10-15% smaller) | Slower to decode | Better quality per bit |
 
-**PSP recommendation:** `cavlc`. The PSP's CPU is very slow — CAVLC is simpler to decode. Our app shows a warning dialog if CABAC is detected and offers to switch the server to CAVLC.
+**PSP recommendation:** `cavlc`. The PSP's CPU is very slow — CAVLC is simpler to decode. CABAC is treated as unsupported for normal PSP playback, and the client will return to the menu if the host still delivers CABAC.
 
 ---
 

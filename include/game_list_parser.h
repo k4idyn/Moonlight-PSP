@@ -21,7 +21,7 @@ extern "C" {
  * Constants
  *--------------------------------------------------------------------------*/
 
-#define MAX_GAMES               100     /* Maximum number of games in list */
+#define MAX_GAMES               64      /* PSP-1000 bounded library metadata */
 #define MAX_TITLE_LENGTH        128     /* Maximum game title length */
 #define MAX_URL_LENGTH          512     /* Maximum URL length */
 #define MAX_HOST_IP_LENGTH      64      /* Maximum host IP address length */
@@ -38,8 +38,9 @@ extern "C" {
 #define CACHE_DIR               "ms0:/PSP/GAME/Moonlight/cache/"
 #define CACHE_DIR_LENGTH        48
 
-/* HTTP buffer size for receiving data (512 KB) */
-#define HTTP_RECV_BUFFER_SIZE   524288
+/* HTTP buffer size for receiving app metadata. Box-art PNG downloads use a
+ * separate statically bounded buffer in game_list_parser.c. */
+#define HTTP_RECV_BUFFER_SIZE   (96 * 1024)
 
 /*--------------------------------------------------------------------------
  * Game Info Structure
@@ -177,11 +178,11 @@ int game_list_save_icon_to_cache(const GameInfo *game);
 void game_list_get_icon_path(const GameInfo *game, char *pathBuf);
 
 /**
- * game_list_cleanup - Free all allocated resources
+ * game_list_cleanup - Reset static game/icon state
  *
  * @gameList: Pointer to GameList to clean up
  *
- * Frees all allocated icon data and resets the game list.
+ * Releases static icon slots and resets the game list; no heap ownership.
  */
 void game_list_cleanup(GameList *gameList);
 

@@ -7,6 +7,7 @@
  */
 
 #include "icon_cache.h"
+#include "game_list_parser.h"
 
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
@@ -37,7 +38,7 @@ static unsigned int crc32_compute(const char *data, int len)
 /*--------------------------------------------------------------------------
  * Cache index entry (in-memory)
  *--------------------------------------------------------------------------*/
-#define MAX_CACHE_ENTRIES   100
+#define MAX_CACHE_ENTRIES   MAX_GAMES
 
 typedef struct {
     int          app_id;

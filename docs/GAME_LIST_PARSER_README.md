@@ -1,4 +1,4 @@
-# Game List Parser for PSP Moonlight
+﻿# Game List Parser for PSP Moonlight
 
 ## Overview
 
@@ -7,9 +7,10 @@ This module implements a game list parser and icon downloader for the PSP Moonli
 ## Features
 
 - **XML Parser**: Simple string-based XML parser to extract game information
-- **HTTP Client**: Uses PSP's built-in `psphttp.h` library for HTTP requests
-- **Icon Downloader**: Downloads 144x80 PNG icons to local cache
-- **Fallback Support**: Uses default "Internal Game" texture when icons are missing
+- **HTTP/HTTPS Client**: Uses the project TLS client for `/applist` and binary icon asset downloads
+- **Icon Downloader**: Downloads Sunshine PNG box art through the normal `BoxArtUrl` or `/appasset` path
+- **Static PNG Decode**: Decodes through fixed libpng buffers and a fixed arena; no first-party heap allocation
+- **Fallback Support**: Uses embedded fallback art first, then the generated default texture when icons are missing
 - **Cache System**: Stores downloaded icons in `ms0:/PSP/GAME/Moonlight/cache/`
 
 ## Files
@@ -79,27 +80,27 @@ The parser supports multiple XML formats from Sunshine/GameStream:
 
 ## Cache Structure
 
-Icons are decoded from PNG (via lodepng) and converted to RGB565 for display. Each file is stored as raw RGB565:
+Icons are decoded from PNG via libpng and converted directly to RGB565 for display. Runtime icons are stored in padded `128x256` RGB565 texture slots; the visible art area is `100x150`. Each file is stored as raw RGB565:
 
 ```
 ms0:/PSP/GAME/Moonlight/cache/
-├── 12345.raw    (Game ID 12345, 144×80×2 bytes = 23,040 bytes)
-├── 67890.raw
-└── ...
+|-- 12345.raw    (Game ID 12345, 128x256x2 bytes = 65,536 bytes)
+|-- 67890.raw
+`-- ...
 ```
 
-An index file (`cache/index.ini`) tracks each entry's source BoxArtURL, last fetch date, and a CRC32 of the URL. On each `/applist` fetch, URLs are compared against the index. If the URL changed or the cache entry is older than `max_cache_age_days` (default 7), the icon is re-downloaded. Icons are downloaded in a background thread and do not block the game grid UI.
+Current raw cache files are 65,536 bytes each (`128x256x2`). An index file (`cache/index.ini`) tracks each entry's source BoxArtURL, last fetch date, and a CRC32 of the URL. On each `/applist` fetch, URLs are compared against the index. If the URL changed or the cache entry is older than `max_cache_age_days` (default 7), the icon is re-downloaded. Cached icons are loaded first; stale or missing entries are downloaded synchronously while the game grid is being populated.
 
 ## Default Icon
 
-When an icon cannot be downloaded or is missing, the system uses a default "Internal Game" icon:
+When an icon cannot be downloaded or is missing, the system first tries embedded title-specific fallback art. If no fallback matches, it uses a generated default icon:
 - Gray gradient background
 - Simple border
-- 144×80 pixels RGBA8888 format
+- Current format: RGB565 texture in the same padded icon layout
 
 ## Integration with Game Grid UI
 
-The `game_grid_ui.cpp` fetches the game list via `game_list_parser.c` and renders a scrollable 3-column grid. Scroll offset is tracked in rows; D-pad navigates within and across rows. The grid supports any number of titles — see the UI Flow reference for scrolling behavior.
+The `game_grid_ui.cpp` fetches the game list via `game_list_parser.c` and renders a scrollable 3-column grid. Scroll offset is tracked in rows; D-pad navigates within and across rows. The grid supports any number of titles â€” see the UI Flow reference for scrolling behavior.
 
 ## Configuration
 
@@ -107,9 +108,11 @@ The host IP is resolved from the selected host in the Host Discovery screen and 
 
 ## Limitations
 
-- Maximum 100 game list entries tracked in the icon cache index.
-- Icon downloads use HTTP only. HTTPS is used for pairing and server info but not icon URLs (Sunshine serves box art over HTTP).
-- lodepng is used for PNG decoding and outputs RGBA8888 which is immediately converted to RGB565 and freed.
+- Maximum 64 game list entries are tracked in static metadata and the icon cache index.
+- Up to 16 icon texture slots are resident in RAM during the game grid.
+- PNG downloads are capped by a fixed 512 KB receive buffer.
+- PNG decode uses a fixed 192 KB arena and rejects rows wider than 4096 bytes.
+- Icon downloads use the binary-safe HTTPS path so embedded NUL bytes in PNG bodies are preserved.
 
 ## Build Integration
 

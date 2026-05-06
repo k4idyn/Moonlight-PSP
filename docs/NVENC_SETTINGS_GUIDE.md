@@ -109,7 +109,7 @@ Requests the NVIDIA driver to keep the GPU in a high-power state for faster enco
 
 Forces CAVLC entropy coding instead of CABAC. CAVLC is ~10% less efficient (bigger frames) but faster to decode.
 
-**PSP recommendation:** `enabled`. The PSP's CPU is very slow — CAVLC reduces decode load. The 10% efficiency loss is acceptable given PSP's tiny resolution. Our Moonlight app will show a warning if CABAC is detected.
+**PSP recommendation:** `enabled`. The PSP's CPU is very slow — CAVLC reduces decode load. The 10% efficiency loss is acceptable at PSP resolution. CABAC is treated as unsupported for normal PSP playback, and the client will return to the menu if the host still delivers CABAC.
 
 ---
 

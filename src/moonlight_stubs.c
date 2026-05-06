@@ -134,10 +134,7 @@ void pairing_cancel(PairingSession *session)
 void pairing_cleanup(PairingSession *session)
 {
     if (session) {
-        if (session->client_cert_hex) {
-            free(session->client_cert_hex);
-            session->client_cert_hex = NULL;
-        }
+        session->client_cert_hex = NULL;
     }
 }
 
@@ -165,4 +162,3 @@ int pairing_is_complete(const PairingSession *session)
  * Pairing PIN UI functions are implemented in pairing_pin_ui.cpp
  *============================================================================*/
 /* (stubs removed — real implementation linked from pairing_pin_ui.o) */
-

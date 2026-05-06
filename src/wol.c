@@ -18,6 +18,9 @@
 
 #include "wol.h"
 #include "ui_manager.h"
+#include "diag_log.h"
+
+#define wol_log(fmt, ...) diag_log_write("WOL", fmt, ##__VA_ARGS__)
 
 /* WOL magic packet: 6 FF bytes + 16 repetitions of 6-byte MAC = 102 bytes */
 #define WOL_PACKET_LEN  102
@@ -82,6 +85,11 @@ int wol_send_magic_packet(const char *mac_str)
     int ret = sceNetInetSendto(sock, packet, WOL_PACKET_LEN, 0,
                                (struct sockaddr *)&addr, sizeof(addr));
     sceNetInetClose(sock);
+
+    if (ret != WOL_PACKET_LEN) {
+        wol_log("send magic packet failed ret=%d errno=%d\n",
+                ret, sceNetInetGetErrno());
+    }
 
     return (ret == WOL_PACKET_LEN) ? 0 : -2;
 }

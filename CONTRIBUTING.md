@@ -2,7 +2,7 @@
 
 Contributions are welcome. This is a PSP homebrew project targeting real hardware, so there are some platform-specific constraints worth understanding before you start.
 
-This is **v0.2.0-beta** — the first public release of the working pipeline. The codebase is stable but there's plenty of room for improvement. Hardware testers are especially valuable at this stage.
+This is the **v1.0.0 public release** of the rewritten PSP-native Moonlight pipeline. Hardware testing is still highly valuable for ongoing maintenance and compatibility work.
 
 ---
 

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <mbedtls/memory_buffer_alloc.h>
 
 #include "shared.h"
 #include "sw_decode_pipeline.h"
@@ -122,6 +123,9 @@ extern volatile u32 g_last_frame_decode_us;
 #include "decode_flags.h"
 
 static int g_gu_active = 0;
+#define PSP_MBEDTLS_HEAP_BYTES (1024 * 1024)
+static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((aligned(16)));
+static int s_mbedtls_heap_ready = 0;
 
 static void LOG(const char *fmt, ...) {
     char buf[512]; va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
@@ -143,6 +147,10 @@ int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
     extern void diag_log_clear(void); diag_log_clear();
+    if (!s_mbedtls_heap_ready) {
+        mbedtls_memory_buffer_alloc_init(s_mbedtls_heap, sizeof(s_mbedtls_heap));
+        s_mbedtls_heap_ready = 1;
+    }
     pspDebugScreenInit();
     ret = scePowerSetClockFrequency(333, 333, 166);
     diag_log_write("MAIN", "[REMOTE] g_remote_buttons at 0x%08X\n", (unsigned int)&g_remote_buttons);
@@ -261,7 +269,8 @@ host_select_loop:
         diag_log_write("MAIN", "Skipping audio init (RTSP audio SETUP failed)\n");
     }
 
-    diag_log_write("MAIN", "Initializing shared memory (375KB)...\n");
+    diag_log_write("MAIN", "Initializing shared memory (~%uKB)...\n",
+                   (unsigned)((sizeof(g_shared) + 1023) / 1024));
     memset(&g_shared, 0, sizeof(g_shared));
     
     diag_log_write("MAIN", "Initializing network ME (D-UDP)...\n");
@@ -273,10 +282,6 @@ host_select_loop:
     diag_log_write("MAIN", "Initializing SW decoder (CAVLC+VFPU dual-core)...\n");
     { g_cabac_detected = 0;
       g_cabac_dialog_active = 0;
-      /* SDP-based early detection: if test mode requested CABAC from the server,
-       * pre-set the flag so the warning screen shows immediately rather than
-       * relying on PPS NAL parsing (which fails if the initial IDR is lost). */
-      if (g_psp_config.cabacTestMode) g_cabac_detected = 1;
     }
     ret = sw_decoder_thread_init(&g_shared.frame_ring);
     if (ret < 0) {
@@ -294,7 +299,10 @@ host_select_loop:
     diag_log_flush();  /* Flush all handshake/setup logs to disk */
     safety_buffer_init();
     hud_init();
-    signal_strength_init(g_psp_config.bitrate);
+    {
+        int signal_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(g_psp_config.bitrate);
+        signal_strength_init(signal_bitrate_kbps);
+    }
     power_handler_init();
 
     int input_socket = sceNetInetSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -383,75 +391,125 @@ host_select_loop:
          * or go back to the app list to switch encoder settings. */
         {
             static int s_cabac_choice = 0; /* 0=not shown, 1=continue, 2=back */
+            static int s_cabac_prompt_logged = 0;
+            static u32 s_cabac_notice_start_us = 0;
 
             /* Auto-reset when a new stream starts (g_cabac_detected resets to 0
              * in sw_decoder_thread_init, so the first frames have it == 0). */
-            if (!decoder_is_cabac_detected())
+            if (!decoder_is_cabac_detected()) {
                 s_cabac_choice = 0;
+                s_cabac_prompt_logged = 0;
+                s_cabac_notice_start_us = 0;
+            }
+
+            if (decoder_is_cabac_detected() && !s_cabac_prompt_logged) {
+                diag_log_write("CABAC", "CABAC detected while cabacTestMode=%d -- showing warning dialog\n",
+                               g_psp_config.cabacTestMode ? 1 : 0);
+                s_cabac_prompt_logged = 1;
+            }
 
             if (decoder_is_cabac_detected() && s_cabac_choice == 0) {
-                diag_log_write("CABAC", "CABAC detected — showing warning dialog\n");
-
                 /* Gate decoder + audio: stop processing until user confirms */
                 g_cabac_dialog_active = 1;
 
-                /* Drain any stale button presses before accepting input */
-                {
-                    SceCtrlData drain;
-                    do {
-                        sceCtrlPeekBufferPositive(&drain, 1);
-                        sceKernelDelayThread(16 * 1000);
-                    } while (drain.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE));
-                }
-
-                SceCtrlData cpd, cprev;
-                memset(&cprev, 0, sizeof(cprev));
-
-                while (1) {
-                    sceCtrlPeekBufferPositive(&cpd, 1);
-                    cpd.Buttons |= g_remote_buttons; g_remote_buttons = 0;
+                if (!g_psp_config.cabacTestMode) {
+                    u32 now_us = sceKernelGetSystemTimeLow();
+                    if (s_cabac_notice_start_us == 0) {
+                        s_cabac_notice_start_us = now_us;
+                    }
 
                     ui_begin_frame();
                     ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
                     ui_draw_header("PSP Moonlight");
 
-                    int pw = 360, ph = 120;
-                    int px = (UI_SCREEN_W - pw) / 2;
-                    int py = (UI_SCREEN_H - ph) / 2 - 10;
-                    int bd = 2;
-                    ui_set_blend(1);
-                    ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
-                    ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
-                    ui_set_blend(0);
+                    {
+                        int pw = 360, ph = 120;
+                        int px = (UI_SCREEN_W - pw) / 2;
+                        int py = (UI_SCREEN_H - ph) / 2 - 10;
+                        int bd = 2;
+                        ui_set_blend(1);
+                        ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
+                        ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
+                        ui_set_blend(0);
 
-                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
-                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using CABAC entropy coding.");
-                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "This causes choppy playback on PSP.");
-                    ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Switch encoder to CAVLC for best results.");
+                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
+                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using unsupported CABAC entropy coding.");
+                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "PSP v1.0 requires CAVLC for stable playback.");
+                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Returning to the host menu. Fix the host encoder and retry.");
+                    }
 
-                    ui_draw_footer_hint("{X}: Continue Anyway    {O}: Back");
+                    ui_draw_footer_hint("Normal mode rejects CABAC streams");
                     ui_end_frame();
 
-                    int cx = (cpd.Buttons & PSP_CTRL_CROSS) && !(cprev.Buttons & PSP_CTRL_CROSS);
-                    int co = (cpd.Buttons & PSP_CTRL_CIRCLE) && !(cprev.Buttons & PSP_CTRL_CIRCLE);
-
-                    if (cx) {
-                        diag_log_write("CABAC", "User chose CONTINUE with CABAC\n");
-                        s_cabac_choice = 1;
-                        break;
-                    }
-                    if (co) {
-                        diag_log_write("CABAC", "User chose BACK — aborting stream\n");
+                    if ((now_us - s_cabac_notice_start_us) < 1200000) {
+                        sceKernelDelayThread(50 * 1000);
+                    } else {
+                        diag_log_write("CABAC", "CABAC in normal mode -- auto-aborting stream\n");
                         s_cabac_choice = 2;
-                        break;
+                    }
+                } else {
+
+                    /* Drain any stale button presses before accepting input */
+                    {
+                        SceCtrlData drain;
+                        do {
+                            sceCtrlPeekBufferPositive(&drain, 1);
+                            sceKernelDelayThread(16 * 1000);
+                        } while (drain.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE));
                     }
 
-                    cprev = cpd;
-                    sceKernelDelayThread(50 * 1000);
+                    {
+                        SceCtrlData cpd, cprev;
+                        memset(&cprev, 0, sizeof(cprev));
+
+                        while (1) {
+                            sceCtrlPeekBufferPositive(&cpd, 1);
+                            cpd.Buttons |= g_remote_buttons; g_remote_buttons = 0;
+
+                            ui_begin_frame();
+                            ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+                            ui_draw_header("PSP Moonlight");
+
+                            int pw = 360, ph = 120;
+                            int px = (UI_SCREEN_W - pw) / 2;
+                            int py = (UI_SCREEN_H - ph) / 2 - 10;
+                            int bd = 2;
+                            ui_set_blend(1);
+                            ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
+                            ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
+                            ui_set_blend(0);
+
+                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
+                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using CABAC entropy coding.");
+                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "PSP v1.0 requires CAVLC for stable playback.");
+                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Continue only for testing, or go back and fix the host encoder.");
+
+                            ui_draw_footer_hint("{X}: Continue Anyway    {O}: Back");
+                            ui_end_frame();
+
+                            int cx = (cpd.Buttons & PSP_CTRL_CROSS) && !(cprev.Buttons & PSP_CTRL_CROSS);
+                            int co = (cpd.Buttons & PSP_CTRL_CIRCLE) && !(cprev.Buttons & PSP_CTRL_CIRCLE);
+
+                            if (cx) {
+                                diag_log_write("CABAC", "User chose CONTINUE with CABAC\n");
+                                s_cabac_choice = 1;
+                                break;
+                            }
+                            if (co) {
+                                diag_log_write("CABAC", "User chose BACK — aborting stream\n");
+                                s_cabac_choice = 2;
+                                break;
+                            }
+
+                            cprev = cpd;
+                            sceKernelDelayThread(50 * 1000);
+                        }
+                    }
                 }
 
                 /* Un-gate decoder + audio now that user has decided */
                 g_cabac_dialog_active = 0;
+                s_cabac_notice_start_us = 0;
 
                 if (s_cabac_choice == 2) {
                     abort_stream_to_menu();
@@ -659,16 +717,9 @@ host_select_loop:
                     }
                 }
 
-                /* Phase 5: Mode B intermediate flush at ~3s before IDR at 5s */
-                {
-                    static int s_phase5_flush_done = 0;
-                    if (s_idle_count >= 180 && s_idle_count < 182 && !s_phase5_flush_done) {
-                        diag_log_write("MAIN", "[PHASE5-WDG] Mode B intermediate flush at 3s");
-                        oh264_pipeline_flush_buffers();
-                        s_phase5_flush_done = 1;
-                    }
-                    if (s_idle_count < 10) s_phase5_flush_done = 0;
-                }
+                /* Removed intermediate decoder flush for v1.0 stability.
+                 * Mid-stall flushes can invalidate references prematurely and
+                 * amplify IDR churn on borderline links. */
 
                 /* Mode B: No frames for ~5s — soft recovery (IDR burst).
                  * Does NOT consume a restart slot.  Repeats every 5s. 
@@ -676,52 +727,81 @@ host_select_loop:
                  * to avoid flooding Sunshine when the problem is server-side. */
                 {
                     static int s_force_restart_no_progress = 0;
-                    int backoff_interval = (s_force_restart_no_progress > 0) ? 600 : 300;
+                    int backoff_interval = (s_force_restart_no_progress > 0) ? 900 : 600;
                     if (s_idle_count > (unsigned)backoff_interval && (s_idle_count % (unsigned)backoff_interval) < 2) {
                     extern volatile int g_decoder_alive_counter;
+                    extern volatile u32 g_last_frame_decode_us;
                     static int s_last_alive_count = 0;
                     int alive_now = g_decoder_alive_counter;
+                    u32 now_us = sceKernelGetSystemTimeLow();
+                    u32 since_decode_us = (g_last_frame_decode_us != 0)
+                        ? (now_us - g_last_frame_decode_us) : 0xFFFFFFFFu;
+                    int recent_decode = (since_decode_us < 4000000u); /* <4s */
 
-                    s_mode_b_soft_count++;
-                    diag_log_write("MAIN", "WATCHDOG-B: no frames for %u idles -- soft recovery #%d (IDR burst) alive=%d",
-                                   (unsigned)s_idle_count, s_mode_b_soft_count, alive_now);
-                    /* Reset g_idr_fully_decoded so (1) IDR requests are not
-                     * suppressed, and (2) rtp_reassembly dedup allows fresh
-                     * frames through even if frame_id wraps/jumps.
-                     * moonlight-common-c has no such flag on its IDR path. */
-                    {
-                        extern volatile int g_idr_fully_decoded;
-                        g_idr_fully_decoded = 0;
-                    }
-                    /* Single IDR request (rate limiter ensures delivery).
-                     * Reduced from 3-burst to 1 to prevent Sunshine from
-                     * being overwhelmed by rapid IDR requests on lossy WiFi. */
-                    control_stream_request_idr();
-
-                    /* After 3 soft recoveries with no progress, escalate to
-                     * full restart ONLY IF the decoder is truly stuck (alive
-                     * counter not advancing).  If the decoder IS processing
-                     * frames (REF-SKIP returning -4 or waiting for SPS
-                     * returning -5), it's alive — don't destroy the context
-                     * and lose SPS/PPS state.  Just keep requesting IDRs. */
-                    if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
-                        if (alive_now == s_last_alive_count) {
-                            /* Decoder truly stuck — alive counter not advancing */
+                    /* Treat only displayed/decode-output progress as healthy.
+                     * Callback progress with no new frame means OpenH264 is
+                     * rejecting inputs while the display is frozen. */
+                    if (recent_decode && alive_now > s_last_alive_count) {
+                        if ((alive_now - s_last_alive_count) >= 2 || (s_idle_count % 900) < 2) {
+                            diag_log_write("MAIN", "WATCHDOG-B: decoder progressing (counter %d->%d), deferring recovery",
+                                           s_last_alive_count, alive_now);
+                        }
+                        s_mode_b_soft_count = 0;
+                        s_force_restart_no_progress = 0;
+                    } else if (recent_decode) {
+                        diag_log_write("MAIN", "WATCHDOG-B: recent decode %u ms ago, deferring recovery",
+                                       (unsigned)(since_decode_us / 1000));
+                        s_mode_b_soft_count = 0;
+                        s_force_restart_no_progress = 0;
+                    } else if (alive_now > s_last_alive_count) {
+                        s_mode_b_soft_count++;
+                        diag_log_write("MAIN", "WATCHDOG-B: callbacks advanced %d->%d but no frame for %u ms -- soft recovery #%d",
+                                       s_last_alive_count, alive_now,
+                                       (unsigned)(since_decode_us / 1000),
+                                       s_mode_b_soft_count);
+                        {
+                            extern volatile int g_idr_fully_decoded;
+                            g_idr_fully_decoded = 0;
+                        }
+                        control_stream_request_idr();
+                        if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
                             s_watchdog_restarts++;
-                            diag_log_write("MAIN", "WATCHDOG-B: escalating to full restart #%d after %d soft failures (decoder stuck, alive=%d)",
+                            diag_log_write("MAIN", "WATCHDOG-B: escalating to full restart #%d after no-output callback progress",
+                                           s_watchdog_restarts);
+                            sw_decoder_thread_force_restart();
+                            control_stream_request_idr();
+                            s_idle_count = 0;
+                            s_mode_b_soft_count = 0;
+                            s_force_restart_no_progress++;
+                        }
+                    } else {
+                        s_mode_b_soft_count++;
+                        diag_log_write("MAIN", "WATCHDOG-B: no frames for %u idles -- soft recovery #%d (IDR burst) alive=%d",
+                                       (unsigned)s_idle_count, s_mode_b_soft_count, alive_now);
+                        /* Reset g_idr_fully_decoded so (1) IDR requests are not
+                         * suppressed, and (2) rtp_reassembly dedup allows fresh
+                         * frames through even if frame_id wraps/jumps.
+                         * moonlight-common-c has no such flag on its IDR path. */
+                        {
+                            extern volatile int g_idr_fully_decoded;
+                            g_idr_fully_decoded = 0;
+                        }
+                        /* Single IDR request (rate limiter ensures delivery).
+                         * Reduced from 3-burst to 1 to prevent Sunshine from
+                         * being overwhelmed by rapid IDR requests on lossy WiFi. */
+                        control_stream_request_idr();
+
+                        /* After repeated soft recoveries with no alive progress,
+                         * escalate to full restart. */
+                        if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
+                            s_watchdog_restarts++;
+                            diag_log_write("MAIN", "WATCHDOG-B: escalating to full restart #%d after %d soft failures (decoder stalled, alive=%d)",
                                            s_watchdog_restarts, s_mode_b_soft_count, alive_now);
                             sw_decoder_thread_force_restart();
                             control_stream_request_idr();
                             s_idle_count = 0;
                             s_mode_b_soft_count = 0;
                             s_force_restart_no_progress++;
-                        } else {
-                            /* Decoder alive (processing frames, just no display output).
-                             * Reset soft count so we don't immediately re-escalate. */
-                            diag_log_write("MAIN", "WATCHDOG-B: decoder alive (counter %d->%d), skipping restart",
-                                           s_last_alive_count, alive_now);
-                            s_mode_b_soft_count = 0;
-                            s_force_restart_no_progress = 0;
                         }
                     }
                     s_last_alive_count = alive_now;

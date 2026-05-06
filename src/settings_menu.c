@@ -24,6 +24,7 @@
 #include "config.h"
 #include "ui_manager.h"
 #include "osk_input.h"
+#include "stream_resolution.h"
 
 extern volatile unsigned int g_remote_buttons;
 
@@ -75,6 +76,7 @@ static MenuState g_menu_state;
 
 void resolution_update_custom(int width, int height)
 {
+    stream_resolution_normalize(&width, &height);
     RESOLUTION_WIDTHS[RESOLUTION_CUSTOM_INDEX]  = width;
     RESOLUTION_HEIGHTS[RESOLUTION_CUSTOM_INDEX] = height;
     snprintf(s_custom_label, sizeof(s_custom_label), "%dx%d", width, height);
@@ -358,8 +360,13 @@ void settings_menu_init(PspConfig *config)
     /* If saved resolutionIndex is Custom, repopulate the custom slot
      * from the saved width/height so the label shows the right value. */
     if (config->resolutionIndex == RESOLUTION_CUSTOM_INDEX &&
-        config->width >= 16 && config->height >= 16) {
-        resolution_update_custom(config->width, config->height);
+        config->width > 0 && config->height > 0) {
+        int custom_w = config->width;
+        int custom_h = config->height;
+        stream_resolution_normalize(&custom_w, &custom_h);
+        resolution_update_custom(custom_w, custom_h);
+        config->width = custom_w;
+        config->height = custom_h;
         g_menu_state.resolutionIndex = RESOLUTION_CUSTOM_INDEX;
     } else {
         /* Find closest matching preset (presets only, not custom) */

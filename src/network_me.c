@@ -41,6 +41,28 @@
 #define NET_RTP_FLAG_EXTENSION    0x10
 #define NET_NV_VIDEO_PKT_SIZE     16
 
+static u16 net_read_be16(const u8 *p)
+{
+    return (u16)(((u16)p[0] << 8) | p[1]);
+}
+
+static int net_rtp_nv_offset(const u8 *packet, int packet_len)
+{
+    int off = NET_RTP_FIXED_HEADER_SIZE;
+    if (!packet || packet_len < off)
+        return -1;
+    if (packet[0] & NET_RTP_FLAG_EXTENSION) {
+        u16 ext_words;
+        if (packet_len < off + 4)
+            return -1;
+        ext_words = net_read_be16(packet + off + 2);
+        off += 4 + (int)ext_words * 4;
+    }
+    if (packet_len < off + NET_NV_VIDEO_PKT_SIZE)
+        return -1;
+    return off;
+}
+
 /* Frame counter for loss stats reporting (control_stream.c) */
 extern volatile unsigned int g_last_good_frame;
 
@@ -78,6 +100,11 @@ static SceUID ping_thread_id = -1;
  * -1 = not yet read (don't restore). */
 static int g_orig_wlan_powersave = -1;
 
+/* Effective SO_RCVBUF cap observed at init. Dynamic tuning never targets
+ * above this, which avoids repeated no-op/failed growth attempts on
+ * low-memory PSP-1000 sessions. */
+static int g_rcvbuf_cap = 128 * 1024;
+
 /* Guard net.log writes across threads so logging can never stall startup. */
 static volatile int net_log_lock = 0;
 
@@ -94,7 +121,7 @@ volatile int g_wifi_reconnecting = 0;              /* Other threads check this *
 static u32   g_last_reconnect_time = 0;            /* Throttle reconnect attempts */
 static int   g_reconnect_count = 0;                /* Total reconnect attempts */
 static int   g_reconnect_success = 0;              /* Successful reconnects */
-#define WIFI_RECONNECT_COOLDOWN_US  (3 * 1000 * 1000)  /* 3s min between attempts */
+#define WIFI_RECONNECT_COOLDOWN_US  (500 * 1000)       /* 500ms min between attempts for instantaneous retry */
 #define WIFI_RECONNECT_MAX_POLL     150                 /* 150 * 100ms = 15s timeout */
 
 /* Phase 5.2: RTCP Receiver Report state */
@@ -154,18 +181,18 @@ static int wifi_try_reconnect(void)
             /* AP driver reports no connection — skip disconnect polling */
             net_log("[WIFI] ap_state=%d (no session), skipping disconnect wait\n", disc_state);
         } else {
-            while (disc_polls < 50 && (me_running || g_keepalive_running)) { /* 50 * 100ms = 5s max */
+            while (disc_polls < 500 && (me_running || g_keepalive_running)) { /* 500 * 10ms = 5s max */
                 sceNetApctlGetState(&disc_state);
                 if (disc_state <= 0)
                     break;
-                if (disc_polls == 0 || (disc_polls % 10) == 0)
+                if (disc_polls == 0 || (disc_polls % 50) == 0)
                     net_log("[WIFI] waiting for disconnect: state=%d poll=%dms\n",
-                            disc_state, disc_polls * 100);
-                sceKernelDelayThread(100 * 1000); /* 100ms */
+                            disc_state, disc_polls * 10);
+                sceKernelDelayThread(10 * 1000); /* 10ms */
                 disc_polls++;
             }
             net_log("[WIFI] disconnected in %dms (state=%d)\n",
-                    disc_polls * 100, disc_state);
+                    disc_polls * 10, disc_state);
             if (disc_state > 0) {
                 net_log("[WIFI] disconnect stuck at state=%d, aborting\n", disc_state);
                 g_wifi_reconnecting = 0;
@@ -188,7 +215,7 @@ static int wifi_try_reconnect(void)
     }
 
     /* Step 3: Poll for connected state (state == 4 = GOT_IP) */
-    while (attempts < WIFI_RECONNECT_MAX_POLL && (me_running || g_keepalive_running)) {
+    while (attempts < (WIFI_RECONNECT_MAX_POLL * 10) && (me_running || g_keepalive_running)) {
         ret = sceNetApctlGetState(&state);
         if (ret < 0) {
             net_log("[WIFI] GetState failed 0x%08X at poll #%d\n",
@@ -204,22 +231,22 @@ static int wifi_try_reconnect(void)
             sceNetApctlGetInfo(8, &info); /* 8 = IP address */
             g_reconnect_success++;
             net_log("[WIFI] reconnected OK! IP=%s attempt=#%d poll=%dms successes=%d\n",
-                    info.ip, g_reconnect_count, attempts * 100, g_reconnect_success);
+                    info.ip, g_reconnect_count, attempts * 10, g_reconnect_success);
             g_wifi_reconnecting = 0;
             return 0;
         }
 
         /* Log state transitions (silenced otherwise) */
         if (attempts == 0 || (attempts % 50) == 0) {
-            net_log("[WIFI] polling state=%d at %dms\n", state, attempts * 100);
+            net_log("[WIFI] polling state=%d at %dms\n", state, attempts * 10);
         }
 
-        sceKernelDelayThread(100 * 1000); /* 100ms */
+        sceKernelDelayThread(10 * 1000); /* 10ms */
         attempts++;
     }
 
     net_log("[WIFI] reconnect timeout after %dms (state=%d)\n",
-            attempts * 100, state);
+            attempts * 10, state);
     g_wifi_reconnecting = 0;
     return -1;
 }
@@ -508,6 +535,8 @@ static void send_ping_burst_internal(int count, const char *reason)
     SsPingPkt ss_pkt;
     char legacy_ping[] = { 0x50, 0x49, 0x4E, 0x47 };
     int i;
+    int sent_ok = 0;
+    int sent_fail = 0;
 
     if (udp_socket < 0) return;
 
@@ -518,18 +547,31 @@ static void send_ping_burst_internal(int count, const char *reason)
     dst.sin_addr.s_addr = inet_addr(g_video_server_ip);
 
     for (i = 0; i < count; i++) {
+        int tx;
         if (g_video_ping_payload[0] != '\0') {
             memcpy(ss_pkt.payload, g_video_ping_payload, 16);
             ss_pkt.seq_be = htonl((u32)(i + 1));
-            sceNetInetSendto(udp_socket, &ss_pkt, sizeof(ss_pkt),
-                             0, (struct sockaddr *)&dst, sizeof(dst));
+            tx = (int)sceNetInetSendto(udp_socket, &ss_pkt, sizeof(ss_pkt),
+                                       0, (struct sockaddr *)&dst, sizeof(dst));
         } else {
-            sceNetInetSendto(udp_socket, legacy_ping, 4,
-                             0, (struct sockaddr *)&dst, sizeof(dst));
+            tx = (int)sceNetInetSendto(udp_socket, legacy_ping, 4,
+                                       0, (struct sockaddr *)&dst, sizeof(dst));
+        }
+
+        if (tx > 0) {
+            sent_ok++;
+        } else {
+            int err = sceNetInetGetErrno();
+            sent_fail++;
+            if (sent_fail <= 3 || (sent_fail % 10) == 0) {
+                net_log("[PHASE5-PING] burst send failed #%d errno=%d (reason=%s)\n",
+                        sent_fail, err, reason ? reason : "n/a");
+            }
         }
         sceKernelDelayThread(30 * 1000); /* 30ms between pings */
     }
-    net_log("[PHASE5-PING] burst of %d pings sent (reason: %s)\n", count, reason);
+    net_log("[PHASE5-PING] burst complete total=%d ok=%d fail=%d (reason: %s)\n",
+            count, sent_ok, sent_fail, reason ? reason : "n/a");
 }
 
 /* net_log already defined at top of file via diag_log.h */
@@ -581,11 +623,16 @@ static void send_rtcp_rr(void)
     rtcp_dst.sin_port   = htons((unsigned short)(g_video_server_port + 1));
     rtcp_dst.sin_addr.s_addr = inet_addr(g_video_server_ip);
 
-    sceNetInetSendto(udp_socket_rtcp, buf, 32, 0,
-                     (struct sockaddr *)&rtcp_dst, sizeof(rtcp_dst));
-
-    net_log("[PHASE5-RTCP] sent RR: frac_lost=%u cum_lost=%u jitter=%u\n",
-            (unsigned)frac_lost, (unsigned)cum_lost, (unsigned)s_rtcp_jitter_us);
+    {
+        int tx = (int)sceNetInetSendto(udp_socket_rtcp, buf, 32, 0,
+                                       (struct sockaddr *)&rtcp_dst, sizeof(rtcp_dst));
+        if (tx < 0) {
+            net_log("[PHASE5-RTCP] RR send failed errno=%d\n", sceNetInetGetErrno());
+        } else {
+            net_log("[PHASE5-RTCP] sent RR: frac_lost=%u cum_lost=%u jitter=%u\n",
+                    (unsigned)frac_lost, (unsigned)cum_lost, (unsigned)s_rtcp_jitter_us);
+        }
+    }
 }
 
 /*--------------------------------------------------------------------------
@@ -659,17 +706,31 @@ void network_me_init(PacketRingBuffer *rb)
 
     /* Enlarge receive buffer so video packets that arrive before the recv
      * thread starts reading are not silently dropped by the kernel.
-     * The IDR frame (Frame 0) typically spikes above 80 KB which completely
-     * overflows a 64 KB buffer! Set to 256 KB to catch the initial HD burst. */
+     * PSP firmware caps this in practice, so set the known-good target
+     * directly to avoid deterministic fallback fault churn. */
     {
-        int rcvbuf = 256 * 1024;
+        int rcvbuf = 128 * 1024;
+
         int opt_ret = sceNetInetSetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
                                            &rcvbuf, sizeof(rcvbuf));
         if (opt_ret < 0) {
-            net_log("[NET INIT] 256KB rcvbuf failed (%d), falling back to 128KB\n", opt_ret);
-            rcvbuf = 128 * 1024;
-            sceNetInetSetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
-                                 &rcvbuf, sizeof(rcvbuf));
+            net_log("[NET INIT] 128KB rcvbuf set failed (%d)\n", opt_ret);
+        }
+
+        {
+            int actual_rcvbuf = 0;
+            socklen_t actual_len = sizeof(actual_rcvbuf);
+            if (sceNetInetGetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
+                                     &actual_rcvbuf, &actual_len) == 0) {
+                g_rcvbuf_cap = (actual_rcvbuf > 0) ? actual_rcvbuf : rcvbuf;
+                net_log("[NET INIT] SO_RCVBUF target=%dKB actual=%dKB\n",
+                        rcvbuf / 1024, actual_rcvbuf / 1024);
+            } else {
+                g_rcvbuf_cap = rcvbuf;
+            }
+
+            if (g_rcvbuf_cap < (128 * 1024))
+                g_rcvbuf_cap = 128 * 1024;
         }
     }
 
@@ -873,19 +934,24 @@ static int network_ping_thread(SceSize args, void *argp)
 
         /* Dynamic SO_RCVBUF: every 50 pings (5s at 100ms), check connection
          * quality and enlarge the socket receive buffer when quality degrades.
-         * POOR/CRITICAL → 384KB (absorb larger IDR bursts during recovery).
-         * EXCELLENT/GOOD → scale back to 256KB to save kernel memory.
-         * Default 256KB set at init time in network_me_init(). */
+         * CRITICAL/POOR → 512KB, FAIR → 384KB, GOOD/EXCELLENT → 256KB. */
         if ((seq % 50) == 0 && udp_socket >= 0) {
             ConnQualityState cq = control_stream_get_quality();
             int target_rcvbuf;
             if (cq.quality >= CONN_QUALITY_POOR) {
-                target_rcvbuf = 384 * 1024;  /* degraded: larger buffer */
+                target_rcvbuf = 512 * 1024;
+            } else if (cq.quality >= CONN_QUALITY_FAIR) {
+                target_rcvbuf = 384 * 1024;
             } else {
-                target_rcvbuf = 256 * 1024;  /* good: standard buffer */
+                target_rcvbuf = 256 * 1024;
             }
+            if (target_rcvbuf > g_rcvbuf_cap)
+                target_rcvbuf = g_rcvbuf_cap;
+
             {
-                static int s_prev_rcvbuf = 256 * 1024;
+                static int s_prev_rcvbuf = 0;
+                if (s_prev_rcvbuf <= 0)
+                    s_prev_rcvbuf = g_rcvbuf_cap;
                 if (target_rcvbuf != s_prev_rcvbuf) {
                     net_log("[RCVBUF] %dKB -> %dKB (quality=%d)\n",
                             s_prev_rcvbuf / 1024, target_rcvbuf / 1024,
@@ -895,6 +961,18 @@ static int network_ping_thread(SceSize args, void *argp)
             }
             sceNetInetSetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
                                  &target_rcvbuf, sizeof(target_rcvbuf));
+
+            {
+                int actual_rcvbuf = 0;
+                socklen_t actual_len = sizeof(actual_rcvbuf);
+                if (sceNetInetGetsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF,
+                                         &actual_rcvbuf, &actual_len) == 0) {
+                    net_log("[RCVBUF] applied=%dKB (target=%dKB q=%d)\n",
+                            actual_rcvbuf / 1024,
+                            target_rcvbuf / 1024,
+                            (int)cq.quality);
+                }
+            }
         }
 
         /* Phase 4: WiFi stutter compensation — proactive IDR on degrading signal */
@@ -1142,15 +1220,13 @@ static int network_recv_thread(SceSize args, void *argp)
         {
             int pkt_priority = 1; /* default: medium */
             if ((u32)n >= NET_RTP_FIXED_HEADER_SIZE + NET_NV_VIDEO_PKT_SIZE) {
-                int nv_off = NET_RTP_FIXED_HEADER_SIZE;
+                int nv_off = net_rtp_nv_offset(recv_buf, (int)n);
                 u8 nv_flags;
                 u32 nv_fec_info;
                 u32 nv_data_pkts;
                 u32 nv_fec_idx;
 
-                if (recv_buf[0] & NET_RTP_FLAG_EXTENSION)
-                    nv_off += 4;
-                if ((u32)n >= (u32)(nv_off + NET_NV_VIDEO_PKT_SIZE)) {
+                if (nv_off >= 0 && (u32)n >= (u32)(nv_off + NET_NV_VIDEO_PKT_SIZE)) {
                     nv_flags = recv_buf[nv_off + 8];
                     nv_fec_info = (u32)recv_buf[nv_off + 12] |
                                   ((u32)recv_buf[nv_off + 13] << 8) |

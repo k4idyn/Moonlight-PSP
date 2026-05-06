@@ -14,6 +14,7 @@
  * ========================================================================= */
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_PLATFORM_MEMORY         /* allow custom malloc/free */
+#define MBEDTLS_MEMORY_BUFFER_ALLOC_C   /* fixed PSP TLS/keygen heap */
 
 /* PSP has no /dev/urandom or CryptGenRandom */
 #define MBEDTLS_NO_PLATFORM_ENTROPY

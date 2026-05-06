@@ -82,6 +82,7 @@ typedef struct {
     u32  total_bytes_buffered;
     u32  rewind_count;
     u32  fallback_writes;
+    u32  fallback_drops;
     
     /* Timestamp tracking for 2-second window */
     u64  oldest_timestamp;

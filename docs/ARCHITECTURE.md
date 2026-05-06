@@ -1,6 +1,6 @@
 # Architecture
 
-_PSP Moonlight v0.2.3-beta_
+_PSP Moonlight v1.0.0_
 
 ## Overview
 
@@ -14,10 +14,10 @@ This is a fully custom implementation — no `moonlight-common-c`, no sceMpeg, n
 
 ```
 Main CPU (Allegrex MIPS32R2 @ 333 MHz)
-  Network receive (UDP socket, 1024-slot ring)
+  Network receive (UDP socket, 512-slot ring)
   RTP reassembly + frame boundary detection
   Reed-Solomon FEC repair (up to 66% parity) + predictive loss detection
-  OpenH264 H.264 decode (Baseline, CAVLC recommended — CABAC supported but unstable)
+  OpenH264 H.264 decode (Baseline, CAVLC required for normal PSP v1.0 playback)
   Control stream (Moonlight protocol, input forward)
   Opus stereo audio decode (48 kHz, fixed-point) + adaptive PLC
   PID-based adaptive bitrate controller
@@ -84,7 +84,7 @@ src/
 │     Composite quality: 40% RSSI + 30% CQ + 30% FEC
 │     Anti-windup integral clamping, dead-zone prevention
 ├── network_me.c             ← Network ME ping thread + ME watchdog
-│     Dynamic SO_RCVBUF (128KB–384KB)
+│     Dynamic SO_RCVBUF (128KB–512KB, capped by runtime-applied socket limit)
 │     Packet prioritization (IDR/SOF preferred)
 │     RTCP receiver reports
 │     WiFi power save disable during streaming
@@ -112,12 +112,42 @@ The main application imports these via `MediaEngine.S` stub. The ME runs `me_yuv
 
 ## Memory Layout (approximate, PSP-1000, 32 MB user RAM)
 
+Current release build accounting from `psp-size moonlight.elf`:
+
+| Segment | Bytes | Notes |
+|---|---:|---|
+| `.text` | 1,886,224 | Code, OpenH264/Opus/mbedTLS/libpng-linked text |
+| `.data` | 16,788 | Initialized globals |
+| `.bss` | 9,379,792 | Static runtime pools and fixed buffers |
+| Total ELF RAM image | 11,282,804 | About 10.76 MiB before PSP kernel/module overhead |
+
+Largest statically accounted runtime pools:
+
+| Symbol | Bytes | Purpose |
+|---|---:|---|
+| `s_wq_slots` | 786,480 | Network/decode work queue slots |
+| `g_shared` | 769,076 | Shared network/ME packet state (512-slot packet ring + frame handoff ring) |
+| `g_rgba_static` | 1,114,112 | Double RGBA frame buffers |
+| `s_mbedtls_heap` | 1,048,576 | Fixed mbedTLS allocator heap |
+| `s_icon_pool` | 1,048,576 | 16 resident padded RGB565 icon slots |
+| `s_png_download_buf` | 524,288 | Fixed PNG download buffer |
+| `s_ram_pool` | 512,000 | Safety buffer static RAM pool |
+| `display_list` / `s_gu_list` / `assembly_buffer` | 786,432 | GU display and packet assembly buffers |
+| `s_png_arena` | 196,608 | Fixed libpng allocation arena |
+| `g_pkt_storage` / `g_rec_storage` | 384,000 | RTP/FEC packet reconstruction storage |
+| `s_ring` | 131,080 | UDP receive ring |
+| `s_http_recv_buf` | 98,304 | App metadata receive buffer |
+| `g_default_icon` | 65,536 | Generated default icon |
+| `s_decoder_storage` | 32,768 | Fixed Opus decoder storage |
+
+The older approximate table below is kept as subsystem orientation only; the measured segment/symbol accounting above is the release gate source of truth.
+
 | Region | Size | Contents |
 |---|---|---|
 | Application code | ~2.5 MB | PRX text/data/BSS |
 | RGBA display buffers (×2) | 480×272×4 × 2 = ~1 MB | Double-buffered RGBA output |
 | YUV buffers (×2) | 480×272×1.5 × 2 = ~600 KB | Double-buffered YUV from OpenH264 |
-| UDP ring buffer | 1024 × 1500 B = ~1.5 MB | RTP packet ring |
+| UDP ring buffer | 512 × 1500 B = ~750 KB | RTP packet ring |
 | mbedTLS context | ~128 KB | TLS session state |
 | OpenH264 decoder ctx | ~256 KB | WelsDecoder state |
 | ME stack | 64 KB | ME thread stack |
@@ -137,7 +167,7 @@ The main application imports these via `MediaEngine.S` stub. The ME runs `me_yuv
 
 **Force-restart sequence:**
 1. `sceKernelTerminateThread` + `sceKernelDeleteThread`
-2. `openh264_pipeline_abandon()` — nulls globals (leaks ~2 MB per restart, capped at 3 restarts)
+2. `openh264_pipeline_abandon()` — tears down the old decoder/ME state and retains only the static RGBA storage
 3. `openh264_pipeline_init()` — fresh WelsDecoder
 4. `rtp_reassembly_reset()` + `rtp_fec_reset()`
 5. Ring flush (tail = head)

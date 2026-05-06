@@ -44,7 +44,7 @@ QSV is available on:
 | `cabac` | Better (~10-15% smaller) | Slower to decode |
 | `cavlc` | Less efficient | Faster to decode |
 
-**PSP recommendation:** `cavlc`. Same reasoning as AMD and NVIDIA — the PSP's CPU is slow, so CAVLC's simpler decoding is beneficial. Our Moonlight app warns if CABAC is detected.
+**PSP recommendation:** `cavlc`. Same reasoning as AMD and NVIDIA — the PSP's CPU is slow, so CAVLC's simpler decoding is beneficial. CABAC is treated as unsupported for normal PSP playback, and the client will return to the menu if a host still delivers CABAC.
 
 ---
 

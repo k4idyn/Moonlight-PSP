@@ -244,7 +244,7 @@ static void render_grid(void)
 }
 
 /* =========================================================================
- * Load game list (skip icon download — PNG decoder not available on PSP)
+ * Load game list and statically download/cache icons
  * ========================================================================= */
 static void load_games_from_server(const char *host_ip)
 {

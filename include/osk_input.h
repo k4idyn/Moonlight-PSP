@@ -33,8 +33,8 @@ int osk_get_ip_input(char *out_ip, int max_len);
  * Keypad replaces '.' with 'x' separator.  A "width x height" tooltip
  * is shown in the text bar and disappears once the user starts typing.
  *
- * @out_width   Receives parsed width  (>0, <=1920).
- * @out_height  Receives parsed height (>0, <=1088).
+ * @out_width   Receives parsed width (renderer-safe, mod-16 aligned).
+ * @out_height  Receives parsed height (renderer-safe, mod-16 aligned).
  *
  * Returns:
  *   0   on success

@@ -29,7 +29,7 @@
  * - 'volatile' forces re-read from memory on every access.
  *============================================================================*/
 
-#define RING_BUFFER_SLOTS       1024    /* Increased to prevent packet dropping during heavy I-frames / decoding lag */
+#define RING_BUFFER_SLOTS       512     /* Reduced to reclaim 750KB RAM for network socket buffer */
 #define MAX_PACKET_SIZE         1500    /* Max UDP payload (MTU safe) */
 
 /* PSP Bitstream queue limits */

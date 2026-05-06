@@ -10,7 +10,6 @@
 #include <pspiofilemgr.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -18,8 +17,8 @@
 
 #include "game_list_parser.h"
 #include "client_identity.h"
-#include "fallback_icons.h"
 #include "icon_cache.h"
+#include "fallback_icons.h"
 
 /* GU owns VRAM during game grid; pspDebugScreenPrintf causes visible
  * corruption (debug overlay draws into GU framebuffer region).
@@ -39,8 +38,22 @@ extern int https_launch_get(const char *host, int port, const char *path,
 extern int https_launch_get_binary(const char *host, int port, const char *path,
                                     char *resp, int resp_size);
 
-/* PNG download buffer — reused across calls to reduce heap fragmentation */
-#define PNG_DOWNLOAD_BUF_SIZE  (512 * 1024)   /* 512 KB max box art */
+/* Statically bounded parser scratch. The PSP-1000 release profile forbids
+ * first-party heap use before streaming, so app metadata parsing uses one
+ * fixed receive buffer and one fixed per-entry scratch buffer. */
+#define MAX_GAME_ENTRY_XML     4096
+#define STATIC_ICON_SLOTS      16
+#define PNG_DOWNLOAD_BUF_SIZE  (512 * 1024)
+#define PNG_ARENA_SIZE         (192 * 1024)
+#define PNG_MAX_ROW_BYTES      (4096)
+static char s_http_recv_buf[HTTP_RECV_BUFFER_SIZE] __attribute__((aligned(64)));
+static char s_entry_buf[MAX_GAME_ENTRY_XML];
+static unsigned short s_icon_pool[STATIC_ICON_SLOTS][ICON_PIXEL_COUNT] __attribute__((aligned(64)));
+static int s_icon_pool_used = 0;
+static unsigned char s_png_download_buf[PNG_DOWNLOAD_BUF_SIZE] __attribute__((aligned(64)));
+static unsigned char s_png_arena[PNG_ARENA_SIZE] __attribute__((aligned(64)));
+static unsigned char s_png_row_buf[PNG_MAX_ROW_BYTES] __attribute__((aligned(64)));
+static unsigned int s_png_arena_pos = 0;
 
 /*--------------------------------------------------------------------------
  * Default "Internal Game" Icon Data (RGB565, 100x150)
@@ -51,6 +64,195 @@ static unsigned short g_default_icon[ICON_PIXEL_COUNT];
 
 /* Flag to track if default icon has been initialized */
 static int g_default_icon_initialized = 0;
+
+static void reset_icon_pool(void)
+{
+    s_icon_pool_used = 0;
+}
+
+static unsigned short *alloc_icon_slot(void)
+{
+    unsigned short *slot;
+    if (s_icon_pool_used >= STATIC_ICON_SLOTS)
+        return NULL;
+    slot = s_icon_pool[s_icon_pool_used++];
+    memset(slot, 0, ICON_DATA_SIZE);
+    return slot;
+}
+
+static void release_last_icon_slot(unsigned short *slot)
+{
+    if (s_icon_pool_used > 0 && slot == s_icon_pool[s_icon_pool_used - 1])
+        s_icon_pool_used--;
+}
+
+static void copy_compact_icon_to_padded(const unsigned short *src, unsigned short *dst)
+{
+    int y;
+    memset(dst, 0, ICON_DATA_SIZE);
+    for (y = 0; y < ICON_HEIGHT; y++) {
+        memcpy(dst + y * ICON_BUFFER_WIDTH,
+               src + y * ICON_WIDTH,
+               ICON_WIDTH * sizeof(unsigned short));
+    }
+}
+
+static int assign_fallback_icon(GameInfo *game)
+{
+    const unsigned short *compact;
+    unsigned short *slot;
+
+    if (!game)
+        return 0;
+
+    compact = fallback_icon_for_title(game->title);
+    if (!compact)
+        return 0;
+
+    slot = alloc_icon_slot();
+    if (!slot)
+        return 0;
+
+    copy_compact_icon_to_padded(compact, slot);
+    game->iconData = slot;
+    game->iconLoaded = 1;
+    return 1;
+}
+
+static void ensure_cache_dir(void)
+{
+    sceIoMkdir("ms0:/PSP", 0777);
+    sceIoMkdir("ms0:/PSP/GAME", 0777);
+    sceIoMkdir("ms0:/PSP/GAME/Moonlight", 0777);
+    sceIoMkdir("ms0:/PSP/GAME/Moonlight/cache", 0777);
+}
+
+typedef struct {
+    const unsigned char *data;
+    png_size_t pos;
+    png_size_t size;
+} PNGReadState;
+
+static png_voidp PNGAPI png_static_alloc(png_structp png_ptr, png_alloc_size_t size)
+{
+    unsigned int aligned;
+    (void)png_ptr;
+
+    if (size == 0 || size > PNG_ARENA_SIZE)
+        return NULL;
+
+    aligned = (s_png_arena_pos + 15u) & ~15u;
+    if (aligned + (unsigned int)size > PNG_ARENA_SIZE)
+        return NULL;
+
+    s_png_arena_pos = aligned + (unsigned int)size;
+    return (png_voidp)(s_png_arena + aligned);
+}
+
+static void PNGAPI png_static_release(png_structp png_ptr, png_voidp ptr)
+{
+    (void)png_ptr;
+    (void)ptr;
+}
+
+static void png_mem_read(png_structp png, png_bytep buf, png_size_t len)
+{
+    PNGReadState *st = (PNGReadState *)png_get_io_ptr(png);
+    if (!st || st->pos + len > st->size) {
+        png_error(png, "png eof");
+        return;
+    }
+    memcpy(buf, st->data + st->pos, len);
+    st->pos += len;
+}
+
+static int decode_png_to_icon(const unsigned char *png_data, int png_len,
+                              unsigned short *icon_out)
+{
+    png_structp png = NULL;
+    png_infop info = NULL;
+    PNGReadState st;
+    int src_w, src_h;
+    int color_type, bit_depth;
+    png_size_t rowbytes;
+    int sy, next_dy;
+
+    if (!png_data || png_len <= 8 || !icon_out)
+        return -1;
+    if (png_sig_cmp((png_bytep)png_data, 0, 8) != 0)
+        return -1;
+
+    memset(icon_out, 0, ICON_DATA_SIZE);
+    s_png_arena_pos = 0;
+
+    png = png_create_read_struct_2(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL,
+                                   NULL, png_static_alloc, png_static_release);
+    if (!png)
+        return -1;
+
+    info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, NULL, NULL);
+        return -1;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        return -1;
+    }
+
+    st.data = png_data;
+    st.pos = 0;
+    st.size = (png_size_t)png_len;
+    png_set_read_fn(png, &st, png_mem_read);
+
+    png_read_info(png, info);
+    src_w = (int)png_get_image_width(png, info);
+    src_h = (int)png_get_image_height(png, info);
+    color_type = png_get_color_type(png, info);
+    bit_depth = png_get_bit_depth(png, info);
+
+    if (src_w <= 0 || src_h <= 0)
+        png_error(png, "bad png size");
+
+    if (bit_depth == 16) png_set_strip_16(png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (color_type == PNG_COLOR_TYPE_RGB ||
+        color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_PALETTE) png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    if (color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+
+    png_read_update_info(png, info);
+    rowbytes = png_get_rowbytes(png, info);
+    if (rowbytes > PNG_MAX_ROW_BYTES)
+        png_error(png, "png row too wide");
+
+    next_dy = 0;
+    for (sy = 0; sy < src_h; sy++) {
+        png_read_row(png, s_png_row_buf, NULL);
+        while (next_dy < ICON_HEIGHT && (next_dy * src_h / ICON_HEIGHT) == sy) {
+            int dx;
+            for (dx = 0; dx < ICON_WIDTH; dx++) {
+                int sx = dx * src_w / ICON_WIDTH;
+                const unsigned char *px = s_png_row_buf + sx * 4;
+                unsigned short r5 = (px[0] >> 3) & 0x1F;
+                unsigned short g6 = (px[1] >> 2) & 0x3F;
+                unsigned short b5 = (px[2] >> 3) & 0x1F;
+                icon_out[next_dy * ICON_BUFFER_WIDTH + dx] =
+                    (unsigned short)((b5 << 11) | (g6 << 5) | r5);
+            }
+            next_dy++;
+        }
+    }
+
+    png_read_end(png, NULL);
+    png_destroy_read_struct(&png, &info, NULL);
+    sceKernelDcacheWritebackInvalidateRange(icon_out, ICON_DATA_SIZE);
+    return 0;
+}
 
 /**
  * Initialize the default icon with a gray gradient placeholder
@@ -255,6 +457,7 @@ void game_list_init(GameList *gameList, const char *hostIp)
     strncpy(gameList->hostIp, hostIp, MAX_HOST_IP_LENGTH - 1);
     gameList->hostIp[MAX_HOST_IP_LENGTH - 1] = '\0';
     gameList->count = 0;
+    reset_icon_pool();
     
     /* Initialize default icon */
     init_default_icon();
@@ -263,17 +466,12 @@ void game_list_init(GameList *gameList, const char *hostIp)
 int game_list_fetch(GameList *gameList)
 {
     char url[512];
-    char *recv_buf;
+    char *recv_buf = s_http_recv_buf;
     int ret;
     
     pspDebugScreenPrintf("game_list_fetch: fetching from %s\n", gameList->hostIp);
     
-    /* Allocate receive buffer */
-    recv_buf = (char*)malloc(HTTP_RECV_BUFFER_SIZE);
-    if (!recv_buf) {
-        pspDebugScreenPrintf("game_list_fetch: failed to allocate buffer\n");
-        return -1;
-    }
+    memset(recv_buf, 0, HTTP_RECV_BUFFER_SIZE);
     
     /* Build URL for applist endpoint — HTTPS port 47984, requires mTLS.
      * https_launch_get is defined in network_connect.c and handles client cert. */
@@ -299,7 +497,6 @@ int game_list_fetch(GameList *gameList)
         }
         if (ret < 0 || strlen(recv_buf) == 0) {
             pspDebugScreenPrintf("game_list_fetch: HTTP request failed after %d attempts (%d)\n", attempts, ret);
-            free(recv_buf);
             return (ret < 0) ? ret : -1;
         }
     }
@@ -321,8 +518,6 @@ int game_list_fetch(GameList *gameList)
         ret = game_list_parse_xml(gameList, recv_buf, xml_len);
     }
     
-    free(recv_buf);
-    
     if (ret < 0) {
         pspDebugScreenPrintf("game_list_fetch: XML parsing failed (%d)\n", ret);
         return ret;
@@ -336,7 +531,6 @@ int game_list_parse_xml(GameList *gameList, const char *xmlData, int xmlSize)
 {
     const char *pos;
     const char *end;
-    char *entry_buf;
     int games_parsed = 0;
     
     pspDebugScreenPrintf("game_list_parse_xml: parsing %d bytes\n", xmlSize);
@@ -398,25 +592,28 @@ int game_list_parse_xml(GameList *gameList, const char *xmlData, int xmlSize)
         if (!entry_end || entry_end >= end)
             break;
         
-        /* Extract entry to buffer dynamically to accommodate massive Base64 nodes */
+        /* Extract entry to bounded static scratch. Oversized game entries are
+         * truncated rather than heap-allocated; ID/title/app asset paths are
+         * expected near the top of Sunshine's app nodes. */
         int entry_len = entry_end - entry_start + close_tag_len;  /* Include closing tag */
-        entry_buf = (char *)malloc(entry_len + 1);
-        if (!entry_buf) break;
+        if (entry_len >= MAX_GAME_ENTRY_XML) {
+            pspDebugScreenPrintf("  Game entry too large (%d), truncating to %d bytes\n",
+                                 entry_len, MAX_GAME_ENTRY_XML - 1);
+            entry_len = MAX_GAME_ENTRY_XML - 1;
+        }
         
-        memcpy(entry_buf, entry_start, entry_len);
-        entry_buf[entry_len] = '\0';
+        memcpy(s_entry_buf, entry_start, entry_len);
+        s_entry_buf[entry_len] = '\0';
         
         /* Parse this game entry */
-        if (parse_game_entry(entry_buf, &gameList->games[games_parsed]) == 0) {
+        if (parse_game_entry(s_entry_buf, &gameList->games[games_parsed]) == 0) {
             pspDebugScreenPrintf("  Game %d: ID=%d, Title=%s\n",
                                  games_parsed,
                                  gameList->games[games_parsed].id,
                                  gameList->games[games_parsed].title);
             games_parsed++;
         }
-        
-        free(entry_buf);
-        
+
         /* Move past this entry */
         pos = entry_end + close_tag_len;
     }
@@ -427,248 +624,94 @@ int game_list_parse_xml(GameList *gameList, const char *xmlData, int xmlSize)
     return games_parsed;
 }
 
-static unsigned short* allocate_padded_fallback_icon(const unsigned short *tight_pixels)
-{
-    unsigned short *padded = (unsigned short *)memalign(16, ICON_DATA_SIZE);
-    if (!padded) return NULL;
-    memset(padded, 0, ICON_DATA_SIZE);
-    
-    for (int y = 0; y < ICON_HEIGHT; y++) {
-        for (int x = 0; x < ICON_WIDTH; x++) {
-            padded[y * ICON_BUFFER_WIDTH + x] = tight_pixels[y * ICON_WIDTH + x];
-        }
-    }
-    
-    sceKernelDcacheWritebackInvalidateRange(padded, ICON_DATA_SIZE);
-    return padded;
-}
-
 int game_list_download_icons(GameList *gameList)
 {
     int i;
     int success_count = 0;
     
-    pspDebugScreenPrintf("game_list_download_icons: downloading %d icons\n",
+    int cache_count = 0;
+    int download_count = 0;
+    int fallback_count = 0;
+    int default_count = 0;
+
+    pspDebugScreenPrintf("game_list_download_icons: loading %d icons\n",
                          gameList->count);
     
-    /* Create cache directory if it doesn't exist */
-    sceIoMkdir(CACHE_DIR, 0777);
-    
-    /* Download icons for each game */
+    ensure_cache_dir();
+
+    /* v1.0 PSP-1000 policy: no first-party heap allocation. Existing raw cache
+     * art is loaded first; stale/missing icons are downloaded and decoded through
+     * fixed PNG buffers; embedded icons remain the offline fallback. */
     for (i = 0; i < gameList->count; i++) {
         GameInfo *game = &gameList->games[i];
-
-        /* Check icon cache validity (URL hash + age) */
         int cache_stale = icon_cache_needs_update(game->id, game->boxArtUrl);
-        
-        /* Try to load from cache first (only if cache is still valid) */
         if (!cache_stale && game_list_load_cached_icon(game)) {
             pspDebugScreenPrintf("  [%d/%d] Loaded from cache: %s\n",
                                  i + 1, gameList->count, game->title);
-            success_count++;
-            continue;
-        }
-        
-        /* Download icon from server */
-        if (game_list_download_icon(game, gameList->hostIp) == 0) {
+            cache_count++;
+        } else if (game_list_download_icon(game, gameList->hostIp) == 0) {
+            icon_cache_record(game->id, game->boxArtUrl);
             pspDebugScreenPrintf("  [%d/%d] Downloaded: %s\n",
                                  i + 1, gameList->count, game->title);
-            icon_cache_record(game->id, game->boxArtUrl);
-            success_count++;
-        } else {
-            pspDebugScreenPrintf("  [%d/%d] Failed: %s (using fallback)\n",
+            download_count++;
+        } else if (assign_fallback_icon(game)) {
+            pspDebugScreenPrintf("  [%d/%d] Fallback: %s\n",
                                  i + 1, gameList->count, game->title);
-            /* Try per-title fallback icon first, then generic grey */
-            {
-                const unsigned short *fb = fallback_icon_for_title(game->title);
-                if (fb) {
-                    game->iconData = allocate_padded_fallback_icon(fb);
-                }
-                if (!game->iconData) {
-                    game->iconData = g_default_icon;
-                }
-            }
+            fallback_count++;
+        } else {
+            game->iconData = g_default_icon;
             game->iconLoaded = 1;
+            pspDebugScreenPrintf("  [%d/%d] Default icon: %s\n",
+                                 i + 1, gameList->count, game->title);
+            default_count++;
         }
-        
-        /* Yield between downloads */
-        sceKernelDelayThread(50000);
+        success_count++;
     }
     
-    pspDebugScreenPrintf("game_list_download_icons: %d/%d successful\n",
-                         success_count, gameList->count);
+    pspDebugScreenPrintf("game_list_download_icons: %d/%d icons assigned (cache=%d downloaded=%d fallback=%d default=%d pool=%d/%d)\n",
+                         success_count, gameList->count, cache_count, download_count,
+                         fallback_count, default_count, s_icon_pool_used, STATIC_ICON_SLOTS);
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * PNG memory-read helpers for libpng
- * ------------------------------------------------------------------------- */
-typedef struct {
-    const unsigned char *data;
-    png_size_t           pos;
-    png_size_t           size;
-} PNGReadState;
-
-static void png_mem_read(png_structp png, png_bytep buf, png_size_t len)
-{
-    PNGReadState *st = (PNGReadState *)png_get_io_ptr(png);
-    if (st->pos + len > st->size) {
-        png_error(png, "EOF");
-        return;
-    }
-    memcpy(buf, st->data + st->pos, len);
-    st->pos += len;
-}
-
-/* -------------------------------------------------------------------------
- * game_list_download_icon
- *
- * 1. Downloads PNG from Sunshine /appasset (mTLS via https_launch_get)
- * 2. Decodes with libpng into a temporary RGBA8888 buffer
- * 3. Nearest-neighbour scales to ICON_WIDTH x ICON_HEIGHT
- * 4. Saves raw ICON_DATA_SIZE bytes to cache
- * ------------------------------------------------------------------------- */
 int game_list_download_icon(GameInfo *game, const char *host_ip)
 {
-    char *png_buf;
-    int   png_len;
-    png_structp  png  = NULL;
-    png_infop    info = NULL;
-    png_bytep   *rows = NULL;
-    unsigned int *src = NULL;
-    int src_w, src_h = 0;
+    int png_len;
+    unsigned short *slot;
 
-    if (!game->boxArtUrl || game->boxArtUrl[0] == '\0' || !host_ip) {
-        /* No BoxArtUrl in server XML — construct the standard Sunshine appasset URL.
-         * Sunshine serves dynamic cover art for every app at this endpoint. */
-        if (!host_ip || game->id == 0) {
-            pspDebugScreenPrintf("[ICON] skip %d: no host or id\n", game->id);
+    if (!game) return -1;
+    if (!host_ip || !host_ip[0])
+        return -1;
+
+    if (!game->boxArtUrl[0]) {
+        if (game->id == 0)
             return -1;
-        }
         snprintf(game->boxArtUrl, MAX_URL_LENGTH,
                  "/appasset?uniqueid=%s&appid=%d&AssetType=2&AssetIdx=0",
                  PSP_UNIQUE_ID, game->id);
-        pspDebugScreenPrintf("[ICON] constructed URL: %s\n", game->boxArtUrl);
     }
 
     pspDebugScreenPrintf("[ICON] downloading appid=%d url=%s\n",
                          game->id, game->boxArtUrl);
-
-    /* boxArtUrl is stored as the path portion only, e.g.
-     * "/appasset?uniqueid=...&appid=123&AssetType=2&AssetIdx=0" */
-    png_buf = (char *)malloc(PNG_DOWNLOAD_BUF_SIZE);
-    if (!png_buf) return -1;
-
-    /* Use binary-safe download: returns body byte count, not 0/-1.
-     * Must use host_ip (not boxArtUrl) as the TLS host parameter. */
-    png_len = https_launch_get_binary(host_ip, 47984,
-                                      game->boxArtUrl,
-                                      png_buf,
+    png_len = https_launch_get_binary(host_ip, 47984, game->boxArtUrl,
+                                      (char *)s_png_download_buf,
                                       PNG_DOWNLOAD_BUF_SIZE);
-    pspDebugScreenPrintf("[ICON] download ret=%d appid=%d\n", png_len, game->id);
     if (png_len <= 0) {
-        free(png_buf);
+        pspDebugScreenPrintf("[ICON] download failed appid=%d ret=%d\n", game->id, png_len);
         return -1;
     }
 
-    /* Validate PNG signature */
-    if (png_sig_cmp((png_bytep)png_buf, 0, 8) != 0) {
-        pspDebugScreenPrintf("[ICON] not a PNG (first bytes: %02x %02x %02x %02x)\n",
-                             (unsigned char)png_buf[0], (unsigned char)png_buf[1],
-                             (unsigned char)png_buf[2], (unsigned char)png_buf[3]);
-        free(png_buf);
+    slot = alloc_icon_slot();
+    if (!slot)
+        return -1;
+
+    if (decode_png_to_icon(s_png_download_buf, png_len, slot) < 0) {
+        release_last_icon_slot(slot);
+        pspDebugScreenPrintf("[ICON] decode failed appid=%d len=%d\n", game->id, png_len);
         return -1;
     }
 
-    /* Set up libpng */
-    png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png) { free(png_buf); return -1; }
-
-    info = png_create_info_struct(png);
-    if (!info) { png_destroy_read_struct(&png, NULL, NULL); free(png_buf); return -1; }
-
-    if (setjmp(png_jmpbuf(png))) {
-        /* libpng error */
-        if (rows) {
-            for (int i = 0; i < src_h; i++) free(rows[i]);
-            free(rows);
-        }
-        free(src);
-        png_destroy_read_struct(&png, &info, NULL);
-        free(png_buf);
-        return -1;
-    }
-
-    /* Custom read from memory */
-    PNGReadState st = { (const unsigned char *)png_buf, 0, (png_size_t)png_len };
-    png_set_read_fn(png, &st, png_mem_read);
-
-    png_read_info(png, info);
-
-    src_w = (int)png_get_image_width(png, info);
-    src_h = (int)png_get_image_height(png, info);
-    int color_type = png_get_color_type(png, info);
-    int bit_depth  = png_get_bit_depth(png, info);
-
-    /* Normalise to 8-bit RGBA */
-    if (bit_depth == 16)              png_set_strip_16(png);
-    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
-    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    if (color_type == PNG_COLOR_TYPE_RGB  ||
-        color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_PALETTE) png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-    if (color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
-    png_read_update_info(png, info);
-
-    /* Allocate rows for the full-size source image */
-    rows = (png_bytep *)malloc(sizeof(png_bytep) * src_h);
-    if (!rows) { longjmp(png_jmpbuf(png), 1); }
-    for (int i = 0; i < src_h; i++) {
-        rows[i] = (png_byte *)malloc(png_get_rowbytes(png, info));
-        if (!rows[i]) {
-            for (int j = 0; j < i; j++) free(rows[j]);
-            free(rows); rows = NULL;
-            longjmp(png_jmpbuf(png), 1);
-        }
-    }
-    png_read_image(png, rows);
-    png_destroy_read_struct(&png, &info, NULL);
-    free(png_buf);
-
-    /* Scale decoded RGBA to ICON_WIDTH x ICON_HEIGHT using nearest-neighbour */
-    /* MUST be 16-byte aligned for sceGuTexImage to prevent GE lockup on real hardware */
-    game->iconData = (unsigned short *)memalign(16, ICON_DATA_SIZE);
-    if (!game->iconData) {
-        for (int i = 0; i < src_h; i++) free(rows[i]);
-        free(rows);
-        return -1;
-    }
-    memset(game->iconData, 0, ICON_DATA_SIZE);
-
-    for (int dy = 0; dy < ICON_HEIGHT; dy++) {
-        int sy = dy * src_h / ICON_HEIGHT;
-        if (sy >= src_h) sy = src_h - 1;
-        const unsigned char *row = rows[sy];
-        for (int dx = 0; dx < ICON_WIDTH; dx++) {
-            int sx = dx * src_w / ICON_WIDTH;
-            if (sx >= src_w) sx = src_w - 1;
-            const unsigned char *px = row + sx * 4;
-            /* Convert 8-bit RGBA to 16-bit RGB565 */
-            unsigned short r5 = (px[0] >> 3) & 0x1F;
-            unsigned short g6 = (px[1] >> 2) & 0x3F;
-            unsigned short b5 = (px[2] >> 3) & 0x1F;
-            game->iconData[dy * ICON_BUFFER_WIDTH + dx] = (b5 << 11) | (g6 << 5) | r5;
-        }
-    }
-
-    for (int i = 0; i < src_h; i++) free(rows[i]);
-    free(rows);
-
-    /* Flush D-cache after generating texture data */
-    sceKernelDcacheWritebackInvalidateRange(game->iconData, ICON_DATA_SIZE);
-
+    game->iconData = slot;
     game->iconLoaded = 1;
     game_list_save_icon_to_cache(game);
     return 0;
@@ -677,41 +720,33 @@ int game_list_download_icon(GameInfo *game, const char *host_ip)
 int game_list_load_cached_icon(GameInfo *game)
 {
     char path[256];
+    unsigned short *slot;
     SceUID fd;
     int ret;
-    
+
+    if (!game)
+        return 0;
+
     game_list_get_icon_path(game, path);
-    
-    /* Try to open the cache file */
-    fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
-    if (fd < 0) {
-        return 0;  /* Not in cache */
-    }
-    
-    /* Allocate icon data */
-    /* Texture buffer MUST be 16-byte aligned for the Graphics Engine */
-    game->iconData = (unsigned short *)memalign(16, ICON_DATA_SIZE);
-    if (!game->iconData) {
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd < 0)
+        return 0;
+
+    slot = alloc_icon_slot();
+    if (!slot) {
         sceIoClose(fd);
         return 0;
     }
-    memset(game->iconData, 0, ICON_DATA_SIZE);
-    
-    /* Read icon data */
-    ret = sceIoRead(fd, game->iconData, ICON_DATA_SIZE);
+
+    ret = sceIoRead(fd, slot, ICON_DATA_SIZE);
     sceIoClose(fd);
-    
     if (ret != ICON_DATA_SIZE) {
-        free(game->iconData);
-        game->iconData = NULL;
+        release_last_icon_slot(slot);
         return 0;
     }
-    
-    /* Ensure D-cache coherence: sceIoRead may DMA into the buffer,
-     * leaving stale data in the CPU data cache.  Writeback+invalidate
-     * so subsequent CPU reads (and GU DMA for textures) see correct data. */
-    sceKernelDcacheWritebackInvalidateRange(game->iconData, ICON_DATA_SIZE);
 
+    sceKernelDcacheWritebackInvalidateRange(slot, ICON_DATA_SIZE);
+    game->iconData = slot;
     game->iconLoaded = 1;
     return 1;
 }
@@ -722,13 +757,12 @@ int game_list_save_icon_to_cache(const GameInfo *game)
     SceUID fd;
     int ret;
     
-    if (!game->iconData || !game->iconLoaded)
+    if (!game->iconData || !game->iconLoaded || game->iconData == g_default_icon)
         return -1;
     
     game_list_get_icon_path(game, path);
     
-    /* Create cache directory if needed */
-    sceIoMkdir(CACHE_DIR, 0777);
+    ensure_cache_dir();
     
     /* Open file for writing */
     fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
@@ -759,10 +793,6 @@ void game_list_cleanup(GameList *gameList)
     int i;
     
     for (i = 0; i < gameList->count; i++) {
-        if (gameList->games[i].iconData && 
-            gameList->games[i].iconData != g_default_icon) {
-            free(gameList->games[i].iconData);
-        }
         gameList->games[i].iconData = NULL;
         gameList->games[i].iconLoaded = 0;
     }

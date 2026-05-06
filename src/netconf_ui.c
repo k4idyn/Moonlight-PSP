@@ -56,7 +56,7 @@ int netconf_ui_run(void)
     /* Use a larger memory pool (128KB) and standard stack sizes (4KB).
      * In Round 3, we make these non-fatal to avoid Permission errors if 
      * the stack was already half-initialized by another component. */
-    sceNetInit(128 * 1024, 42, 4096, 42, 4096);
+    sceNetInit(512 * 1024, 42, 4096, 42, 4096);
     sceNetInetInit();
     sceNetApctlInit(0x2000, 42);
 
