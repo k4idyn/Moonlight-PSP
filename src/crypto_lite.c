@@ -86,7 +86,7 @@ void sha256_hash(const unsigned char *data, size_t len, unsigned char *out)
     /* Remaining bytes + padding */
     rem = len - i;
     memset(block, 0, 64);
-    if (rem > 0) {
+    if (rem > 0 && rem < sizeof(block)) {
         memcpy(block, data + i, rem);
     }
     block[rem] = 0x80;
@@ -166,11 +166,12 @@ static const unsigned char aes_rcon[11] = {
 #define AES_Nk 4
 #define AES_Nr 10
 
-static void aes_key_expansion(const unsigned char *key, unsigned char rk[176])
+static void aes_key_expansion(const unsigned char *key, size_t key_len, unsigned char rk[176])
 {
     unsigned char tmp[4];
     int i;
 
+    if (key_len < 16) { memset(rk, 0, 176); return; }
     memcpy(rk, key, 16);
 
     for (i = AES_Nk; i < AES_Nb * (AES_Nr + 1); i++) {
@@ -292,7 +293,7 @@ void aes128_ecb_encrypt(const unsigned char *plaintext, int len,
 {
     unsigned char rk[176];
     int i;
-    aes_key_expansion(key, rk);
+    aes_key_expansion(key, 16, rk);
     for (i = 0; i < len; i += 16) {
         aes_encrypt_block(plaintext + i, ciphertext + i, rk);
     }
@@ -303,7 +304,7 @@ void aes128_ecb_decrypt(const unsigned char *ciphertext, int len,
 {
     unsigned char rk[176];
     int i;
-    aes_key_expansion(key, rk);
+    aes_key_expansion(key, 16, rk);
     for (i = 0; i < len; i += 16) {
         aes_decrypt_block(ciphertext + i, plaintext + i, rk);
     }
