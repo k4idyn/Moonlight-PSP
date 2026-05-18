@@ -65,6 +65,15 @@ static float s_host_target_camera = 0.0f;   /* integer camera from clamp logic  
 static float s_host_focus_anim    = 0.0f;   /* lerps toward selected for pop    */
 static u32   s_host_last_anim_us  = 0;
 
+static void closeProbeTcpSocket(int sock)
+{
+    if (sock >= 0) {
+        struct linger lg = { 1, 0 };
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        sceNetInetClose(sock);
+    }
+}
+
 static void clampSelectionWindow(void)
 {
     if (g_host_count <= 0) {
@@ -280,7 +289,7 @@ static int httpProbeHost(HostPC *host)
         int err = sceNetInetGetErrno();
         if (err != EINPROGRESS && err != EALREADY &&
             err != EAGAIN && err != EWOULDBLOCK) {
-            sceNetInetClose(sock);
+            closeProbeTcpSocket(sock);
             return -1;
         }
     }
@@ -298,7 +307,7 @@ static int httpProbeHost(HostPC *host)
 
         ret = sceNetInetSelect(sock + 1, NULL, &wfds, NULL, &tv);
         if (ret <= 0) {
-            sceNetInetClose(sock);
+            closeProbeTcpSocket(sock);
             return -1;
         }
 
@@ -306,7 +315,7 @@ static int httpProbeHost(HostPC *host)
         optlen = sizeof(optval);
         sceNetInetGetsockopt(sock, SOL_SOCKET, SO_ERROR, &optval, &optlen);
         if (optval != 0) {
-            sceNetInetClose(sock);
+            closeProbeTcpSocket(sock);
             return -1;
         }
     }
@@ -336,14 +345,14 @@ static int httpProbeHost(HostPC *host)
             int err = sceNetInetGetErrno();
             if (err != EAGAIN && err != EWOULDBLOCK) {
                 diag_log_write("DISC", "probe %s: send err=%d\n", host->ip, err);
-                sceNetInetClose(sock);
+                closeProbeTcpSocket(sock);
                 return -1;
             }
         }
 
         if ((sceKernelGetSystemTimeLow() / 1000) - start_ms > SEND_TIMEOUT_MS) {
             diag_log_write("DISC", "probe %s: send timeout\n", host->ip);
-            sceNetInetClose(sock);
+            closeProbeTcpSocket(sock);
             return -1;
         }
         sceKernelDelayThread(10000);
@@ -351,7 +360,7 @@ static int httpProbeHost(HostPC *host)
 
     if (sent < req_len) {
         diag_log_write("DISC", "probe %s: short send (%d/%d)\n", host->ip, sent, req_len);
-        sceNetInetClose(sock);
+        closeProbeTcpSocket(sock);
         return -1;
     }
 
@@ -375,7 +384,7 @@ static int httpProbeHost(HostPC *host)
         }
     }
     response[total] = '\0';
-    sceNetInetClose(sock);
+    closeProbeTcpSocket(sock);
 
     diag_log_write("DISC", "probe %s got %d bytes\n", host->ip, total);
     if (total <= 0) {
@@ -529,10 +538,15 @@ static void mdnsDiscoverHosts(void)
 
         /* Re-send query at ~1s for reliability */
         if (!resent && (sceKernelGetSystemTimeLow() / 1000) - start_ms >= 1000) {
+#ifdef RETAIL_BUILD
+            sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
+                             (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+#else
             int retry_tx = sceNetInetSendto(sock, mdns_query, sizeof(mdns_query), 0,
                                             (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
             diag_log_write("DISC", "mdns: retry query sent (%d bytes, err=%d)\n",
                            retry_tx, retry_tx < 0 ? sceNetInetGetErrno() : 0);
+#endif
             resent = 1;
         }
 
@@ -681,7 +695,7 @@ static int quickSubnetScan(void)
 
             ret = sceNetInetSelect(sock + 1, NULL, &wfds, NULL, &tv);
             if (ret <= 0) {
-                sceNetInetClose(sock);
+                closeProbeTcpSocket(sock);
                 continue;
             }
 
@@ -689,13 +703,13 @@ static int quickSubnetScan(void)
             optlen = sizeof(optval);
             sceNetInetGetsockopt(sock, SOL_SOCKET, SO_ERROR, &optval, &optlen);
             if (optval != 0) {
-                sceNetInetClose(sock);
+                closeProbeTcpSocket(sock);
                 continue;
             }
         }
 
         /* Connected — this is a Sunshine host */
-        sceNetInetClose(sock);
+        closeProbeTcpSocket(sock);
         diag_log_write("DISC", "subnet: port open on %s\n", ip_str);
 
         config_add_manual_host(ip_str, NULL);

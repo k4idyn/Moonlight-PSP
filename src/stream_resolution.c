@@ -21,15 +21,35 @@ void stream_resolution_normalize(int *inout_width, int *inout_height)
 {
     int width = (inout_width && *inout_width > 0) ? *inout_width : PSP_LCD_WIDTH;
     int height = (inout_height && *inout_height > 0) ? *inout_height : PSP_LCD_HEIGHT;
+    int scale_from_w;
+    int scale_from_h;
+    int scale;
+    const int scale_min = (STREAM_MIN_WIDTH + 29) / 30;
+    const int scale_max = STREAM_MAX_WIDTH / 30;
 
-    /* Enforce H.264 macroblock alignment first, then clamp to renderer bounds. */
-    width &= ~15;
-    height &= ~15;
+    /* Snap every request to the PSP LCD's exact 30:17 aspect ratio. The scale
+     * value must be even so the resulting YUV420 dimensions are even.
+     * This avoids black bars without relying on renderer-side distortion. */
+    scale_from_w = (width + 15) / 30;
+    scale_from_h = (height + 8) / 17;
+    scale = (scale_from_w + scale_from_h + 1) / 2;
+    if (scale & 1) {
+        scale++;
+    }
 
-    if (width < STREAM_MIN_WIDTH) width = STREAM_MIN_WIDTH;
-    if (height < STREAM_MIN_HEIGHT) height = STREAM_MIN_HEIGHT;
-    if (width > STREAM_MAX_WIDTH) width = STREAM_MAX_WIDTH;
-    if (height > STREAM_MAX_HEIGHT) height = STREAM_MAX_HEIGHT;
+    if (scale < scale_min) scale = scale_min;
+    if (scale & 1) scale++;
+    if (scale > scale_max) scale = scale_max & ~1;
+    if (scale < 2) scale = 2;
+
+    width = 30 * scale;
+    height = 17 * scale;
+
+    if (height > STREAM_MAX_HEIGHT) {
+        scale = (STREAM_MAX_HEIGHT / 17) & ~1;
+        width = 30 * scale;
+        height = 17 * scale;
+    }
 
     if (inout_width) {
         *inout_width = width;
@@ -57,9 +77,10 @@ void stream_resolution_init(int width, int height)
     g_stream_res.yuv_total_size = g_stream_res.y_plane_size
                                 + 2 * g_stream_res.uv_plane_size;
 
-    /* Macroblock grid */
-    g_stream_res.mb_width  = width / 16;
-    g_stream_res.mb_height = height / 16;
+    /* H.264 coded macroblock grid. Display dimensions do not need to be
+     * mod-16; encoders signal cropping for exact even sizes such as 300x170. */
+    g_stream_res.mb_width  = (width + 15) / 16;
+    g_stream_res.mb_height = (height + 15) / 16;
     g_stream_res.total_mbs = g_stream_res.mb_width * g_stream_res.mb_height;
 
     g_stream_res.initialized = 1;
@@ -97,10 +118,7 @@ void resolution_scaler_init(void)
     g_res_scaler.loss_avg_pct = 0;
     g_res_scaler.initialized = 1;
 
-    pspDebugScreenPrintf("[PHASE4-RES] init: %dx%d (step %d)\n",
-                         g_res_scaler.target_width, g_res_scaler.target_height,
-                         g_res_scaler.current_step);
-    diag_log_write("RES", "[PHASE4-RES] scaler init: %dx%d step=%d\n",
+    diag_log_write("RES", "[RES] scaler init: %dx%d step=%d\n",
                    g_res_scaler.target_width, g_res_scaler.target_height,
                    g_res_scaler.current_step);
 }
@@ -130,9 +148,7 @@ int resolution_scaler_update(int decode_time_ms, int loss_rate_pct)
         g_res_scaler.last_change_time = now;
         g_res_scaler.recover_start_time = 0;
 
-        pspDebugScreenPrintf("[PHASE4-RES] step DOWN: %dx%d\n",
-                             g_res_scaler.target_width, g_res_scaler.target_height);
-        diag_log_write("RES", "[PHASE4-RES] step DOWN %d->%d: %dx%d (decode=%dms loss=%d%%)\n",
+        diag_log_write("RES", "[RES] step DOWN %d->%d: %dx%d (decode=%dms loss=%d%%)\n",
                        old_step, g_res_scaler.current_step,
                        g_res_scaler.target_width, g_res_scaler.target_height,
                        g_res_scaler.decode_avg_ms, g_res_scaler.loss_avg_pct);
@@ -153,9 +169,7 @@ int resolution_scaler_update(int decode_time_ms, int loss_rate_pct)
             g_res_scaler.last_change_time = now;
             g_res_scaler.recover_start_time = 0;
 
-            pspDebugScreenPrintf("[PHASE4-RES] step UP: %dx%d\n",
-                                 g_res_scaler.target_width, g_res_scaler.target_height);
-            diag_log_write("RES", "[PHASE4-RES] step UP %d->%d: %dx%d (decode=%dms loss=%d%%)\n",
+            diag_log_write("RES", "[RES] step UP %d->%d: %dx%d (decode=%dms loss=%d%%)\n",
                            old_step, g_res_scaler.current_step,
                            g_res_scaler.target_width, g_res_scaler.target_height,
                            g_res_scaler.decode_avg_ms, g_res_scaler.loss_avg_pct);

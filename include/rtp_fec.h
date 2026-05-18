@@ -42,6 +42,7 @@ extern volatile u8  g_fec_last_fec_pct;
 
 /* Total video bytes received since last reset (for bandwidth estimation) */
 extern volatile u32 g_fec_total_bytes_received;
+extern volatile u32 g_fec_packets_received;
 
 /* ── Aggregate FEC recovery statistics ──────────────────────────────
  * These counters are monotonically increasing over the session lifetime.

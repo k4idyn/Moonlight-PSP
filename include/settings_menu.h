@@ -2,8 +2,10 @@
  * settings_menu.h - PSP Settings Menu System for Moonlight
  *
  * Provides a menu interface for configuring streaming settings:
- * - Resolution (720p/1080p rendered at native 480x272)
- * - FPS (15/30)
+ * - Preset tier (Quality native, Balanced, Performance, or custom)
+ * - Resolution dimensions, independently adjustable after preset selection
+ * - FPS (10/15/20/30/60/custom; 20fps is a gate, not a ceiling)
+ * - Audio enable, bitrate, packet size, theme, and controls
  * - Control Mode (Digital/Analog)
  *
  * Controls:
@@ -30,21 +32,23 @@ extern "C" {
 
 /* Resolution presets — PSP-1000 hardware-tuned
  *
- *   [0] Native      480x272 @15fps  500kbps (PSP LCD native)
- *   [1] Performance 256x144 @30fps  500kbps (low latency, easy decode)
- *   [2] Custom      user-defined via OSK (defaults to 480x272)
+ *   [0] Quality      480x272 native resolution, 10fps tier
+ *   [1] Balanced     360x204 exact PSP-panel aspect, 20fps tier
+ *   [2] Performance  300x170 lowest even PSP-panel aspect above host floor, 30fps tier, audio off
+ *   [3] Custom       user-defined via OSK (defaults to 480x272)
  *
  * The Custom slot is writable — OSK input updates it at runtime.
  * ALL code paths read width/height from these arrays (single source of truth).
  */
-#define RESOLUTION_PRESET_COUNT 2
-#define RESOLUTION_CUSTOM_INDEX 2
-#define RESOLUTION_COUNT 3
+#define RESOLUTION_PRESET_COUNT 3
+#define RESOLUTION_CUSTOM_INDEX 3
+#define RESOLUTION_COUNT 4
 extern int          RESOLUTION_WIDTHS[RESOLUTION_COUNT];
 extern int          RESOLUTION_HEIGHTS[RESOLUTION_COUNT];
 extern const char * RESOLUTION_LABELS[RESOLUTION_COUNT];
 extern const int    RESOLUTION_OPTIMAL_FPS_IDX[RESOLUTION_COUNT];
 extern const int    RESOLUTION_OPTIMAL_BITRATE[RESOLUTION_COUNT];
+extern const int    RESOLUTION_OPTIMAL_PACKET_SIZE[RESOLUTION_COUNT];
 
 /* Update the Custom slot's label after OSK entry. */
 void resolution_update_custom(int width, int height);
@@ -53,10 +57,10 @@ void resolution_update_custom(int width, int height);
  *   60Hz / 4 = 15fps,  60Hz / 3 = 20fps,
  *   60Hz / 2 = 30fps,  60Hz / 1 = 60fps
  */
-extern const char * const FPS_OPTIONS[5];
-extern const int    FPS_VALUES[5];
-#define FPS_COUNT 5
-#define FPS_CUSTOM_INDEX 4
+extern const char * const FPS_OPTIONS[6];
+extern const int    FPS_VALUES[6];
+#define FPS_COUNT 6
+#define FPS_CUSTOM_INDEX 5
 
 
 /* Control mode options */
@@ -81,11 +85,11 @@ typedef struct {
     /* Moonlight stream configuration */
     int width;              /* Stream width  — supports super-native (e.g. 640) */
     int height;             /* Stream height — supports super-native (e.g. 360) */
-    int fps;                /* Frame rate (15 or 30) */
+    int fps;                /* Frame rate */
     int bitrate;            /* Bitrate in kbps */
     int packetSize;         /* Max packet size */
     int streamingRemotely;  /* Remote streaming flag */
-    int audioConfiguration; /* Audio config */
+    int audioConfiguration; /* Moonlight audio config; PSP defaults to mono */
     int supportedVideoFormats; /* Supported video codecs */
     int clientRefreshRateX100; /* Display refresh rate x 100 */
     int colorSpace;         /* Color space */
@@ -96,7 +100,8 @@ typedef struct {
 
     /* PSP-specific settings */
     ControlMode controlMode;    /* Digital or Analog control mode */
-    int resolutionIndex;        /* Index into RESOLUTION_OPTIONS */
+    int presetIndex;            /* Step-ladder preset index */
+    int resolutionIndex;        /* Resolution row index; does not snap defaults */
     int fpsIndex;               /* Index into FPS_OPTIONS */
 
     /* Pairing persistence — up to 8 remembered paired hosts */
@@ -112,8 +117,8 @@ typedef struct {
     char localBindIp[16];       /* Source IP for UDP sockets, or "" = INADDR_ANY */
     int uiThemeIndex;           /* Selected UI accent color index */
     int cabacTestMode;          /* 1 = request Main profile + CABAC in SDP (test only) */
-    int audioEnabled;           /* 1 = enable streaming audio, 0 = disable for performance */
-    int disableEncryption;      /* 1 = disable AV encryption (saves ~5% CPU on 333MHz PSP) */
+    int audioEnabled;           /* 1 = stream/decode audio, 0 = drain/drop RTP only */
+    int disableEncryption;      /* 1 = disable AV encryption; keep RTSP/control compatibility */
 } PspConfig;
 
 /*--------------------------------------------------------------------------
@@ -121,12 +126,14 @@ typedef struct {
  *--------------------------------------------------------------------------*/
 typedef struct {
     int currentSelection;   /* Currently selected menu item */
-    int resolutionIndex;    /* Selected resolution option */
+    int presetIndex;        /* Selected step-ladder preset */
+    int resolutionIndex;    /* Selected resolution option; no default snap */
     int fpsIndex;           /* Selected FPS option */
     int customFpsValue;     /* The custom FPS value if custom is selected */
     int audioEnabled;       /* Local state for Audio option */
     int controlModeIndex;   /* Selected control mode option */
-    int bitrate;            /* Bitrate in kbps (500-4000) */
+    int bitrate;            /* Bitrate in kbps */
+    int packetSize;         /* RTP payload size in bytes */
     int uiThemeIndex;       /* Selected UI theme index */
     int needsRedraw;        /* Flag to indicate menu needs redraw */
 } MenuState;
@@ -141,10 +148,13 @@ typedef struct {
  * @config: Pointer to PspConfig to initialize with defaults
  *
  * Sets default values:
- * - Resolution: 720p
+ * - Preset: Performance
+ * - Resolution: 300x170
  * - FPS: 30
- * - Control Mode: Analog
- * - Bitrate: 5000 kbps
+ * - Audio: Disabled
+ * - Control Mode: Xbox
+ * - Bitrate: 384 kbps
+ * - Packet size: 1056 bytes
  */
 void settings_menu_init(PspConfig *config);
 

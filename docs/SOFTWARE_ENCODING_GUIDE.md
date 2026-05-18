@@ -9,7 +9,7 @@ Software encoding uses your PC's CPU (via x264/libx264) instead of GPU hardware.
 - You want maximum compatibility
 - You're running on a headless server with no GPU
 
-Software encoding is **significantly slower** than hardware encoding. For PSP streaming at 368×208@15 fps, it's usually fine because the resolution is so low.
+Software encoding is **significantly slower** than hardware encoding. For PSP preset streaming, it is usually fine because the resolution is low.
 
 ## Settings
 
@@ -32,7 +32,7 @@ Software encoding is **significantly slower** than hardware encoding. For PSP st
 | `slower` | Very slow | Excellent | ~70% |
 | `veryslow` | Slowest | Best | ~90% |
 
-**PSP recommendation:** `superfast` or `veryfast`. At 368×208, even `superfast` looks decent. Don't go slower than `fast` — the added quality is invisible on the PSP screen and the CPU cost isn't worth it.
+**PSP recommendation:** `superfast` or `veryfast`. At the v1.2 PSP preset sizes, even `superfast` looks decent. Don't go slower than `fast` — the added quality is invisible on the PSP screen and the CPU cost isn't worth it.
 
 ---
 
@@ -72,11 +72,11 @@ encoder = sw
 sw_preset = superfast
 sw_tune = zerolatency
 qp = 28
-fec_percentage = 20
+fec_percentage = 35
 ```
 
 ## Performance Notes
 
-At 368×208@15 fps, software encoding uses very little CPU because the resolution is tiny. Even a 10-year-old laptop CPU can handle this. The bottleneck will be your network, not the encoder.
+At PSP preset sizes, software encoding uses very little CPU because the resolution is tiny. Even a 10-year-old laptop CPU can handle this. The bottleneck will usually be the PSP Wi-Fi and decode budget, not the host encoder.
 
 If you see high CPU usage, check if another program is also using the CPU. Software encoding at PSP resolution should use less than 5% of a modern CPU.

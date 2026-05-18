@@ -31,15 +31,15 @@ extern "C" {
 
 /* Active renderer path supports up to 1024 source width (2x512 pages) and
  * 512 source height (PSP GU max texture height without vertical tiling). */
-#define STREAM_MIN_WIDTH     128
-#define STREAM_MIN_HEIGHT     80
+#define STREAM_MIN_WIDTH     300
+#define STREAM_MIN_HEIGHT    170
 #define STREAM_MAX_WIDTH    1024
 #define STREAM_MAX_HEIGHT    512
 
 typedef struct {
     /* Base dimensions (from config) */
-    int width;              /* Stream width  (e.g. 368, 480, 640) */
-    int height;             /* Stream height (e.g. 208, 272, 360) */
+    int width;              /* Stream width  (e.g. 300, 360, 480) */
+    int height;             /* Stream height (e.g. 170, 204, 272) */
 
     /* GPU-compatible stride (power-of-2, >= width) */
     int stride;             /* 512 for width<=512, 1024 for width>512 */
@@ -50,9 +50,9 @@ typedef struct {
     int uv_plane_size;      /* (width/2) * (height/2) */
     int yuv_total_size;     /* y + 2*uv */
 
-    /* Macroblock grid (H.264: width/16 x height/16) */
-    int mb_width;           /* width / 16 */
-    int mb_height;          /* height / 16 */
+    /* Macroblock grid (H.264 coded size, rounded up from display size) */
+    int mb_width;           /* ceil(width / 16) */
+    int mb_height;          /* ceil(height / 16) */
     int total_mbs;          /* mb_width * mb_height */
 
     /* Initialization flag */
@@ -64,29 +64,30 @@ extern StreamResolution g_stream_res;
 /*
  * stream_resolution_init - Compute all derived resolution parameters
  *
- * @width:  Stream width from config (will be clamped to mod-16)
- * @height: Stream height from config (will be clamped to mod-16)
+ * @width:  Stream width from config
+ * @height: Stream height from config
  *
  * Must be called before oh264_pipeline_init() and sw_pipeline_init().
  */
 void stream_resolution_init(int width, int height);
 
 /* Clamp and align a resolution to the renderer-safe runtime contract.
- * Dimensions are rounded down to mod-16 and then clamped to STREAM_* bounds. */
+ * Stream requests are snapped to the PSP LCD's 30:17 aspect ratio so the
+ * renderer can fill 480x272 without black bars or aspect distortion. */
 void stream_resolution_normalize(int *inout_width, int *inout_height);
 
 /*============================================================================
  * Phase 4: Smart Resolution Scaling
  *============================================================================*/
 
-/* Resolution steps (all mod-16 aligned for H.264 macroblock compatibility) */
+/* Resolution steps (all exact 30:17 PSP-panel aspect; no black bars) */
 #define RES_STEP_COUNT  4
-#define RES_STEP_0_W    256
-#define RES_STEP_0_H    144
-#define RES_STEP_1_W    320
-#define RES_STEP_1_H    176
-#define RES_STEP_2_W    368
-#define RES_STEP_2_H    208
+#define RES_STEP_0_W    300
+#define RES_STEP_0_H    170
+#define RES_STEP_1_W    360
+#define RES_STEP_1_H    204
+#define RES_STEP_2_W    420
+#define RES_STEP_2_H    238
 #define RES_STEP_3_W    480
 #define RES_STEP_3_H    272
 

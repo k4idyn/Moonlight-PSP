@@ -82,12 +82,11 @@ int moonh264_init(MoonH264Decoder *dec, int width, int height) {
   param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
 
   /*
-   * eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR_FREEZE_RES_CHANGE
-   * On a lossy Wi-Fi link Moonlight may receive corrupted slices.  This mode
-   * conceals errors by copying the nearest valid reference slice and freezes
-   * on a resolution change rather than crashing — the safest choice for PSP.
+   * eEcActiveIdc = ERROR_CON_DISABLE
+   * Match the live Moonlight-PSP path: avoid concealed blocky output and let
+   * the caller hold the last clean frame while transport recovery catches up.
    */
-  param.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR_FREEZE_RES_CHANGE;
+  param.eEcActiveIdc = ERROR_CON_DISABLE;
 
   /*
    * bParseOnly = false: we want fully decoded YUV output, not bitstream
@@ -148,10 +147,6 @@ int moonh264_decode(MoonH264Decoder *dec,
                                        &buf_info);
 
   if (state != dsErrorFree && state != dsDataErrorConcealed) {
-    /*
-     * dsDataErrorConcealed means the decoder recovered via error concealment —
-     * still return a picture rather than an error so Moonlight keeps streaming.
-     */
     if (state & dsNoParamSets || state & dsRefLost)
       return MOONH264_OK;  /* Waiting for IDR — not fatal. */
     return MOONH264_ERR_DECODE;

@@ -7,9 +7,9 @@
  * ENet control stream (channel 0x10, type 0x0206).
  *
  * Button Mapper (PSP has no L2/R2 or right stick):
- *   L  + D-pad Up/Down/Left/Right  → Right Stick Up/Down/Left/Right
- *   L  + Cross                     → virtual L2 (left trigger  = 0xFF)
- *   L  + Square                    → virtual R2 (right trigger = 0xFF)
+ *   Default: L + face-button diamond -> Right Stick Up/Down/Left/Right
+ *   Optional: L + analog nub         -> Right Stick analog
+ *   L + mapped button                -> virtual LT/RT/L3/R3
  */
 
 #include <pspkernel.h>
@@ -48,9 +48,21 @@
 
 /* Right-stick emulation magnitude when a combo fires */
 #define RSTICK_MAGNITUDE    24000
+#define RSTICK_ANALOG_DEADZONE  3200
 
 /* Map config path on Memory Stick */
 #define MAP_CFG_PATH        "ms0:/moonlight/map.cfg"
+
+typedef struct {
+    uint32_t l2_button;
+    uint32_t r2_button;
+    uint32_t rs_up_button;
+    uint32_t rs_down_button;
+    uint32_t rs_left_button;
+    uint32_t rs_right_button;
+    uint32_t l3_button;
+    uint32_t r3_button;
+} ButtonMappingV1;
 
 /* ------------------------------------------------------------------ *
  * ButtonMapping - loaded from map.cfg
@@ -66,7 +78,10 @@
 #define MOUSE_BUTTON_UP_MAGIC       0x00000009
 #define MOUSE_BUTTON_LEFT           1
 #define MOUSE_BUTTON_RIGHT          3
-#define MOUSE_SENSITIVITY           6   /* analog-to-delta multiplier */
+#define MOUSE_DEADZONE              18
+#define MOUSE_BASE_SPEED            12
+#define MOUSE_ACCEL_SPEED           16
+#define MOUSE_AXIS_RANGE            (127 - MOUSE_DEADZONE)
 
 /* ENet channel assignments per Moonlight protocol (moonlight-common-c) */
 #define CTRL_CHANNEL_KEYBOARD     0x02
@@ -112,13 +127,20 @@ static int          g_initialized = 0;
 static SceCtrlData  g_prev;      /* previous frame's controller state */
 static int          g_prev_valid; /* 0 until first poll completes  */
 ButtonMapping g_mapping;  /* loaded combo mappings */
+static int          g_mapping_loaded = 0;
 
 /* Access to global config for control mode */
 extern PspConfig g_psp_config;
+extern volatile unsigned int g_remote_analog_active;
+extern volatile unsigned int g_remote_analog_lx;
+extern volatile unsigned int g_remote_analog_ly;
 
 /* Browser-mode button-press memory for edge detection */
 static int g_mouse_l_down = 0;
 static int g_mouse_r_down = 0;
+static int g_last_battery_percent = 100;
+static uint8_t g_last_battery_state = BATTERY_STATE_FULL;
+static int g_suppress_combo_prev = 0;
 
 /* Phase 3: Battery report timer */
 static SceUInt32 g_last_battery_report_us = 0;
@@ -131,41 +153,186 @@ static int g_osk_trigger_prev = 0;
  * ------------------------------------------------------------------ */
 static void set_default_mapping(void)
 {
-    g_mapping.l2_button      = PSP_CTRL_CROSS;
-    g_mapping.r2_button      = PSP_CTRL_SQUARE;
-    g_mapping.rs_up_button   = PSP_CTRL_UP;
-    g_mapping.rs_down_button = PSP_CTRL_DOWN;
-    g_mapping.rs_left_button = PSP_CTRL_LEFT;
-    g_mapping.rs_right_button= PSP_CTRL_RIGHT;
-    g_mapping.l3_button      = PSP_CTRL_TRIANGLE;
-    g_mapping.r3_button      = PSP_CTRL_CIRCLE;
+    memset(&g_mapping, 0, sizeof(g_mapping));
+    g_mapping.version          = BUTTON_MAPPING_VERSION;
+    g_mapping.modifier_button  = PSP_CTRL_LTRIGGER;
+    g_mapping.right_stick_mode = RIGHT_STICK_MODE_BUTTONS;
+    g_mapping.l2_button        = PSP_CTRL_LEFT;
+    g_mapping.r2_button        = PSP_CTRL_RIGHT;
+    g_mapping.rs_up_button     = PSP_CTRL_TRIANGLE;
+    g_mapping.rs_down_button   = PSP_CTRL_CROSS;
+    g_mapping.rs_left_button   = PSP_CTRL_SQUARE;
+    g_mapping.rs_right_button  = PSP_CTRL_CIRCLE;
+    g_mapping.l3_button        = PSP_CTRL_DOWN;
+    g_mapping.r3_button        = PSP_CTRL_UP;
+}
+
+static int mapping_button_supported(uint32_t button)
+{
+    switch (button) {
+        case 0:
+        case PSP_CTRL_CROSS:
+        case PSP_CTRL_CIRCLE:
+        case PSP_CTRL_SQUARE:
+        case PSP_CTRL_TRIANGLE:
+        case PSP_CTRL_UP:
+        case PSP_CTRL_DOWN:
+        case PSP_CTRL_LEFT:
+        case PSP_CTRL_RIGHT:
+        case PSP_CTRL_LTRIGGER:
+        case PSP_CTRL_RTRIGGER:
+        case PSP_CTRL_START:
+        case PSP_CTRL_SELECT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int legacy_mapping_is_factory_default(const ButtonMappingV1 *m)
+{
+    return m &&
+           m->l2_button       == PSP_CTRL_CROSS &&
+           m->r2_button       == PSP_CTRL_SQUARE &&
+           m->rs_up_button    == PSP_CTRL_UP &&
+           m->rs_down_button  == PSP_CTRL_DOWN &&
+           m->rs_left_button  == PSP_CTRL_LEFT &&
+           m->rs_right_button == PSP_CTRL_RIGHT &&
+           m->l3_button       == PSP_CTRL_TRIANGLE &&
+           m->r3_button       == PSP_CTRL_CIRCLE;
+}
+
+static void sanitize_mapping_button(uint32_t *button, uint32_t fallback, const char *name)
+{
+    uint32_t replacement = fallback;
+    if (!button)
+        return;
+
+    if (g_mapping.modifier_button != 0 && replacement == g_mapping.modifier_button)
+        replacement = 0;
+
+    if (!mapping_button_supported(*button)) {
+        diag_log_write("INP", "Mapping %s invalid 0x%08X -> 0x%08X",
+                       name, *button, replacement);
+        *button = replacement;
+    }
+
+    if (g_mapping.modifier_button != 0 && *button == g_mapping.modifier_button) {
+        diag_log_write("INP", "Mapping %s matched modifier 0x%08X -> 0x%08X",
+                       name, *button, replacement);
+        *button = replacement;
+    }
+}
+
+static void sanitize_mapping(void)
+{
+    g_mapping.version = BUTTON_MAPPING_VERSION;
+
+    if (!mapping_button_supported(g_mapping.modifier_button)) {
+        diag_log_write("INP", "Mapping modifier invalid 0x%08X -> 0x%08X",
+                       g_mapping.modifier_button, PSP_CTRL_LTRIGGER);
+        g_mapping.modifier_button = PSP_CTRL_LTRIGGER;
+    }
+
+    if (g_mapping.right_stick_mode > RIGHT_STICK_MODE_ANALOG_NUB) {
+        diag_log_write("INP", "Mapping right-stick mode invalid %u -> %u",
+                       g_mapping.right_stick_mode, RIGHT_STICK_MODE_BUTTONS);
+        g_mapping.right_stick_mode = RIGHT_STICK_MODE_BUTTONS;
+    }
+
+    sanitize_mapping_button(&g_mapping.l2_button,       PSP_CTRL_LEFT,     "LT");
+    sanitize_mapping_button(&g_mapping.r2_button,       PSP_CTRL_RIGHT,    "RT");
+    sanitize_mapping_button(&g_mapping.rs_up_button,    PSP_CTRL_TRIANGLE, "RS_UP");
+    sanitize_mapping_button(&g_mapping.rs_down_button,  PSP_CTRL_CROSS,    "RS_DOWN");
+    sanitize_mapping_button(&g_mapping.rs_left_button,  PSP_CTRL_SQUARE,   "RS_LEFT");
+    sanitize_mapping_button(&g_mapping.rs_right_button, PSP_CTRL_CIRCLE,   "RS_RIGHT");
+    sanitize_mapping_button(&g_mapping.l3_button,       PSP_CTRL_DOWN,     "L3");
+    sanitize_mapping_button(&g_mapping.r3_button,       PSP_CTRL_UP,       "R3");
+}
+
+static void log_mapping(const char *source)
+{
+    diag_log_write("INP",
+                   "Mapping %s: ver=%u mod=0x%08X rsMode=%u LT=0x%08X RT=0x%08X RSU=0x%08X RSD=0x%08X RSL=0x%08X RSR=0x%08X L3=0x%08X R3=0x%08X",
+                   source ? source : "load",
+                   g_mapping.version,
+                   g_mapping.modifier_button,
+                   g_mapping.right_stick_mode,
+                   g_mapping.l2_button,
+                   g_mapping.r2_button,
+                   g_mapping.rs_up_button,
+                   g_mapping.rs_down_button,
+                   g_mapping.rs_left_button,
+                   g_mapping.rs_right_button,
+                   g_mapping.l3_button,
+                   g_mapping.r3_button);
 }
 
 static void load_mapping(void)
 {
     SceUID fd;
+    int read_len;
     set_default_mapping();
 
     fd = sceIoOpen(MAP_CFG_PATH, PSP_O_RDONLY, 0);
+    if (fd < 0) {
+        log_mapping("defaults");
+        g_mapping_loaded = 1;
+        return;
+    }
     if (fd < 0) return; /* no file — use defaults */
 
     /* File is a raw struct dump for simplicity */
-    sceIoRead(fd, &g_mapping, sizeof(g_mapping));
+    read_len = sceIoRead(fd, &g_mapping, sizeof(g_mapping));
     sceIoClose(fd);
+
+    if (read_len == (int)sizeof(ButtonMappingV1)) {
+        ButtonMappingV1 legacy;
+        memcpy(&legacy, &g_mapping, sizeof(legacy));
+        if (legacy_mapping_is_factory_default(&legacy)) {
+            set_default_mapping();
+            diag_log_write("INP", "Migrated legacy factory map.cfg to v2 defaults");
+        } else {
+            set_default_mapping();
+            g_mapping.l2_button       = legacy.l2_button;
+            g_mapping.r2_button       = legacy.r2_button;
+            g_mapping.rs_up_button    = legacy.rs_up_button;
+            g_mapping.rs_down_button  = legacy.rs_down_button;
+            g_mapping.rs_left_button  = legacy.rs_left_button;
+            g_mapping.rs_right_button = legacy.rs_right_button;
+            g_mapping.l3_button       = legacy.l3_button;
+            g_mapping.r3_button       = legacy.r3_button;
+            diag_log_write("INP", "Loaded legacy custom map.cfg (%d bytes)", read_len);
+        }
+    } else if (read_len != (int)sizeof(g_mapping)) {
+        diag_log_write("INP", "Ignoring malformed map.cfg size=%d expected=%u",
+                       read_len, (unsigned int)sizeof(g_mapping));
+        set_default_mapping();
+    }
+
+    sanitize_mapping();
+    log_mapping("loaded");
+    g_mapping_loaded = 1;
 }
 
 void input_save_mapping(void)
 {
     SceUID fd;
+    g_mapping.version = BUTTON_MAPPING_VERSION;
+    sanitize_mapping();
     sceIoMkdir("ms0:/moonlight", 0777);
     fd = sceIoOpen(MAP_CFG_PATH,
                    PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd < 0) return;
     sceIoWrite(fd, &g_mapping, sizeof(g_mapping));
     sceIoClose(fd);
+    g_mapping_loaded = 1;
 }
 
 void button_mapping_get(ButtonMapping *mapping) {
+    if (!g_mapping_loaded) {
+        load_mapping();
+    }
     if (mapping) *mapping = g_mapping;
 }
 
@@ -216,6 +383,35 @@ static inline void put_be32(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)((value >> 16) & 0xFF);
     dst[2] = (uint8_t)((value >> 8) & 0xFF);
     dst[3] = (uint8_t)(value & 0xFF);
+}
+
+static inline int16_t zero_deadzone_axis(int16_t value)
+{
+    if (value > -RSTICK_ANALOG_DEADZONE && value < RSTICK_ANALOG_DEADZONE)
+        return 0;
+    return value;
+}
+
+static void consume_psp_button(uint32_t psp_button, uint16_t *button_flags)
+{
+    if (!button_flags)
+        return;
+
+    switch (psp_button) {
+        case PSP_CTRL_CROSS:    *button_flags &= ~ML_A; break;
+        case PSP_CTRL_CIRCLE:   *button_flags &= ~ML_B; break;
+        case PSP_CTRL_SQUARE:   *button_flags &= ~ML_X; break;
+        case PSP_CTRL_TRIANGLE: *button_flags &= ~ML_Y; break;
+        case PSP_CTRL_START:    *button_flags &= ~ML_START; break;
+        case PSP_CTRL_SELECT:   *button_flags &= ~ML_BACK; break;
+        case PSP_CTRL_LTRIGGER: *button_flags &= ~ML_LB; break;
+        case PSP_CTRL_RTRIGGER: *button_flags &= ~ML_RB; break;
+        case PSP_CTRL_UP:       *button_flags &= ~ML_DPAD_UP; break;
+        case PSP_CTRL_DOWN:     *button_flags &= ~ML_DPAD_DOWN; break;
+        case PSP_CTRL_LEFT:     *button_flags &= ~ML_DPAD_LEFT; break;
+        case PSP_CTRL_RIGHT:    *button_flags &= ~ML_DPAD_RIGHT; break;
+        default: break;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -271,90 +467,85 @@ static void build_packet(uint8_t *buf, uint16_t buttons,
     put_le16(&buf[32], 0x0055);          /* tailB */
 }
 
-/* ------------------------------------------------------------------ *
- * apply_button_mapper
- *
- * When L-trigger is held, intercept mapped buttons and produce
- * virtual L2/R2 triggers and right-stick axes.  Matched PSP buttons
- * are consumed (removed from button_flags) so they are not also sent
- * as LB or D-pad inputs.
- * ------------------------------------------------------------------ */
-static void apply_button_mapper(uint32_t psp_buttons,
-                                uint16_t *button_flags,
-                                uint8_t  *lt, uint8_t  *rt,
-                                int16_t  *rsx, int16_t *rsy)
+static void apply_button_mapper_v2(uint32_t psp_buttons,
+                                   int16_t *lsx, int16_t *lsy,
+                                   uint16_t *button_flags,
+                                   uint8_t  *lt, uint8_t  *rt,
+                                   int16_t  *rsx, int16_t *rsy)
 {
+    uint32_t modifier = g_mapping.modifier_button;
+    int combo_active = 0;
+
     *lt  = 0;
     *rt  = 0;
     *rsx = 0;
     *rsy = 0;
 
-    if (!(psp_buttons & PSP_CTRL_LTRIGGER))
-        return; /* L not held — no combos active */
+    if (modifier == 0 || !(psp_buttons & modifier))
+        return;
 
-    /* L is held — remove LB from flags (it is now the modifier) */
-    *button_flags &= ~ML_LB;
+    if (g_mapping.right_stick_mode == RIGHT_STICK_MODE_ANALOG_NUB) {
+        int16_t ax = zero_deadzone_axis(*lsx);
+        int16_t ay = zero_deadzone_axis(*lsy);
+        if (ax != 0 || ay != 0) {
+            *rsx = ax;
+            *rsy = ay;
+            *lsx = 0;
+            *lsy = 0;
+            combo_active = 1;
+        }
+    } else {
+        if (g_mapping.rs_up_button && (psp_buttons & g_mapping.rs_up_button)) {
+            *rsy = RSTICK_MAGNITUDE;
+            consume_psp_button(g_mapping.rs_up_button, button_flags);
+            combo_active = 1;
+        }
+        if (g_mapping.rs_down_button && (psp_buttons & g_mapping.rs_down_button)) {
+            *rsy = -RSTICK_MAGNITUDE;
+            consume_psp_button(g_mapping.rs_down_button, button_flags);
+            combo_active = 1;
+        }
+        if (g_mapping.rs_left_button && (psp_buttons & g_mapping.rs_left_button)) {
+            *rsx = -RSTICK_MAGNITUDE;
+            consume_psp_button(g_mapping.rs_left_button, button_flags);
+            combo_active = 1;
+        }
+        if (g_mapping.rs_right_button && (psp_buttons & g_mapping.rs_right_button)) {
+            *rsx = RSTICK_MAGNITUDE;
+            consume_psp_button(g_mapping.rs_right_button, button_flags);
+            combo_active = 1;
+        }
+    }
 
-    /* Virtual L2 */
-    if (psp_buttons & g_mapping.l2_button) {
+    if (g_mapping.l2_button && (psp_buttons & g_mapping.l2_button)) {
         *lt = 0xFF;
-        /* Consume the PSP button so it is not sent as a face button */
-        if (g_mapping.l2_button == PSP_CTRL_CROSS)    *button_flags &= ~ML_A;
-        if (g_mapping.l2_button == PSP_CTRL_CIRCLE)   *button_flags &= ~ML_B;
-        if (g_mapping.l2_button == PSP_CTRL_SQUARE)   *button_flags &= ~ML_X;
-        if (g_mapping.l2_button == PSP_CTRL_TRIANGLE) *button_flags &= ~ML_Y;
+        consume_psp_button(g_mapping.l2_button, button_flags);
+        combo_active = 1;
     }
 
-    /* Virtual R2 */
-    if (psp_buttons & g_mapping.r2_button) {
+    if (g_mapping.r2_button && (psp_buttons & g_mapping.r2_button)) {
         *rt = 0xFF;
-        if (g_mapping.r2_button == PSP_CTRL_CROSS)    *button_flags &= ~ML_A;
-        if (g_mapping.r2_button == PSP_CTRL_CIRCLE)   *button_flags &= ~ML_B;
-        if (g_mapping.r2_button == PSP_CTRL_SQUARE)   *button_flags &= ~ML_X;
-        if (g_mapping.r2_button == PSP_CTRL_TRIANGLE) *button_flags &= ~ML_Y;
+        consume_psp_button(g_mapping.r2_button, button_flags);
+        combo_active = 1;
     }
 
-    /* Right stick emulation via L+D-pad */
-    if (psp_buttons & g_mapping.rs_up_button) {
-        *rsy =  RSTICK_MAGNITUDE;
-        *button_flags &= ~ML_DPAD_UP;
-    }
-    if (psp_buttons & g_mapping.rs_down_button) {
-        *rsy = -RSTICK_MAGNITUDE;
-        *button_flags &= ~ML_DPAD_DOWN;
-    }
-    if (psp_buttons & g_mapping.rs_left_button) {
-        *rsx = -RSTICK_MAGNITUDE;
-        *button_flags &= ~ML_DPAD_LEFT;
-    }
-    if (psp_buttons & g_mapping.rs_right_button) {
-        *rsx =  RSTICK_MAGNITUDE;
-        *button_flags &= ~ML_DPAD_RIGHT;
-    }
-
-    /* Virtual L3 (left stick click) via L+Triangle */
-    if (psp_buttons & g_mapping.l3_button) {
+    if (g_mapping.l3_button && (psp_buttons & g_mapping.l3_button)) {
         *button_flags |= ML_LS_CLK;
-        if (g_mapping.l3_button == PSP_CTRL_CROSS)    *button_flags &= ~ML_A;
-        if (g_mapping.l3_button == PSP_CTRL_CIRCLE)   *button_flags &= ~ML_B;
-        if (g_mapping.l3_button == PSP_CTRL_SQUARE)   *button_flags &= ~ML_X;
-        if (g_mapping.l3_button == PSP_CTRL_TRIANGLE) *button_flags &= ~ML_Y;
+        consume_psp_button(g_mapping.l3_button, button_flags);
+        combo_active = 1;
     }
 
-    /* Virtual R3 (right stick click) via L+Circle */
-    if (psp_buttons & g_mapping.r3_button) {
+    if (g_mapping.r3_button && (psp_buttons & g_mapping.r3_button)) {
         *button_flags |= ML_RS_CLK;
-        if (g_mapping.r3_button == PSP_CTRL_CROSS)    *button_flags &= ~ML_A;
-        if (g_mapping.r3_button == PSP_CTRL_CIRCLE)   *button_flags &= ~ML_B;
-        if (g_mapping.r3_button == PSP_CTRL_SQUARE)   *button_flags &= ~ML_X;
-        if (g_mapping.r3_button == PSP_CTRL_TRIANGLE) *button_flags &= ~ML_Y;
+        consume_psp_button(g_mapping.r3_button, button_flags);
+        combo_active = 1;
+    }
+
+    if (combo_active) {
+        consume_psp_button(modifier, button_flags);
     }
 }
 
-
-/* ------------------------------------------------------------------ *
- * Convert raw PSP button bitmask → Moonlight button flags
- * ------------------------------------------------------------------ */
 static uint16_t translate_buttons(uint32_t psp_buttons)
 {
     uint16_t flags = 0;
@@ -424,7 +615,34 @@ static void send_mouse_move(int16_t dx, int16_t dy)
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
     if (ret <= 0) {
         diag_log_write("INP", "Mouse move FAILED: ret=%d dx=%d dy=%d", ret, dx, dy);
+    } else {
+        static unsigned int s_mouse_move_log_count = 0;
+        if ((s_mouse_move_log_count++ & 31u) == 0u) {
+            diag_log_write("INP", "Mouse move: dx=%d dy=%d ret=%d", dx, dy, ret);
+        }
     }
+}
+
+static int browser_mouse_delta(int axis)
+{
+    int sign = 1;
+    int mag = axis;
+    if (mag < 0) {
+        sign = -1;
+        mag = -mag;
+    }
+
+    if (mag <= MOUSE_DEADZONE)
+        return 0;
+
+    mag -= MOUSE_DEADZONE;
+
+    int delta = (mag * MOUSE_BASE_SPEED) / MOUSE_AXIS_RANGE;
+    delta += (mag * mag * MOUSE_ACCEL_SPEED) / (MOUSE_AXIS_RANGE * MOUSE_AXIS_RANGE);
+    if (delta < 1)
+        delta = 1;
+
+    return sign * delta;
 }
 
 /* ------------------------------------------------------------------ *
@@ -443,6 +661,8 @@ static void send_mouse_button(int pressed, uint8_t button)
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
     if (ret <= 0) {
         diag_log_write("INP", "Mouse button FAILED: ret=%d pressed=%d btn=%d", ret, pressed, button);
+    } else {
+        diag_log_write("INP", "Mouse button: pressed=%d btn=%d ret=%d", pressed, button, ret);
     }
 }
 
@@ -457,27 +677,42 @@ static void send_controller_arrival(void)
     pkt[9] = CONTROLLER_TYPE_XBOX;                       /* controllerType = Xbox */
     put_le32(&pkt[10], SUPPORTED_BUTTON_FLAGS);          /* supportedButtonFlags */
     put_le16(&pkt[14], CONTROLLER_CAP_ANALOG_TRIGGERS);  /* capabilities */
+#ifdef RETAIL_BUILD
+    control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
+#else
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
     diag_log_write("INP", "Controller arrival sent: type=Xbox caps=0x%04X ret=%d",
                    CONTROLLER_CAP_ANALOG_TRIGGERS, ret);
+#endif
 }
 
 /* ── Phase 3.2: Controller Battery Event ────────────────────────── */
 static void send_controller_battery(void)
 {
-    int charging = scePowerIsBatteryCharging();
-    int percent  = scePowerGetBatteryLifePercent();
+    int raw_charging = scePowerIsBatteryCharging();
+    int charging = (raw_charging > 0) ? 1 : 0;
+    int battery_exists = scePowerIsBatteryExist();
+    int raw_percent = scePowerGetBatteryLifePercent();
+    int percent = raw_percent;
     uint8_t state;
 
-    if (percent < 0) {
+    if (battery_exists == 0) {
         state = BATTERY_STATE_NOT_PRESENT;
         percent = 0;
+    } else if (percent < 0 || percent > 100) {
+        state = g_last_battery_state;
+        percent = g_last_battery_percent;
     } else if (charging) {
         state = (percent >= 100) ? BATTERY_STATE_FULL : BATTERY_STATE_CHARGING;
     } else {
         state = BATTERY_STATE_DISCHARGING;
     }
+    if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
+    if (state != BATTERY_STATE_NOT_PRESENT && state != BATTERY_STATE_UNKNOWN) {
+        g_last_battery_state = state;
+        g_last_battery_percent = percent;
+    }
 
     uint8_t pkt[11];
     memset(pkt, 0, sizeof(pkt));
@@ -487,9 +722,13 @@ static void send_controller_battery(void)
     pkt[9] = state;                                  /* batteryState */
     pkt[10] = (uint8_t)percent;                      /* batteryPercentage */
 
+#ifdef RETAIL_BUILD
+    control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
+#else
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
-    diag_log_write("INP", "Battery report: state=%d pct=%d charging=%d ret=%d",
-                   state, percent, charging, ret);
+    diag_log_write("INP", "Battery report: state=%d pct=%d charging=%d rawCharging=%d rawPct=%d exists=%d ret=%d",
+                   state, percent, charging, raw_charging, raw_percent, battery_exists, ret);
+#endif
 }
 
 /* ── Phase 3.3: Keyboard Event Sender ───────────────────────────── */
@@ -505,9 +744,13 @@ void input_send_keyboard_event(uint8_t key_action, uint16_t vk_code, uint8_t mod
     put_le16(&pkt[14], vk_code);             /* Windows VK code */
     pkt[16] = modifiers;                     /* modifier bitmask */
 
+#ifdef RETAIL_BUILD
+    control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_KEYBOARD);
+#else
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_KEYBOARD);
     diag_log_write("INP", "Keyboard event: action=%d vk=0x%04X mod=0x%02X ret=%d",
                    key_action, vk_code, modifiers, ret);
+#endif
 }
 
 /* Send a complete key tap (down + up) for a VK code */
@@ -609,6 +852,12 @@ void input_init(int sock)
 void input_poll_and_send(void)
 {
     SceCtrlData pad;
+    int browser_mode;
+    int browser_dx = 0;
+    int browser_dy = 0;
+    int scroll_combo = 0;
+    int browser_osk_combo = 0;
+    int browser_hud_combo = 0;
 
     if (!g_initialized)
         return;
@@ -633,8 +882,49 @@ void input_poll_and_send(void)
         pad.Buttons |= g_remote_buttons;
     }
 
+    if (g_remote_analog_active) {
+        unsigned int lx = g_remote_analog_lx;
+        unsigned int ly = g_remote_analog_ly;
+        if (lx > 255) lx = 255;
+        if (ly > 255) ly = 255;
+        pad.Lx = (unsigned char)lx;
+        pad.Ly = (unsigned char)ly;
+    }
+
+    browser_mode = (g_psp_config.controlMode == CONTROL_MODE_BROWSER);
+    {
+        int stream_exit_combo = (pad.Buttons & PSP_CTRL_START) &&
+                                (pad.Buttons & PSP_CTRL_SELECT);
+        int hud_combo = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                        (pad.Buttons & PSP_CTRL_UP);
+        if (stream_exit_combo || hud_combo) {
+            if (!g_suppress_combo_prev) {
+                diag_log_write("INP",
+                               "App combo suppress host input: exit=%d hud=%d btn=0x%08X",
+                               stream_exit_combo ? 1 : 0,
+                               hud_combo ? 1 : 0,
+                               pad.Buttons);
+            }
+            g_suppress_combo_prev = 1;
+            return;
+        }
+        g_suppress_combo_prev = 0;
+    }
+    if (browser_mode) {
+        scroll_combo = (pad.Buttons & PSP_CTRL_LTRIGGER) &&
+                       (pad.Buttons & (PSP_CTRL_UP | PSP_CTRL_DOWN));
+        browser_osk_combo = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                            (pad.Buttons & PSP_CTRL_TRIANGLE);
+        browser_hud_combo = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                            (pad.Buttons & PSP_CTRL_UP);
+        int ax = (int)pad.Lx - 128;
+        int ay = (int)pad.Ly - 128;
+        browser_dx = browser_mouse_delta(ax);
+        browser_dy = browser_mouse_delta(ay);
+    }
+
     /* Only transmit when state actually changed */
-    if (!state_changed(&pad))
+    if (!state_changed(&pad) && !(browser_mode && (browser_dx != 0 || browser_dy != 0)))
         return;
 
     /* Rate-limit analog input to ~30 Hz max (33ms) to avoid ENOBUFS.
@@ -655,11 +945,11 @@ void input_poll_and_send(void)
 
     /* Log button transitions with timestamps for latency analysis */
     if (pad.Buttons != g_prev.Buttons) {
-        diag_log_write("INP", "Button transition: 0x%08X -> 0x%08X (XOR: 0x%08X)", 
+        diag_log_write("INP", "Button transition: 0x%08X -> 0x%08X (XOR: 0x%08X)",
                        g_prev.Buttons, pad.Buttons, pad.Buttons ^ g_prev.Buttons);
     }
 
-    if (g_psp_config.controlMode == CONTROL_MODE_BROWSER) {
+    if (browser_mode) {
         /* ---- Browser Mode: analog stick → mouse, L/R → MB1/MB2 ---- */
 
         /* Phase 3.4: L+DpadUp/Down → scroll events in browser mode */
@@ -679,8 +969,7 @@ void input_poll_and_send(void)
          * loop which stalls the stream. Instead, send Enter as a quick
          * keyboard action for common desktop use (confirm dialogs, etc). */
         {
-            int osk_now = (pad.Buttons & PSP_CTRL_RTRIGGER) &&
-                          (pad.Buttons & PSP_CTRL_TRIANGLE);
+            int osk_now = browser_osk_combo;
             if (osk_now && !g_osk_trigger_prev) {
                 send_key_tap(0x0D, 0);  /* VK_RETURN */
                 diag_log_write("INP", "R+Triangle: sent Enter key");
@@ -689,41 +978,70 @@ void input_poll_and_send(void)
         }
 
         /* Analog stick → relative mouse delta with deadzone */
-        int ax = (int)pad.Lx - 128;
-        int ay = (int)pad.Ly - 128;
-        #define MOUSE_DEADZONE 20
-        int dx = (ax > MOUSE_DEADZONE || ax < -MOUSE_DEADZONE) ? (ax * MOUSE_SENSITIVITY / 128) : 0;
-        int dy = (ay > MOUSE_DEADZONE || ay < -MOUSE_DEADZONE) ? (ay * MOUSE_SENSITIVITY / 128) : 0;
-        #undef MOUSE_DEADZONE
+        int dx = browser_dx;
+        int dy = browser_dy;
         if (dx != 0 || dy != 0) {
             send_mouse_move((int16_t)dx, (int16_t)dy);
         }
 
         /* L trigger → left mouse button (edge-triggered) */
-        int l_now = (pad.Buttons & PSP_CTRL_LTRIGGER) ? 1 : 0;
+        int l_now = ((pad.Buttons & PSP_CTRL_LTRIGGER) && !scroll_combo) ? 1 : 0;
         if (l_now && !g_mouse_l_down) send_mouse_button(1, MOUSE_BUTTON_LEFT);
         else if (!l_now && g_mouse_l_down) send_mouse_button(0, MOUSE_BUTTON_LEFT);
         g_mouse_l_down = l_now;
 
         /* R trigger → right mouse button (edge-triggered) */
-        int r_now = (pad.Buttons & PSP_CTRL_RTRIGGER) ? 1 : 0;
+        int r_now = ((pad.Buttons & PSP_CTRL_RTRIGGER) &&
+                     !browser_osk_combo && !browser_hud_combo) ? 1 : 0;
         if (r_now && !g_mouse_r_down) send_mouse_button(1, MOUSE_BUTTON_RIGHT);
         else if (!r_now && g_mouse_r_down) send_mouse_button(0, MOUSE_BUTTON_RIGHT);
         g_mouse_r_down = r_now;
 
-        /* D-pad and face buttons still send as gamepad for in-browser navigation.
+        /* D-pad and face buttons send keyboard taps for browser navigation.
          * Only send when buttons changed — analog-only changes are handled by
-         * mouse move above.  Sending redundant gamepad packets on every analog
-         * tick doubles WiFi traffic and can overflow the 802.11b send buffer. */
+         * mouse movement is handled separately above. */
         if (pad.Buttons != g_prev.Buttons) {
-            uint16_t buttons = translate_buttons(pad.Buttons);
-            /* Strip L/R from gamepad since they're mouse buttons now */
-            buttons &= ~(ML_LB | ML_RB);
-            uint8_t packet[34];
-            build_packet(packet, buttons, 0, 0,
-                         0, 0,  /* no left stick in browser mode */
-                         0, 0); /* no right stick */
-            control_stream_send_input(packet, sizeof(packet), CTRL_CHANNEL_GAMEPAD0);
+            unsigned int pressed = pad.Buttons & ~g_prev.Buttons;
+            if (!scroll_combo && !browser_hud_combo && (pressed & PSP_CTRL_UP)) {
+                send_key_tap(0x26, 0);  /* VK_UP */
+                diag_log_write("INP", "Browser key: Up");
+            }
+            if (!scroll_combo && (pressed & PSP_CTRL_DOWN)) {
+                send_key_tap(0x28, 0);  /* VK_DOWN */
+                diag_log_write("INP", "Browser key: Down");
+            }
+            if (pressed & PSP_CTRL_LEFT) {
+                send_key_tap(0x25, 0);  /* VK_LEFT */
+                diag_log_write("INP", "Browser key: Left");
+            }
+            if (pressed & PSP_CTRL_RIGHT) {
+                send_key_tap(0x27, 0);  /* VK_RIGHT */
+                diag_log_write("INP", "Browser key: Right");
+            }
+            if (pressed & PSP_CTRL_CROSS) {
+                send_key_tap(0x0D, 0);  /* VK_RETURN */
+                diag_log_write("INP", "Browser key: Enter");
+            }
+            if (pressed & PSP_CTRL_CIRCLE) {
+                send_key_tap(0x1B, 0);  /* VK_ESCAPE */
+                diag_log_write("INP", "Browser key: Escape");
+            }
+            if (!browser_osk_combo && (pressed & PSP_CTRL_TRIANGLE)) {
+                send_key_tap(0x09, 0);  /* VK_TAB */
+                diag_log_write("INP", "Browser key: Tab");
+            }
+            if (pressed & PSP_CTRL_SQUARE) {
+                send_key_tap(0x20, 0);  /* VK_SPACE */
+                diag_log_write("INP", "Browser key: Space");
+            }
+            if (pressed & PSP_CTRL_START) {
+                send_key_tap(0x0D, 0);  /* VK_RETURN */
+                diag_log_write("INP", "Browser key: Start/Enter");
+            }
+            if (pressed & PSP_CTRL_SELECT) {
+                send_key_tap(0x1B, 0);  /* VK_ESCAPE */
+                diag_log_write("INP", "Browser key: Select/Escape");
+            }
         }
     } else {
         /* ---- Xbox Mode: full gamepad with L+combo mapper ---- */
@@ -746,7 +1064,7 @@ void input_poll_and_send(void)
         uint8_t lt, rt;
 
         /* Apply button mapper: L+combo → virtual L2/R2/right-stick/L3/R3 */
-        apply_button_mapper(pad.Buttons, &buttons, &lt, &rt, &rsx, &rsy);
+        apply_button_mapper_v2(pad.Buttons, &lsx, &lsy, &buttons, &lt, &rt, &rsx, &rsy);
 
         /* Assemble the 34-byte NV_MULTI_CONTROLLER_PACKET */
         uint8_t packet[34];
@@ -758,6 +1076,13 @@ void input_poll_and_send(void)
             if (ret <= 0) {
                 diag_log_write("INP", "Send FAILED: ret=%d btn=0x%04X", ret, buttons);
             }
+#ifndef RETAIL_BUILD
+            else if (pad.Buttons != g_prev.Buttons) {
+                diag_log_write("INP",
+                               "GAMEPAD send: psp=0x%08X btn=0x%04X lt=%u rt=%u ls=%d,%d rs=%d,%d ret=%d",
+                               pad.Buttons, buttons, lt, rt, lsx, lsy, rsx, rsy, ret);
+            }
+#endif
         }
     }
 

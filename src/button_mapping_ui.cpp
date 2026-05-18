@@ -22,7 +22,7 @@ extern "C" {
 #define ITEM_H        44
 #define ITEM_PAD      6   /* step=50: 4 items end at y=235 unscaled; scaled 1.05→y=236, 8px gap to footer */
 
-#define NUM_MAPPINGS  8
+#define NUM_MAPPINGS  10
 
 static int s_selected = 0;
 static float s_scroll_curr = 0.0f;
@@ -31,14 +31,16 @@ static ButtonMapping s_mapping;
 
 static const char *getItemName(int index) {
     switch (index) {
-        case 0: return "Virtual L2 Trigger";
-        case 1: return "Virtual R2 Trigger";
+        case 0: return "Combo Modifier";
+        case 1: return "Right Stick Source";
         case 2: return "Right Stick Up";
         case 3: return "Right Stick Down";
         case 4: return "Right Stick Left";
         case 5: return "Right Stick Right";
-        case 6: return "Left Stick Click (L3)";
-        case 7: return "Right Stick Click (R3)";
+        case 6: return "Virtual LT Trigger";
+        case 7: return "Virtual RT Trigger";
+        case 8: return "Left Stick Click (L3)";
+        case 9: return "Right Stick Click (R3)";
     }
     return "";
 }
@@ -62,16 +64,42 @@ static const char *getPSPButtonToken(uint32_t btn) {
 
 static uint32_t *getMappedButtonPtr(int index) {
     switch(index) {
-        case 0: return &s_mapping.l2_button;
-        case 1: return &s_mapping.r2_button;
+        case 0: return &s_mapping.modifier_button;
         case 2: return &s_mapping.rs_up_button;
         case 3: return &s_mapping.rs_down_button;
         case 4: return &s_mapping.rs_left_button;
         case 5: return &s_mapping.rs_right_button;
-        case 6: return &s_mapping.l3_button;
-        case 7: return &s_mapping.r3_button;
+        case 6: return &s_mapping.l2_button;
+        case 7: return &s_mapping.r2_button;
+        case 8: return &s_mapping.l3_button;
+        case 9: return &s_mapping.r3_button;
     }
     return NULL;
+}
+
+static const char *getRightStickSourceText(void) {
+    return (s_mapping.right_stick_mode == RIGHT_STICK_MODE_ANALOG_NUB) ? "{AN} Nub" : "Buttons";
+}
+
+static void toggleRightStickSource(void) {
+    s_mapping.right_stick_mode =
+        (s_mapping.right_stick_mode == RIGHT_STICK_MODE_ANALOG_NUB)
+            ? RIGHT_STICK_MODE_BUTTONS
+            : RIGHT_STICK_MODE_ANALOG_NUB;
+}
+
+static void setDefaultMapping(void) {
+    s_mapping.version          = BUTTON_MAPPING_VERSION;
+    s_mapping.modifier_button  = PSP_CTRL_LTRIGGER;
+    s_mapping.right_stick_mode = RIGHT_STICK_MODE_BUTTONS;
+    s_mapping.l2_button        = PSP_CTRL_LEFT;
+    s_mapping.r2_button        = PSP_CTRL_RIGHT;
+    s_mapping.rs_up_button     = PSP_CTRL_TRIANGLE;
+    s_mapping.rs_down_button   = PSP_CTRL_CROSS;
+    s_mapping.rs_left_button   = PSP_CTRL_SQUARE;
+    s_mapping.rs_right_button  = PSP_CTRL_CIRCLE;
+    s_mapping.l3_button        = PSP_CTRL_DOWN;
+    s_mapping.r3_button        = PSP_CTRL_UP;
 }
 
 static float s_target_camera = 0.0f;
@@ -90,10 +118,10 @@ static void update_animations(void) {
 
 static int tile_screen_pos(int idx, int *out_x, int *out_y) {
     int start_y = 41; /* Starts after header height + padding */
-    
+
     *out_x = (SCREEN_W - ITEM_W) / 2;
     *out_y = start_y + (int)(((float)idx - s_scroll_curr) * (float)(ITEM_H + ITEM_PAD));
-    
+
     if (*out_y + ITEM_H < 0) return 0;
     if (*out_y > SCREEN_H) return 0;
     return 1;
@@ -104,7 +132,7 @@ static uint32_t prompt_mapping(int index) {
     SceCtrlData pad, prev;
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    
+
     /* Wait for release */
     do {
         sceCtrlPeekBufferPositive(&pad, 1);
@@ -136,13 +164,13 @@ static uint32_t prompt_mapping(int index) {
 
         ui_begin_frame();
         ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
-        
+
         ui_draw_rect_rounded((SCREEN_W - 300) / 2, (SCREEN_H - 100) / 2, 300, 100, 12, UI_COL_PANEL);
         ui_draw_border((SCREEN_W - 300) / 2, (SCREEN_H - 100) / 2, 300, 100, 2, UI_COL_BORDER_FOC);
-        
+
         ui_draw_text_centered((float)SCREEN_W / 2, 0.0f, (float)(SCREEN_H / 2 - 10), g_ui_text_foc_color ? g_ui_text_foc_color : 0xFFFFFFFF, getItemName(index));
         ui_draw_text_centered((float)SCREEN_W / 2, 0.0f, (float)(SCREEN_H / 2 + 15), 0xFFDDDDDD, "Press new button to map...");
-        
+
         ui_end_frame();
     }
     return 0;
@@ -178,42 +206,49 @@ extern "C" void button_mapping_ui_run(void)
         if (pressed & PSP_CTRL_DOWN) {
             if (s_selected < NUM_MAPPINGS - 1) s_selected++;
         }
-        
+
+        if ((pressed & PSP_CTRL_LEFT) || (pressed & PSP_CTRL_RIGHT)) {
+            if (s_selected == 1) {
+                toggleRightStickSource();
+            }
+        }
+
         if (pressed & PSP_CTRL_CIRCLE) {
             button_mapping_set(&s_mapping);
             break; /* Back to settings menu */
         }
-        
+
         /* SQUARE: clear the focused mapping (disables that virtual button) */
         if (pressed & PSP_CTRL_SQUARE) {
-            uint32_t *ptr = getMappedButtonPtr(s_selected);
-            if (ptr) *ptr = 0;
+            if (s_selected == 1) {
+                s_mapping.right_stick_mode = RIGHT_STICK_MODE_BUTTONS;
+            } else {
+                uint32_t *ptr = getMappedButtonPtr(s_selected);
+                if (ptr) *ptr = 0;
+            }
         }
 
         /* SELECT: reset ALL mappings to factory defaults (confirm on O to persist) */
         if (pressed & PSP_CTRL_SELECT) {
-            s_mapping.l2_button       = PSP_CTRL_CROSS;
-            s_mapping.r2_button       = PSP_CTRL_SQUARE;
-            s_mapping.rs_up_button    = PSP_CTRL_UP;
-            s_mapping.rs_down_button  = PSP_CTRL_DOWN;
-            s_mapping.rs_left_button  = PSP_CTRL_LEFT;
-            s_mapping.rs_right_button = PSP_CTRL_RIGHT;
-            s_mapping.l3_button       = PSP_CTRL_TRIANGLE;
-            s_mapping.r3_button       = PSP_CTRL_CIRCLE;
+            setDefaultMapping();
         }
-        
+
         if (pressed & PSP_CTRL_CROSS) {
-            uint32_t new_btn = prompt_mapping(s_selected);
-            if (new_btn != 0) {
-                uint32_t *ptr = getMappedButtonPtr(s_selected);
-                if (ptr) *ptr = new_btn;
+            if (s_selected == 1) {
+                toggleRightStickSource();
+            } else {
+                uint32_t new_btn = prompt_mapping(s_selected);
+                if (new_btn != 0) {
+                    uint32_t *ptr = getMappedButtonPtr(s_selected);
+                    if (ptr) *ptr = new_btn;
+                }
+                /* Flush after prompt */
+                do {
+                    sceCtrlPeekBufferPositive(&pad, 1);
+                    sceKernelDelayThread(16667);
+                } while (pad.Buttons != 0);
+                prev = pad;
             }
-            /* Flush after prompt */
-            do {
-                sceCtrlPeekBufferPositive(&pad, 1);
-                sceKernelDelayThread(16667);
-            } while (pad.Buttons != 0);
-            prev = pad;
         }
 
         ui_begin_frame();
@@ -257,11 +292,19 @@ extern "C" void button_mapping_ui_run(void)
             ui_draw_text((float)(ox + 16), (float)(oy + th / 2 + 5), focused ? UI_COL_TEXT_FOCUS : UI_COL_TEXT, getItemName(i));
 
             // Draw Value (inline badge rendering, right portion of card)
-            uint32_t *ptr = getMappedButtonPtr(i);
-            const char *tok = ptr ? getPSPButtonToken(*ptr) : "?";
-            char map_text[32];
-            snprintf(map_text, sizeof(map_text), "{L} + %s", tok);
-            ui_draw_text_inline((float)(ox + tw - 90), (float)(oy + th / 2 + 5),
+            char map_text[48];
+            if (i == 1) {
+                snprintf(map_text, sizeof(map_text), "%s", getRightStickSourceText());
+            } else if (i == 0) {
+                uint32_t *ptr = getMappedButtonPtr(i);
+                snprintf(map_text, sizeof(map_text), "%s", ptr ? getPSPButtonToken(*ptr) : "?");
+            } else {
+                uint32_t *ptr = getMappedButtonPtr(i);
+                snprintf(map_text, sizeof(map_text), "%s+%s",
+                         getPSPButtonToken(s_mapping.modifier_button),
+                         ptr ? getPSPButtonToken(*ptr) : "?");
+            }
+            ui_draw_text_inline((float)(ox + tw - 118), (float)(oy + th / 2 + 5),
                                 focused ? UI_COL_TEXT_FOCUS : UI_COL_TEXT_DIM, map_text);
         }
 
@@ -274,7 +317,7 @@ extern "C" void button_mapping_ui_run(void)
         snprintf(progress, sizeof(progress), "%d / %d", s_selected + 1, NUM_MAPPINGS);
         ui_draw_text_right((float)(SCREEN_W - 18), 22.0f, UI_COL_TEXT_DIM, progress);
 
-        ui_draw_footer_hint("{X}: Map  {SQ}: Clear  {SE}: Defaults  {O}: Save");
+        ui_draw_footer_hint("{X}: Map  {LF}/{RF}: Src  {SQ}: Clear  {SE}: Defaults  {O}: Save");
         ui_end_frame();
     }
 }

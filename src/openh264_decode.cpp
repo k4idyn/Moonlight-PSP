@@ -20,7 +20,7 @@
  * Low-latency optimizations (requires our custom OpenH264 PSP port):
  *   - Single-threaded decode (DECODER_OPTION_NUM_OF_THREADS = 0)
  *   - Slice-based output via DecodeFrameNoDelay (immediate per-slice)
- *   - ERROR_CON_SLICE_COPY for fast error concealment without full re-decode
+ *   - Bounded frame-copy concealment for first-frame/startup continuity
  *   - No internal frame reordering (B-frames disabled at encoder)
  *   - Direct I420 plane access — zero memcpy to ME dispatch
  *
@@ -43,6 +43,7 @@ extern "C" {
 #include "me.h"
 #include "settings_menu.h"  /* PspConfig */
 #include "decode_flags.h"
+#include "runtime_telemetry.h"
 
 extern PspConfig g_psp_config;
 extern int control_stream_request_idr(void);
@@ -73,6 +74,10 @@ volatile int     g_idr_fully_decoded       = 0;
 volatile int     g_refs_corrupted          = 0;
 volatile int     g_current_frame_is_corrupt = 0;
 volatile int     g_decode_counters_reset_pending = 0;
+
+extern "C" {
+volatile u32     g_oh264_me_wait_us        = 0;
+}
 
 /* ============================================================================
  * BT.601 YUV420P → RGBA8888 — optimized low-latency conversion
@@ -108,6 +113,38 @@ static inline u8 clamp8_fast(int v)
     return (u8)v;
 }
 
+static inline int graded_luma_term(int y, int row, int col)
+{
+    static const signed char dither4x4[16] = {
+        -3,  1, -2,  2,
+         3, -1,  4,  0,
+        -2,  2, -3,  1,
+         4,  0,  3, -1
+    };
+
+    /* Renderer-only grade: PSP LCD plus low-bitrate streams look washed out
+     * with the standard 16 luma offset. A slightly deeper black point and a
+     * 76/64 luma gain preserve legal-range white without the old 82/64
+     * highlight clipping. UI/HUD never pass through this converter. */
+    int yy = y - 20 + dither4x4[((row & 3) << 2) | (col & 3)];
+    if (yy < 0) yy = 0;
+    if (yy > 235) yy = 235;
+    return 76 * yy;
+}
+
+static inline u32 pack_video_pixel(int c, int rv, int guv, int bu)
+{
+    return (u32)clamp8_fast((c + rv) >> 6)
+         | ((u32)clamp8_fast((c + guv) >> 6) << 8)
+         | ((u32)clamp8_fast((c + bu) >> 6) << 16)
+         | 0xFF000000u;
+}
+
+static inline int decode_state_is_pending_only(DECODING_STATE ds)
+{
+    return ds == dsErrorFree || ds == dsFramePending;
+}
+
 /* 2×2 block YUV420→RGBA with row-pair processing.
  * Processes 4 pixels per inner loop body (2 wide × 2 tall),
  * computing UV contribution once and reusing for all 4 pixels. */
@@ -138,32 +175,20 @@ static void yuv420_to_rgba_2x2(const u8 *y_plane, int y_stride,
             int bu  =  129 * uu;
 
             /* Top-left pixel (row, col) */
-            int c = 74 * ((int)yp0[col] - 16);
-            dst0[col] = (u32)clamp8_fast((c + rv)  >> 6)
-                      | ((u32)clamp8_fast((c + guv) >> 6) << 8)
-                      | ((u32)clamp8_fast((c + bu)  >> 6) << 16)
-                      | 0xFF000000u;
+            int c = graded_luma_term((int)yp0[col], row, col);
+            dst0[col] = pack_video_pixel(c, rv, guv, bu);
 
             /* Top-right pixel (row, col+1) */
-            c = 74 * ((int)yp0[col + 1] - 16);
-            dst0[col + 1] = (u32)clamp8_fast((c + rv)  >> 6)
-                          | ((u32)clamp8_fast((c + guv) >> 6) << 8)
-                          | ((u32)clamp8_fast((c + bu)  >> 6) << 16)
-                          | 0xFF000000u;
+            c = graded_luma_term((int)yp0[col + 1], row, col + 1);
+            dst0[col + 1] = pack_video_pixel(c, rv, guv, bu);
 
             /* Bottom-left pixel (row+1, col) */
-            c = 74 * ((int)yp1[col] - 16);
-            dst1[col] = (u32)clamp8_fast((c + rv)  >> 6)
-                      | ((u32)clamp8_fast((c + guv) >> 6) << 8)
-                      | ((u32)clamp8_fast((c + bu)  >> 6) << 16)
-                      | 0xFF000000u;
+            c = graded_luma_term((int)yp1[col], row + 1, col);
+            dst1[col] = pack_video_pixel(c, rv, guv, bu);
 
             /* Bottom-right pixel (row+1, col+1) */
-            c = 74 * ((int)yp1[col + 1] - 16);
-            dst1[col + 1] = (u32)clamp8_fast((c + rv)  >> 6)
-                          | ((u32)clamp8_fast((c + guv) >> 6) << 8)
-                          | ((u32)clamp8_fast((c + bu)  >> 6) << 16)
-                          | 0xFF000000u;
+            c = graded_luma_term((int)yp1[col + 1], row + 1, col + 1);
+            dst1[col + 1] = pack_video_pixel(c, rv, guv, bu);
         }
     }
 }
@@ -192,18 +217,18 @@ static struct me_struct           g_me_ctrl_storage __attribute__((aligned(64)))
 static MeYuv2RgbaParams           g_me_params_storage __attribute__((aligned(64)));
 static int  g_me_available = 0;
 static int  g_me_pending   = 0;
+static int  g_me_pending_clean = 0;
 static u8  *g_me_rgba_out  = NULL;
 static u8  *g_last_rgba    = NULL;
+static u32  g_me_dispatch_us = 0;
 
-/* Zero-pipeline-delay mode: when enabled, ME dispatch is synchronous.
- * Eliminates the 1-frame pipeline latency (16-33ms at 30-60fps) at the
- * cost of serializing decode + colorspace.  For sub-native resolutions
- * (256x144, 368x208) where ME YUV→RGBA takes <5ms, this is a net win:
- *   Async:  decode=11ms + pipeline_latency=33ms = 44ms glass-to-glass
- *   ZeroDL: decode=11ms + ME_wait=3ms            = 14ms glass-to-glass
- * Threshold: width*height <= 480*272 (native PSP LCD) → zero-delay. */
+/* Zero-delay mode waits for ME conversion before returning a frame. That saves
+ * one frame of latency, but serializes CPU decode with ME color conversion.
+ * Release playback favors async ME pipelining, keeping zero-delay only for
+ * tiny low-FPS streams where latency matters more than overlap. */
 static int  g_zero_delay_mode = 0;
-#define ZERO_DELAY_PIXEL_THRESHOLD  (480 * 272)
+#define ZERO_DELAY_PIXEL_THRESHOLD  (256 * 144)
+#define ZERO_DELAY_MAX_FPS          15
 
 static int me_yuv420_to_rgba_entry(int param)
 {
@@ -238,20 +263,20 @@ extern "C" int oh264_pipeline_init(void)
         stream_resolution_init(g_psp_config.width, g_psp_config.height);
     }
 
-    /* Configure decoder — low-latency streaming profile.
+    /* Configure decoder: low-latency streaming profile.
      * Since we build OpenH264 from source for PSP (DISABLE_DECODER_MT,
      * single-threaded), these settings maximize decode-to-display speed:
      *   - VIDEO_BITSTREAM_AVC: standard Annex-B NAL input (no container overhead)
-     *   - ERROR_CON_FRAME_COPY_CROSS_IDR: on error, copy entire previous frame
-     *     even across IDR boundaries — keeps picture stable on packet loss
+     *   - ERROR_CON_DISABLE: avoid spending CPU on concealed slices that still
+     *     look blocky on PSP. The caller holds the last clean frame instead.
      *   - bParseOnly=false: full decode, immediate output
      *   - NUM_OF_THREADS=0: explicit single-thread (matches PSP hardware)
-     *   - TRACE_LEVEL=0: disable all internal logging (saves ~200µs/frame)
+     *   - TRACE_LEVEL=0: disable all internal logging
      */
     SDecodingParam param;
     memset(&param, 0, sizeof(param));
     param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    param.eEcActiveIdc = ERROR_CON_FRAME_COPY_CROSS_IDR;
+    param.eEcActiveIdc = ERROR_CON_DISABLE;
     param.bParseOnly   = false;
 
     long iret = g_decoder->Initialize(&param);
@@ -276,7 +301,7 @@ extern "C" int oh264_pipeline_init(void)
         int trace_level = 0;  /* WELS_LOG_QUIET */
         g_decoder->SetOption(DECODER_OPTION_TRACE_LEVEL, &trace_level);
     }
-    diag_log_write("OH264", "OpenH264 decoder initialized (threads=0, trace=off)");
+    diag_log_write("OH264", "OpenH264 decoder initialized (threads=0, trace=off, ec=off)");
 
     /* RGBA double-buffer. Fixed static storage keeps the stream path out of
      * the heap; g_stream_res.rgba_size is validated against the PSP LCD max. */
@@ -302,20 +327,25 @@ extern "C" int oh264_pipeline_init(void)
     memset(g_rgba_buf[1], 0, g_stream_res.rgba_size);
     g_rgba_idx = 0;
 
-    /* Determine zero-delay mode based on resolution.
-     * Sub-native resolutions (256x144, 368x208) benefit from synchronous
-     * ME dispatch: ME YUV→RGBA takes ~3ms at these sizes, which is far
-     * less than the 16-33ms pipeline latency saved by not double-buffering. */
-    g_zero_delay_mode = (g_stream_res.width * g_stream_res.height
-                         <= ZERO_DELAY_PIXEL_THRESHOLD) ? 1 : 0;
-    diag_log_write("OH264", "Zero-delay mode: %s (res=%dx%d, threshold=%d)",
-                   g_zero_delay_mode ? "ON" : "OFF",
-                   g_stream_res.width, g_stream_res.height,
-                   ZERO_DELAY_PIXEL_THRESHOLD);
+    /* Release presets pipeline ME work so CPU decode can overlap colorspace.
+     * Keep synchronous zero-delay only for tiny low-FPS streams. */
+    {
+        int pixels = g_stream_res.width * g_stream_res.height;
+        int target_fps = (g_psp_config.fps > 0) ? g_psp_config.fps : 20;
+        g_zero_delay_mode =
+            (target_fps <= ZERO_DELAY_MAX_FPS &&
+             pixels <= ZERO_DELAY_PIXEL_THRESHOLD) ? 1 : 0;
+        diag_log_write("OH264",
+                       "ME pipeline mode: %s (res=%dx%d fps=%d zero_limit=%dpx@%dfps)",
+                       g_zero_delay_mode ? "zero-delay" : "async",
+                       g_stream_res.width, g_stream_res.height, target_fps,
+                       ZERO_DELAY_PIXEL_THRESHOLD, ZERO_DELAY_MAX_FPS);
+    }
 
     /* Initialize Media Engine */
     g_me_available = 0;
     g_me_pending   = 0;
+    g_me_pending_clean = 0;
     g_last_rgba    = NULL;
     g_me_rgba_out  = NULL;
 
@@ -338,8 +368,12 @@ extern "C" int oh264_pipeline_init(void)
         }
         if (me_prx_id >= 0) {
             int status = 0;
+#ifdef RETAIL_BUILD
+            sceKernelStartModule(me_prx_id, 0, NULL, &status, NULL);
+#else
             int res = sceKernelStartModule(me_prx_id, 0, NULL, &status, NULL);
             diag_log_write("OH264", "ME helper start=0x%08X", (unsigned)res);
+#endif
         } else if (me_prx_id == (SceUID)0x80020139 ||
                    me_prx_id == (SceUID)0x8002032C) {
             diag_log_write("OH264", "ME helper already resident");
@@ -418,6 +452,8 @@ extern "C" void oh264_pipeline_shutdown(void)
     g_me_ctrl = NULL;
     g_me_params = NULL;
     g_me_pending  = 0;
+    g_me_pending_clean = 0;
+    g_me_dispatch_us = 0;
     g_last_rgba   = NULL;
     g_me_rgba_out = NULL;
 
@@ -463,6 +499,8 @@ extern "C" void oh264_pipeline_abandon(void)
     g_me_ctrl        = NULL;
     g_me_available   = 0;
     g_me_pending     = 0;
+    g_me_pending_clean = 0;
+    g_me_dispatch_us = 0;
     g_last_rgba      = NULL;
     g_me_rgba_out    = NULL;
 
@@ -514,6 +552,7 @@ extern "C" int oh264_pipeline_reset_codec(void)
             }
         }
         g_me_pending = 0;
+        g_me_pending_clean = 0;
     }
 
     if (g_decoder) {
@@ -531,7 +570,7 @@ extern "C" int oh264_pipeline_reset_codec(void)
     SDecodingParam param;
     memset(&param, 0, sizeof(param));
     param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    param.eEcActiveIdc = ERROR_CON_FRAME_COPY_CROSS_IDR;
+    param.eEcActiveIdc = ERROR_CON_DISABLE;
     param.bParseOnly   = false;
 
     long iret = g_decoder->Initialize(&param);
@@ -549,6 +588,7 @@ extern "C" int oh264_pipeline_reset_codec(void)
 
     g_last_rgba = NULL;
     g_me_rgba_out = NULL;
+    g_me_pending_clean = 0;
     g_saw_first_idr = 0;
     g_idr_fully_decoded = 0;
     g_refs_corrupted = 1;
@@ -583,6 +623,8 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
 
     *out_rgba = NULL;
     int collected_me_frame = 0;
+    int output_concealed = 0;
+    g_oh264_me_wait_us = 0;
 
     /* Clear per-frame corruption flag (snapshot not needed here) */
     g_current_frame_is_corrupt = 0;
@@ -590,12 +632,18 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     /* --- Collect previous ME frame (only in pipelined async mode) --------- */
     if (!g_zero_delay_mode && g_me_available && g_me_pending && g_me_ctrl) {
         int loops = 0;
+        u32 me_wait_start_us = sceKernelGetSystemTimeLow();
         while (!CheckME(g_me_ctrl) && loops < 5000000) {
             loops++;
             if ((loops & 63) == 0)
                 sceKernelDelayThread(0);
         }
+        g_oh264_me_wait_us += sceKernelGetSystemTimeLow() - me_wait_start_us;
         if (loops >= 5000000) {
+            if (g_me_dispatch_us != 0) {
+                telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+                g_me_dispatch_us = 0;
+            }
             diag_log_write("OH264", "ME TIMEOUT — resetting");
             KillME(g_me_ctrl);
             memset((void *)g_me_ctrl_cached, 0, sizeof(struct me_struct));
@@ -610,11 +658,18 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
                 g_me_available = 0;
             }
         } else {
+            if (g_me_dispatch_us != 0) {
+                telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+                g_me_dispatch_us = 0;
+            }
             sceKernelDcacheInvalidateRange(g_me_rgba_out, g_stream_res.rgba_size);
-            g_last_rgba = g_me_rgba_out;
-            collected_me_frame = 1;
+            if (g_me_pending_clean) {
+                g_last_rgba = g_me_rgba_out;
+                collected_me_frame = 1;
+            }
         }
         g_me_pending = 0;
+        g_me_pending_clean = 0;
     }
 
     /* --- Decode via OpenH264 ---------------------------------------------- */
@@ -623,37 +678,25 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     memset(&info, 0, sizeof(info));
 
     /* CRITICAL: Do NOT use DecodeFrameNoDelay() — it calls DecodeFrame2
-     * twice (data + NULL flush) and ORs the return codes together.  After
-     * a pipeline reinit the NULL flush returns dsInitialOptExpected (0x2000)
-     * which masks the valid IDR decode from the first call, permanently
-     * stalling video recovery.
-     *
-     * Instead, call DecodeFrame2 twice manually and preserve the first
-     * call's output if it produced a valid frame. */
+     * twice (data + NULL flush) and ORs the return codes together. After
+     * pipeline reinit the NULL flush can mask a valid IDR decode. We do the
+     * two calls manually so first-call output always wins. */
     DECODING_STATE ds1 = g_decoder->DecodeFrame2(
         (const unsigned char *)nal_data, nal_len, pData, &info);
 
-    /* Fast path: if first call produced a frame, skip the NULL flush entirely.
-     * This saves ~3-8% CPU on clean streams where every frame decodes on
-     * the first call. The flush is only needed to drain buffered frames
-     * from OpenH264's internal pipeline (rare at low latency). */
     DECODING_STATE ds;
     if (info.iBufferStatus == 1 && pData[0]) {
         ds = ds1;
     } else {
-        /* Save first call's results before the flush call may overwrite them */
         unsigned char *pData1[3] = { pData[0], pData[1], pData[2] };
         SBufferInfo    info1;
         memcpy(&info1, &info, sizeof(SBufferInfo));
 
-        /* Flush call: feed NULL to drain any internally buffered frame */
         unsigned char *pData2[3] = {NULL, NULL, NULL};
         SBufferInfo    info2;
         memset(&info2, 0, sizeof(info2));
         DECODING_STATE ds2 = g_decoder->DecodeFrame2(NULL, 0, pData2, &info2);
 
-        /* Prefer the first call's output if it produced a frame.
-         * Fall back to the flush call's output if the first had nothing. */
         if (info1.iBufferStatus == 1 && pData1[0]) {
             ds = ds1;
             pData[0] = pData1[0]; pData[1] = pData1[1]; pData[2] = pData1[2];
@@ -663,7 +706,6 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             pData[0] = pData2[0]; pData[1] = pData2[1]; pData[2] = pData2[2];
             memcpy(&info, &info2, sizeof(SBufferInfo));
         } else {
-            /* Neither call produced output — merge error codes */
             ds = (DECODING_STATE)(ds1 | ds2);
         }
     }
@@ -675,34 +717,94 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
      *   dsBitstreamError     (0x04)  = broken bitstream
      *   dsDepLayerLost       (0x08)  = dependency layer lost
      *   dsNoParamSets        (0x10)  = no SPS/PPS
-     *   dsDataErrorConcealed (0x20)  = error concealed, output MAY be valid
+     *   dsDataErrorConcealed (0x20)  = error concealed
      *   dsInitialOptExpected (0x2000)= decoder needs initialization
      *   dsInvalidArgument    (0x1000)= bad input
      *
-     * CRITICAL: dsDataErrorConcealed (0x20) means OpenH264 substituted
-     * missing data via ERROR_CON_SLICE_COPY — the frame IS decoded and
-     * output may be available in pData with iBufferStatus==1.
-     *
-     * Fix: check iBufferStatus==1 for usable output regardless of ds. */
+     * Concealed output is not release-safe on PSP. It often appears as
+     * macroblocking after Wi-Fi loss, so keep the last clean frame on-screen
+     * and force the RTP path into IDR recovery instead of queueing concealed
+     * pixels for ME conversion. */
 
     if (info.iBufferStatus == 1 && pData[0]) {
-        /* Frame produced — use it even if ds has error bits set.
-         * dsDataErrorConcealed frames have minor visual artifacts
-         * (macroblocking) but are far better than stale frames. */
+        static int s_concealed_streak = 0;
         if (ds != dsErrorFree) {
             static int s_concealed_count = 0;
+            static u32 s_last_conceal_idr_us = 0;
             s_concealed_count++;
-            if (s_concealed_count <= 3 || (s_concealed_count % 120) == 0) {
-                diag_log_write("OH264", "DecodeFrame2 ds=0x%X (concealed #%d, using output)",
-                               (int)ds, s_concealed_count);
+            s_concealed_streak++;
+            if (ds == dsDataErrorConcealed) {
+                u32 now_us = sceKernelGetSystemTimeLow();
+                g_current_frame_is_corrupt = 1;
+                g_refs_corrupted = 1;
+                g_idr_fully_decoded = 0;
+                output_concealed = 1;
+                if (s_concealed_count <= 3 || (s_concealed_count % 60) == 0) {
+                    diag_log_write("OH264", "DecodeFrame2 fid=%u ds=0x%X len=%d (concealed drop #%d streak=%d)",
+                                   (unsigned)g_decode_current_frame_id, (int)ds, nal_len,
+                                   s_concealed_count, s_concealed_streak);
+                }
+                if (now_us - s_last_conceal_idr_us > 1000000) {
+                    control_stream_request_idr();
+                    s_last_conceal_idr_us = now_us;
+                }
+                if (collected_me_frame && g_last_rgba) {
+                    *out_rgba = g_last_rgba;
+                    g_frames_decoded++;
+                    return 0;
+                }
+                return -6;
+            } else {
+                if (s_concealed_count <= 3 || (s_concealed_count % 60) == 0) {
+                    diag_log_write("OH264", "DecodeFrame2 fid=%u ds=0x%X len=%d (corrupt/conceal drop #%d streak=%d)",
+                                   (unsigned)g_decode_current_frame_id, (int)ds, nal_len,
+                                   s_concealed_count, s_concealed_streak);
+                }
+                {
+                    u32 now_us = sceKernelGetSystemTimeLow();
+                    g_frames_dropped++;
+                    g_current_frame_is_corrupt = 1;
+                    g_refs_corrupted = 1;
+                    g_idr_fully_decoded = 0;
+                    if (now_us - s_last_conceal_idr_us > 500000) {
+                        control_stream_request_idr();
+                        s_last_conceal_idr_us = now_us;
+                    }
+                    if (collected_me_frame && g_last_rgba) {
+                        *out_rgba = g_last_rgba;
+                        g_frames_decoded++;
+                        return 0;
+                    }
+                    return -6;
+                }
+            }
+        } else {
+            s_concealed_streak = 0;
+        }
+    } else if (!decode_state_is_pending_only(ds)) {
+        /* No usable output AND error state — true failure */
+        {
+            int ref_lost_only =
+                ((ds & dsRefLost) != 0) &&
+                ((ds & ~(dsRefLost | dsFramePending)) == 0);
+            g_frames_dropped++;
+            g_current_frame_is_corrupt = 1;
+            if (ref_lost_only) {
+                if (g_frames_dropped <= 3 || (g_frames_dropped % 60) == 0) {
+                    diag_log_write("OH264", "DecodeFrame2 fid=%u returned 0x%X len=%d (ref-lost, no output, dropped=%d)",
+                                   (unsigned)g_decode_current_frame_id, (int)ds, nal_len,
+                                   g_frames_dropped);
+                }
+                (void)collected_me_frame;
+                return -7;
             }
         }
-    } else if (ds != dsErrorFree) {
-        /* No usable output AND error state — true failure */
-        g_frames_dropped++;
+        g_refs_corrupted = 1;
+        g_idr_fully_decoded = 0;
         if (g_frames_dropped <= 3 || (g_frames_dropped % 60) == 0) {
-            diag_log_write("OH264", "DecodeFrame2 returned 0x%X (dropped=%d, no output)",
-                           (int)ds, g_frames_dropped);
+            diag_log_write("OH264", "DecodeFrame2 fid=%u returned 0x%X len=%d (dropped=%d, no output)",
+                           (unsigned)g_decode_current_frame_id, (int)ds, nal_len,
+                           g_frames_dropped);
         }
         /* Decoder-driven IDR feedback: when the decoder signals it has no
          * SPS/PPS (0x10) or needs reinit (0x2000), request IDR immediately
@@ -731,21 +833,17 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             g_frames_decoded++;
             return 0;
         }
-        /* No frame yet — still waiting for first IDR */
+        /* No displayable frame was produced for this access unit. */
         return -5;
     }
 
-    /* We have a valid decoded I420 frame (possibly with error concealment) */
+    /* We have a decoded I420 frame. */
     g_saw_first_idr = 1;
-    if (ds == dsErrorFree) {
-        /* Clean decode — fully trust this frame */
+    if (!output_concealed) {
         g_idr_fully_decoded = 1;
         g_refs_corrupted    = 0;
     } else {
-        /* Concealed frame — still usable but refs may be imperfect.
-         * Set g_idr_fully_decoded so the dedup/lgf logic works normally.
-         * Don't clear g_refs_corrupted since concealment means data was lost. */
-        g_idr_fully_decoded = 1;
+        g_current_frame_is_corrupt = 1;
     }
 
     int src_w      = info.UsrData.sSystemBuffer.iWidth;
@@ -767,16 +865,15 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
 
     /* --- Dispatch YUV→RGBA to ME (or CPU fallback) ------------------------
      *
-     * Two modes, chosen at init based on resolution:
+     * Two modes, chosen at init based on resolution and target fps:
      *
-     * ZERO-DELAY MODE (sub-native res):
-     *   Synchronous ME dispatch — waits for ME to finish, returns CURRENT
-     *   frame immediately.  Eliminates 1-frame pipeline latency (16-33ms).
-     *   At 256x144 (36K pixels), ME takes ~3ms — far less than a frame.
+     * ZERO-DELAY MODE (tiny low-FPS res):
+     *   Synchronous ME dispatch waits for ME to finish and returns the current
+     *   frame immediately. This is reserved for <=15fps tiny streams.
      *
-     * ASYNC PIPELINED MODE (native/super-native res):
-     *   Returns PREVIOUS frame while ME processes current frame async.
-     *   Higher throughput but adds 1-frame pipeline latency.
+     * ASYNC PIPELINED MODE (release/stress presets):
+     *   Returns the previous frame while ME processes the current frame. This
+     *   costs one frame of latency, but keeps CPU and ME overlapped.
      * ----------------------------------------------------------------------- */
     if (g_me_available && g_me_ctrl && g_me_params) {
         g_me_params->y_plane            = pData[0];
@@ -806,8 +903,10 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
         BeginME(g_me_ctrl, (int)(unsigned int)me_yuv420_to_rgba_entry,
                 (int)(unsigned int)g_me_params,
                 -1, NULL, -1, NULL);
+        g_me_dispatch_us = sceKernelGetSystemTimeLow();
         g_me_rgba_out = rgba_out;
         g_me_pending  = 1;
+        g_me_pending_clean = 1;
 
         if (g_zero_delay_mode) {
             /* ZERO-DELAY: wait for ME synchronously, return current frame.
@@ -815,14 +914,21 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
              * Yield every 4 iterations to keep audio/network responsive.
              * 500K iters ≈ 5ms ceiling — generous for ~3ms actual. */
             int w = 0;
+            u32 me_wait_start_us = sceKernelGetSystemTimeLow();
             while (!CheckME(g_me_ctrl) && w < 500000) {
                 w++;
                 if ((w & 3) == 0)
                     sceKernelDelayThread(0);
             }
+            g_oh264_me_wait_us += sceKernelGetSystemTimeLow() - me_wait_start_us;
+            if (g_me_dispatch_us != 0) {
+                telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+                g_me_dispatch_us = 0;
+            }
             sceKernelDcacheInvalidateRange(rgba_out, g_stream_res.rgba_size);
             g_last_rgba  = rgba_out;
             g_me_pending = 0;
+            g_me_pending_clean = 0;
             *out_rgba = rgba_out;
             g_frames_decoded++;
             return 0;
@@ -836,14 +942,21 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
         }
         /* First frame: must wait for ME synchronously */
         int w = 0;
+        u32 me_wait_start_us = sceKernelGetSystemTimeLow();
         while (!CheckME(g_me_ctrl) && w < 500000) {
             w++;
             if ((w & 3) == 0)
                 sceKernelDelayThread(0);
         }
+        g_oh264_me_wait_us += sceKernelGetSystemTimeLow() - me_wait_start_us;
+        if (g_me_dispatch_us != 0) {
+            telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+            g_me_dispatch_us = 0;
+        }
         sceKernelDcacheInvalidateRange(rgba_out, g_stream_res.rgba_size);
         g_last_rgba  = rgba_out;
         g_me_pending = 0;
+        g_me_pending_clean = 0;
         *out_rgba = g_last_rgba;
         g_frames_decoded++;
         return 0;

@@ -8,6 +8,7 @@
  */
 
 #include "moonlight_types.h"
+#include <pspkernel.h>
 #include <psptypes.h>
 #include <string.h>
 #include <stdio.h>
@@ -19,6 +20,8 @@
 #include "control_stream.h"
 #include "decode_flags.h"
 #include "signal_strength.h"
+#include "settings_menu.h"
+#include "runtime_telemetry.h"
 
 #define RTP_LOG(fmt, ...) diag_log_write("RTP", fmt, ##__VA_ARGS__)
 
@@ -32,26 +35,234 @@
 
 /* Maximum reassembled frame size (256KB is enough for PSP-tier bitrates) */
 #define MAX_ASSEMBLY_SIZE       (256 * 1024)
+#define RFI_WAIT_MAX_DROPS_CAP  4
+#define IDR_WAIT_MAX_DROPS_CAP  60
+#define RFI_WAIT_MIN_DROPS      4
+#define IDR_WAIT_MIN_DROPS      20
+#define IDR_WAIT_LOG_INTERVAL   30
+#define RFI_WAIT_MIN_US         200000U
+#define IDR_WAIT_MIN_US         2000000U
+#define RFI_WAIT_REF_SPAN_MAX   6
 
 /* Reassembly state */
 static u8  assembly_buffer[MAX_ASSEMBLY_SIZE] __attribute__((aligned(64)));
 static u32 assembly_pos = 0;
 static u32 current_frame_id = 0xFFFFFFFF;
+static u32 s_last_seen_frame_id = 0xFFFFFFFF;
 static u16 expected_seq = 0;
 static int reassembling = 0;
 static int g_frame_had_gaps = 0;
 static int g_saw_first_sof = 0;
 static int g_frame_overflow = 0;
 static unsigned int s_consec_gap_frames = 0; /* consecutive frames with seq gaps */
+static int s_waiting_for_ref_inval_frame = 0;
+static int s_waiting_for_idr_frame = 0;
+static u32 s_ref_inval_start = 0;
+static u32 s_ref_inval_end = 0;
+static u32 s_idr_wait_loss_start = 0;
+static u32 s_idr_wait_loss_end = 0;
+static u32 s_ref_inval_wait_start_us = 0;
+static u32 s_idr_wait_start_us = 0;
+static u32 s_rfi_wait_drop_count = 0;
+static u32 s_idr_wait_drop_count = 0;
+static int s_current_frame_idr_recovery = 0;
+static u32 s_current_idr_loss_start = 0;
+static u32 s_current_idr_loss_end = 0;
 
 /* External dependencies */
 extern int g_decoder_ready;
 extern void rtp_frame_complete_callback(const u8 *nal_data, int nal_len);
 extern volatile unsigned int g_last_good_frame;
+extern PspConfig g_psp_config;
 /* g_idr_fully_decoded declared in decode_flags.h */
 
 /* Host processing latency from Sunshine frame headers (microseconds) */
 volatile u32 g_host_processing_us = 0;
+
+static void rtp_start_idr_wait(u32 start_frame, u32 end_frame, u32 current_frame, const char *reason);
+
+static u32 rtp_frame_span(u32 start_frame, u32 end_frame)
+{
+    if (start_frame == 0 || (s32)(end_frame - start_frame) < 0) {
+        return 1;
+    }
+    return (u32)(end_frame - start_frame) + 1U;
+}
+
+static u32 rtp_rfi_wait_max_drops(void)
+{
+    u32 fps = (g_psp_config.fps > 0) ? (u32)g_psp_config.fps : 20U;
+    u32 limit = fps;
+
+    if (limit < RFI_WAIT_MIN_DROPS) {
+        limit = RFI_WAIT_MIN_DROPS;
+    }
+    if (limit > RFI_WAIT_MAX_DROPS_CAP) {
+        limit = RFI_WAIT_MAX_DROPS_CAP;
+    }
+    return limit;
+}
+
+static u32 rtp_idr_wait_max_drops(void)
+{
+    u32 fps = (g_psp_config.fps > 0) ? (u32)g_psp_config.fps : 20U;
+    u32 limit = fps * 2U;
+
+    if (limit < IDR_WAIT_MIN_DROPS) {
+        limit = IDR_WAIT_MIN_DROPS;
+    }
+    if (limit > IDR_WAIT_MAX_DROPS_CAP) {
+        limit = IDR_WAIT_MAX_DROPS_CAP;
+    }
+    return limit;
+}
+
+static int rtp_wait_elapsed(u32 start_us, u32 min_us)
+{
+    if (start_us == 0) {
+        return 0;
+    }
+    return (u32)(sceKernelGetSystemTimeLow() - start_us) >= min_us;
+}
+
+static void rtp_advance_decoded_frame(u32 frame_id)
+{
+    if (g_last_decode_output_ok && g_idr_fully_decoded &&
+        !g_current_frame_is_corrupt &&
+        (g_last_good_frame == 0 || (s32)(frame_id - g_last_good_frame) > 0)) {
+        g_last_good_frame = frame_id;
+    }
+}
+
+static void rtp_mark_waiting_for_ref_inval(u32 start_frame, u32 end_frame)
+{
+    if (start_frame == 0 || (s32)(end_frame - start_frame) < 0) {
+        start_frame = end_frame;
+    }
+    if (rtp_frame_span(start_frame, end_frame) > RFI_WAIT_REF_SPAN_MAX &&
+        g_last_good_frame != 0) {
+        diag_log_write("RTP", "RFI span %u-%u exceeds %u frames; entering IDR wait",
+                       start_frame, end_frame, (unsigned)RFI_WAIT_REF_SPAN_MAX);
+        rtp_start_idr_wait(start_frame, end_frame, end_frame, "RFI span exceeds decoder window");
+        return;
+    }
+    if (!s_waiting_for_ref_inval_frame) {
+        s_ref_inval_start = start_frame;
+        s_ref_inval_end = end_frame;
+        s_waiting_for_ref_inval_frame = 1;
+        s_rfi_wait_drop_count = 0;
+        s_ref_inval_wait_start_us = sceKernelGetSystemTimeLow();
+        diag_log_write("RTP", "waiting for RFI recovery frame after loss %u-%u",
+                       s_ref_inval_start, s_ref_inval_end);
+    } else {
+        if ((s32)(start_frame - s_ref_inval_start) < 0) {
+            s_ref_inval_start = start_frame;
+        }
+        if ((s32)(end_frame - s_ref_inval_end) > 0) {
+            s_ref_inval_end = end_frame;
+        }
+        if (rtp_frame_span(s_ref_inval_start, s_ref_inval_end) > RFI_WAIT_REF_SPAN_MAX &&
+            g_last_good_frame != 0) {
+            diag_log_write("RTP", "RFI span widened to %u-%u over %u frames; entering IDR wait",
+                           s_ref_inval_start, s_ref_inval_end,
+                           (unsigned)RFI_WAIT_REF_SPAN_MAX);
+            rtp_start_idr_wait(s_ref_inval_start, s_ref_inval_end, s_ref_inval_end,
+                               "RFI span exceeds decoder window");
+            return;
+        }
+    }
+}
+
+static void rtp_clear_ref_inval_wait(void)
+{
+    s_waiting_for_ref_inval_frame = 0;
+    s_ref_inval_start = 0;
+    s_ref_inval_end = 0;
+    s_ref_inval_wait_start_us = 0;
+    s_rfi_wait_drop_count = 0;
+}
+
+static void rtp_clear_idr_wait(void)
+{
+    s_waiting_for_idr_frame = 0;
+    s_idr_wait_loss_start = 0;
+    s_idr_wait_loss_end = 0;
+    s_idr_wait_start_us = 0;
+    s_idr_wait_drop_count = 0;
+}
+
+static void rtp_clear_current_idr_recovery(void)
+{
+    s_current_frame_idr_recovery = 0;
+    s_current_idr_loss_start = 0;
+    s_current_idr_loss_end = 0;
+}
+
+static void rtp_start_idr_wait(u32 start_frame, u32 end_frame, u32 current_frame, const char *reason)
+{
+    int was_waiting = s_waiting_for_idr_frame;
+
+    if (start_frame == 0 || (s32)(end_frame - start_frame) < 0) {
+        start_frame = end_frame;
+    }
+
+    if (!s_waiting_for_idr_frame) {
+        s_idr_wait_loss_start = start_frame;
+        s_idr_wait_loss_end = end_frame;
+        s_idr_wait_drop_count = 0;
+        s_idr_wait_start_us = sceKernelGetSystemTimeLow();
+        diag_log_write("RTP", "switching to IDR wait after %s: loss=%u-%u current=%u",
+                       reason ? reason : "recovery miss",
+                       s_idr_wait_loss_start, s_idr_wait_loss_end, current_frame);
+    } else {
+        if ((s32)(start_frame - s_idr_wait_loss_start) < 0) {
+            s_idr_wait_loss_start = start_frame;
+        }
+        if ((s32)(end_frame - s_idr_wait_loss_end) > 0) {
+            s_idr_wait_loss_end = end_frame;
+        }
+    }
+
+    s_waiting_for_idr_frame = 1;
+    rtp_clear_ref_inval_wait();
+    g_refs_corrupted = 1;
+    g_idr_fully_decoded = 0;
+    if (was_waiting) {
+        control_stream_request_idr();
+    } else {
+        control_stream_request_idr_force();
+    }
+}
+
+void rtp_reassembly_note_frame_loss(u32 start_frame, u32 end_frame)
+{
+    if (start_frame == 0 || (s32)(end_frame - start_frame) < 0) {
+        start_frame = end_frame;
+    }
+
+    if (s_waiting_for_idr_frame) {
+        if ((s32)(start_frame - s_idr_wait_loss_start) < 0) {
+            s_idr_wait_loss_start = start_frame;
+        }
+        if ((s32)(end_frame - s_idr_wait_loss_end) > 0) {
+            s_idr_wait_loss_end = end_frame;
+        }
+        return;
+    }
+
+    if ((g_refs_corrupted || !g_idr_fully_decoded) && g_last_good_frame == 0) {
+        rtp_start_idr_wait(start_frame, end_frame, end_frame,
+                           g_refs_corrupted ? "corrupt refs" : "pre-IDR loss");
+        return;
+    }
+
+    rtp_mark_waiting_for_ref_inval(start_frame, end_frame);
+}
+
+int rtp_reassembly_waiting_for_idr(void)
+{
+    return s_waiting_for_idr_frame;
+}
 
 /*--------------------------------------------------------------------------
  * NAL Unit Helpers
@@ -62,6 +273,37 @@ static int is_annexb_start(const u8 *data, int len, int offset) {
         return 3;
     if (offset + 4 < len && data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 && data[offset+3] == 1)
         return 4;
+    return 0;
+}
+
+static int payload_contains_idr_nal(const u8 *data, int len) {
+    int i;
+
+    if (data == NULL || len <= 0) {
+        return 0;
+    }
+
+    for (i = 0; i < len; i++) {
+        int sc = is_annexb_start(data, len, i);
+        if (sc > 0 && i + sc < len) {
+            u8 nal_type = data[i + sc] & 0x1F;
+            if (nal_type == 5) {
+                return 1;
+            }
+            i += sc;
+        }
+    }
+
+    {
+        u8 nal_type = data[0] & 0x1F;
+        if (nal_type == 5) {
+            return 1;
+        }
+        if (nal_type == 28 && len >= 2 && (data[1] & 0x80) && ((data[1] & 0x1F) == 5)) {
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -94,15 +336,13 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
     /* 1. Parse RTP Header */
     int data_offset = FIXED_RTP_HEADER_SIZE;
     if (packet[0] & FLAG_EXTENSION) {
-        /* RTP extension header: 2-byte type + 2-byte length (in 32-bit words)
-         * then length*4 bytes of extension data. Reference code:
-         *   offset += 4; offset += BE16(&data[offset-2]) * 4; */
+        /* GameStream video uses the fixed 4-byte RTP extension layout used by
+         * moonlight-common-c's RtpVideoQueue/VideoDepacketizer. Parsing the
+         * extension length word here can misalign FEC-recovered packets. */
         if (packet_len < data_offset + 4) return;
-        u16 ext_words = (u16)((packet[data_offset + 2] << 8) |
-                               packet[data_offset + 3]);
-        data_offset += 4 + ext_words * 4;
+        data_offset += 4;
     }
-    
+
     if (packet_len < data_offset + NV_VIDEO_PKT_SIZE) return;
 
     u16 seq = (u16)((packet[2] << 8) | packet[3]);
@@ -112,7 +352,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
     u8 *nv = packet + data_offset;
     u32 frame_id = (u32)nv[4] | ((u32)nv[5] << 8) | ((u32)nv[6] << 16) | ((u32)nv[7] << 24);
     u8  flags = nv[8];
-    
+
     u8 *payload = nv + NV_VIDEO_PKT_SIZE;
     int payload_len = packet_len - (data_offset + NV_VIDEO_PKT_SIZE);
 
@@ -146,17 +386,41 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         return;
     }
 
-    /* Forward jump protection: if frame_id leaps >100 ahead, the counter
-     * was likely poisoned by a corrupted RS-recovered packet.  Anchor it
-     * to the current frame so that future frames have small, manageable
-     * deltas.  Setting to 0 creates a deadlock: when g_idr_fully_decoded
-     * is false (persistent WiFi loss), g_last_good can never re-advance
-     * from 0, causing ALL subsequent frames to fail decode permanently. */
-    if (g_last_good_frame != 0 && (s32)(frame_id - g_last_good_frame) > 100) {
-        RTP_LOG("[RTP] Massive frame_id jump: %u -> %u (delta=%d), anchoring to current\n",
-                g_last_good_frame, frame_id, (int)(frame_id - g_last_good_frame));
-        g_last_good_frame = frame_id;
-        control_stream_request_idr();
+    u32 prev_seen_frame_id = s_last_seen_frame_id;
+    s32 transport_frame_delta = 0;
+    int transport_frame_gap = 0;
+    int rtp_seq_gap_at_frame_boundary = 0;
+    if (prev_seen_frame_id != 0xFFFFFFFF) {
+        transport_frame_delta = (s32)(frame_id - prev_seen_frame_id);
+        transport_frame_gap = transport_frame_delta > 1;
+    }
+    if (frame_id != current_frame_id && current_frame_id != 0xFFFFFFFF) {
+        rtp_seq_gap_at_frame_boundary = (seq != expected_seq);
+    }
+
+    /* Forward jump protection must use transport progress, not decode output.
+     * g_last_good_frame intentionally means "last displayable decoded frame";
+     * on PSP-1000 OpenH264 can lag or legally return no-output for many access
+     * units. Comparing incoming transport frame IDs against lgf turns normal
+     * decode backlog into false loss windows and causes RFI storms.
+     *
+     * Frame-id gaps by themselves do not prove loss: Sunshine can intentionally
+     * skip frame ids when pacing low-FPS streams, and N3DS-style smooth playback
+     * accepts those packet-contiguous skips. Only treat a frame-id jump as
+     * reference loss when the RTP sequence also jumped at the frame boundary. */
+    if (transport_frame_delta > 100 &&
+        rtp_seq_gap_at_frame_boundary &&
+        !s_waiting_for_idr_frame &&
+        !s_waiting_for_ref_inval_frame) {
+        u32 loss_start = prev_seen_frame_id + 1;
+        RTP_LOG("[RTP] Massive frame_id jump: %u -> %u (delta=%d), requesting RFI\n",
+                prev_seen_frame_id, frame_id, (int)transport_frame_delta);
+        rtp_mark_waiting_for_ref_inval(loss_start, frame_id);
+        control_stream_request_rfi(loss_start, frame_id);
+    }
+    if (s_last_seen_frame_id == 0xFFFFFFFF ||
+        (s32)(frame_id - s_last_seen_frame_id) > 0) {
+        s_last_seen_frame_id = frame_id;
     }
 
     if (frame_id != current_frame_id) {
@@ -197,14 +461,17 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         assembly_pos = 0;
         g_saw_first_sof = 1;
         g_frame_overflow = 0;
+        rtp_clear_current_idr_recovery();
 
         /* SOF diagnostic silenced for performance (was per-frame) */
 
         /* Sunshine Frame Header skip (Verbatim logic from moonlight-common-c) */
         int header_skip = 0;
+        int frame_type = -1;
         if (payload_len >= 1) {
             if (payload[0] == 0x01) {
                 header_skip = 8;
+                if (payload_len >= 4) frame_type = payload[3];
                 /* Parse host processing latency from Sunshine type-0x01 header.
                  * Bytes 4-7 contain the host encode duration in microseconds (LE32). */
                 if (payload_len >= 8) {
@@ -223,12 +490,183 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
                 }
             } else if (payload[0] == (u8)0x81) {
                 header_skip = 44;
+                if (payload_len >= 4) frame_type = payload[3];
             } else if (payload_len >= 4 && payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 1) {
                 /* Raw H.264 slice – no Sunshine header */
                 header_skip = 0;
             }
         }
-        
+
+        {
+            const u8 *payload_after_header = payload;
+            int payload_after_header_len = payload_len;
+            int contains_idr = 0;
+            int is_sync_frame;
+            int is_ref_recovery_frame;
+            int accept_after_rfi_timeout = 0;
+
+            if (payload_after_header_len >= header_skip) {
+                payload_after_header += header_skip;
+                payload_after_header_len -= header_skip;
+                contains_idr = payload_contains_idr_nal(payload_after_header, payload_after_header_len);
+            }
+
+            is_sync_frame = (frame_type == 2) || contains_idr;
+            is_ref_recovery_frame = is_sync_frame || (frame_type == 4) || (frame_type == 5);
+
+            if (transport_frame_gap &&
+                !s_waiting_for_idr_frame &&
+                !s_waiting_for_ref_inval_frame &&
+                g_idr_fully_decoded && g_last_good_frame != 0) {
+                u32 loss_start = prev_seen_frame_id + 1;
+                u32 loss_end = frame_id - 1;
+                if (!rtp_seq_gap_at_frame_boundary) {
+                    static u32 s_contiguous_skip_log_count = 0;
+                    s_contiguous_skip_log_count++;
+                    if (s_contiguous_skip_log_count <= 8 ||
+                        (s_contiguous_skip_log_count % 100) == 0) {
+                        diag_log_write("RTP", "frame-id skip %u -> %u has contiguous RTP; accepting fid=%u type=%d",
+                                       prev_seen_frame_id, frame_id, frame_id, frame_type);
+                    }
+                } else if (is_ref_recovery_frame) {
+                    diag_log_write("RTP", "transport gap %u-%u covered by recovery frame fid=%u type=%d",
+                                    loss_start, loss_end, frame_id, frame_type);
+                } else {
+                    diag_log_write("RTP", "transport frame gap %u -> %u (missing %u-%u), entering RFI wait",
+                                   prev_seen_frame_id, frame_id, loss_start, loss_end);
+                    rtp_mark_waiting_for_ref_inval(loss_start, loss_end);
+                    signal_strength_report_frame_drop();
+                }
+            }
+
+            if (g_refs_corrupted && !s_waiting_for_idr_frame) {
+                u32 loss_start = g_last_good_frame ? (g_last_good_frame + 1) : frame_id;
+                rtp_start_idr_wait(loss_start, frame_id, frame_id,
+                                   "decoder corrupt refs");
+            }
+
+            if (s_waiting_for_idr_frame) {
+                if (is_sync_frame) {
+                    diag_log_write("RTP", "IDR recovery frame accepted: fid=%u type=%d loss=%u-%u drops=%u",
+                                   frame_id, frame_type, s_idr_wait_loss_start,
+                                   s_idr_wait_loss_end, s_idr_wait_drop_count);
+                    s_current_frame_idr_recovery = 1;
+                    s_current_idr_loss_start = s_idr_wait_loss_start;
+                    s_current_idr_loss_end = s_idr_wait_loss_end;
+                    rtp_clear_idr_wait();
+                } else {
+                    s_idr_wait_drop_count++;
+                    if (s_idr_wait_drop_count == rtp_idr_wait_max_drops() &&
+                        !rtp_wait_elapsed(s_idr_wait_start_us, IDR_WAIT_MIN_US)) {
+                        diag_log_write("RTP", "strict IDR wait held after %u drops; still inside %ums minimum",
+                                       s_idr_wait_drop_count, IDR_WAIT_MIN_US / 1000U);
+                    }
+                    if (s_idr_wait_drop_count >= rtp_idr_wait_max_drops() &&
+                        rtp_wait_elapsed(s_idr_wait_start_us, IDR_WAIT_MIN_US)) {
+                        if ((s_idr_wait_drop_count % rtp_idr_wait_max_drops()) == 0) {
+                            diag_log_write("RTP", "strict IDR wait: dropping P-frame fid=%u count=%u lgf=%u",
+                                           frame_id, s_idr_wait_drop_count,
+                                           (unsigned)g_last_good_frame);
+                            control_stream_request_idr();
+                        }
+                    } else {
+                        if (s_idr_wait_drop_count <= 3 ||
+                            (s_idr_wait_drop_count % IDR_WAIT_LOG_INTERVAL) == 0) {
+                            diag_log_write("RTP", "waiting for IDR frame: drop fid=%u type=%d loss=%u-%u count=%u",
+                                           frame_id, frame_type, s_idr_wait_loss_start,
+                                           s_idr_wait_loss_end, s_idr_wait_drop_count);
+                        }
+                    }
+                    if (s_idr_wait_drop_count == 1 ||
+                        (rtp_wait_elapsed(s_idr_wait_start_us, IDR_WAIT_MIN_US) &&
+                         (s_idr_wait_drop_count % (IDR_WAIT_LOG_INTERVAL * 2)) == 0)) {
+                        control_stream_request_idr_force();
+                    } else if (rtp_wait_elapsed(s_idr_wait_start_us, IDR_WAIT_MIN_US) &&
+                               (s_idr_wait_drop_count % IDR_WAIT_LOG_INTERVAL) == 0) {
+                        control_stream_request_idr();
+                    }
+                    reassembling = 0;
+                    assembly_pos = 0;
+                    g_saw_first_sof = 0;
+                    g_fec_recovery_clean = 0;
+                    /* These are deliberate decoder-protection skips while we
+                     * wait for a sync frame, not fresh transport drops. */
+                    return;
+                }
+            } else if (s_waiting_for_ref_inval_frame) {
+                if (is_ref_recovery_frame) {
+                    diag_log_write("RTP", "RFI recovery frame accepted: fid=%u type=%d loss=%u-%u",
+                                   frame_id, frame_type, s_ref_inval_start, s_ref_inval_end);
+                    rtp_clear_ref_inval_wait();
+                    g_refs_corrupted = 0;
+                    g_idr_fully_decoded = 1;
+                } else {
+                    s_rfi_wait_drop_count++;
+                    if ((s32)(frame_id - s_ref_inval_end) > 0) {
+                        s_ref_inval_end = frame_id;
+                    }
+                    if (rtp_frame_span(s_ref_inval_start, s_ref_inval_end) > RFI_WAIT_REF_SPAN_MAX) {
+                        diag_log_write("RTP", "RFI wait span %u-%u exceeds %u frames; entering IDR wait",
+                                       s_ref_inval_start, s_ref_inval_end,
+                                       (unsigned)RFI_WAIT_REF_SPAN_MAX);
+                        rtp_start_idr_wait(s_ref_inval_start, s_ref_inval_end, frame_id,
+                                           "RFI wait span exceeds decoder window");
+                        reassembling = 0;
+                        assembly_pos = 0;
+                        g_saw_first_sof = 0;
+                        g_fec_recovery_clean = 0;
+                        return;
+                    }
+                    if (s_rfi_wait_drop_count <= 3 ||
+                        (s_rfi_wait_drop_count % IDR_WAIT_LOG_INTERVAL) == 0) {
+                        diag_log_write("RTP", "waiting for RFI frame: drop fid=%u type=%d loss=%u-%u count=%u",
+                                        frame_id, frame_type, s_ref_inval_start,
+                                        s_ref_inval_end, s_rfi_wait_drop_count);
+                    }
+                    {
+                        unsigned int wait_max = rtp_rfi_wait_max_drops();
+                        if (s_rfi_wait_drop_count == wait_max &&
+                            !rtp_wait_elapsed(s_ref_inval_wait_start_us, RFI_WAIT_MIN_US)) {
+                            diag_log_write("RTP", "RFI wait held after %u drops; still inside %ums minimum",
+                                           s_rfi_wait_drop_count, RFI_WAIT_MIN_US / 1000U);
+                        }
+                        if (s_rfi_wait_drop_count >= wait_max &&
+                            rtp_wait_elapsed(s_ref_inval_wait_start_us, RFI_WAIT_MIN_US)) {
+                            u32 req_start = s_ref_inval_start;
+                            u32 req_end = s_ref_inval_end;
+                            if (req_end < req_start) {
+                                req_end = req_start;
+                            }
+                            diag_log_write("RTP", "RFI wait timeout after %u drops; preserving refs and accepting fid=%u loss=%u-%u",
+                                           s_rfi_wait_drop_count, frame_id,
+                                           req_start, req_end);
+                            rtp_clear_ref_inval_wait();
+                            g_refs_corrupted = 0;
+                            g_idr_fully_decoded = 1;
+                            control_stream_request_rfi(req_start, req_end);
+                            accept_after_rfi_timeout = 1;
+                        } else if (s_rfi_wait_drop_count == 1 ||
+                                   (s_rfi_wait_drop_count % 10U) == 0) {
+                            u32 req_end = s_ref_inval_end;
+                            if (req_end < s_ref_inval_start) {
+                                req_end = s_ref_inval_start;
+                            }
+                            control_stream_request_rfi(s_ref_inval_start, req_end);
+                        }
+                    }
+                    if (!accept_after_rfi_timeout) {
+                        reassembling = 0;
+                        assembly_pos = 0;
+                        g_saw_first_sof = 0;
+                        g_fec_recovery_clean = 0;
+                        /* Do not feed adaptive bitrate with each intentional
+                         * RFI-wait P-frame skip; count only the original loss. */
+                        return;
+                    }
+                }
+            }
+        }
+
         /* Log header detection for first 5 frames */
         {
             static int hdr_log_count = 0;
@@ -266,6 +704,7 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
         int sc_len = is_annexb_start(payload, payload_len, 0);
         if (sc_len == 0) append_start_code();
     }
+    telemetry_accum_video_usable((u32)payload_len);
     append_to_frame(payload, payload_len);
 
     /* 4. Complete Frame Delivery */
@@ -287,12 +726,13 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
                 return;
             }
 
+            int drop_corrupt_frame = (g_frame_had_gaps && !g_fec_recovery_clean);
+
             /* Advance g_last_good_frame BEFORE the decode callback.
              * The callback blocks for the full CAVLC decode (up to 11s for
-             * a complex IDR on the 333 MHz PSP).  The CTRL PING thread
-             * piggybacks an FEC status on every keepalive so that Sunshine
-             * sees frame progress independently of decode latency.
-             * Updating lgf first keeps the two in sync.
+             * a complex IDR on the 333 MHz PSP).  Do not advance this counter
+             * before the decoder returns a displayable output; false progress
+             * makes stall detection and recovery less reliable.
              *
              * CRITICAL: Only advance after first IDR decoded, otherwise
              * every failing P-frame advances the counter and blocks
@@ -306,18 +746,12 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
              * 100 and triggering a massive-jump reset. */
             {
                 int delta = (s32)(frame_id - g_last_good_frame);
-                int force = (!g_idr_fully_decoded &&
-                             (g_last_good_frame == 0 || delta > 10));
-                /* Also force-advance for FEC-recovered frames — the data is
-                 * complete, so the frame counter should reflect progress. */
-                if (!force && g_fec_recovery_clean) {
-                    force = 1;
-                }
-                if ((g_idr_fully_decoded || force) &&
+                if (0 && !drop_corrupt_frame &&
+                    g_idr_fully_decoded &&
                     (g_last_good_frame == 0 ||
                     (delta > 0 && delta <= 100))) {
                     g_last_good_frame = frame_id;
-                } else {
+                } else if (0) {
                     RTP_LOG("[RTP] NOT advancing g_last_good=%u for fid=%u (delta=%d)\n",
                             g_last_good_frame, frame_id,
                             (int)(frame_id - g_last_good_frame));
@@ -336,21 +770,30 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
              * RS recovery is mathematically exact — don't mark corrupt. */
             if (g_frame_had_gaps && !g_fec_recovery_clean) {
                 s_consec_gap_frames++;
-                g_current_frame_is_corrupt = 1;
+                g_current_frame_is_corrupt = 0;
 
-                /* Escalate only on sustained corruption. Single-gap frames are
-                 * handled by decoder concealment plus RFI to avoid IDR storms. */
-                if (s_consec_gap_frames >= 2 || g_last_good_frame == 0) {
-                    g_refs_corrupted = 1;
+                /* This frame is dropped below and never enters OpenH264, so
+                 * the decoder DPB is still valid. Preserve refs and avoid
+                 * forcing a post-startup IDR wait that can freeze the stream. */
+                if (g_last_good_frame == 0) {
                     g_idr_fully_decoded = 0;
-                    diag_log_write("RTP", "frame %u has seq gaps -- refs corrupted (consec=%u), IDR",
+                    diag_log_write("RTP", "frame %u has seq gaps before first ref (consec=%u), IDR",
                                    frame_id, s_consec_gap_frames);
-                    control_stream_request_idr();
-                    s_consec_gap_frames = 0;
+                    control_stream_request_idr_force();
+                } else if (s_current_frame_idr_recovery) {
+                    u32 loss_start = s_current_idr_loss_start ? s_current_idr_loss_start : (g_last_good_frame + 1);
+                    diag_log_write("RTP", "IDR recovery frame %u had seq gaps, continuing IDR wait",
+                                   frame_id);
+                    rtp_start_idr_wait(loss_start, frame_id, frame_id, "gapped IDR recovery");
                 } else {
-                    diag_log_write("RTP", "frame %u has seq gaps (consec=%u), RFI",
+                    diag_log_write("RTP", "frame %u has seq gaps (consec=%u), dropped before decode",
                                    frame_id, s_consec_gap_frames);
-                    control_stream_request_rfi(frame_id, frame_id);
+                    rtp_mark_waiting_for_ref_inval(g_last_good_frame + 1, frame_id);
+                    control_stream_request_rfi(g_last_good_frame + 1, frame_id);
+                    if (s_consec_gap_frames >= 4) {
+                        g_refs_corrupted = 1;
+                        g_idr_fully_decoded = 0;
+                    }
                 }
                 signal_strength_report_frame_drop();
             } else if (g_frame_had_gaps && g_fec_recovery_clean) {
@@ -363,8 +806,17 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
             }
             /* Reset FEC clean flag for next frame */
             g_fec_recovery_clean = 0;
+            rtp_clear_current_idr_recovery();
 
-            rtp_frame_complete_callback(assembly_buffer, (int)assembly_pos);
+            if (!drop_corrupt_frame) {
+                g_last_decode_output_ok = 0;
+                g_decode_current_frame_id = frame_id;
+                rtp_frame_complete_callback(assembly_buffer, (int)assembly_pos);
+                rtp_advance_decoded_frame(frame_id);
+            } else {
+                diag_log_write("RTP", "frame %u dropped before decode due to unrecovered seq gaps",
+                               frame_id);
+            }
         }
         reassembling = 0;
         assembly_pos = 0;
@@ -375,11 +827,16 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
 void rtp_reassembly_reset(void) {
     assembly_pos = 0;
     current_frame_id = 0xFFFFFFFF;
+    s_last_seen_frame_id = 0xFFFFFFFF;
     expected_seq = 0;
     reassembling = 0;
     g_frame_had_gaps = 0;
     g_frame_overflow = 0;
     g_saw_first_sof = 0;
+    s_consec_gap_frames = 0;
+    rtp_clear_ref_inval_wait();
+    rtp_clear_idr_wait();
+    rtp_clear_current_idr_recovery();
 }
 
 void rtp_reassembly_flush_pre_ready_frames(void) {
@@ -389,4 +846,22 @@ void rtp_reassembly_flush_pre_ready_frames(void) {
 
 void rtp_reassembly_flush_partial_frame(void) {
     rtp_reassembly_reset();
+}
+
+void rtp_reassembly_prepare_fec_frame(u32 frame_id) {
+    if (current_frame_id != frame_id) {
+        return;
+    }
+
+    if (reassembling && assembly_pos > 0) {
+        RTP_LOG("[RTP] clearing stale partial frame %u before FEC submit\n",
+                frame_id);
+    }
+
+    assembly_pos = 0;
+    reassembling = 0;
+    g_frame_had_gaps = 0;
+    g_frame_overflow = 0;
+    g_saw_first_sof = 0;
+    expected_seq = 0;
 }

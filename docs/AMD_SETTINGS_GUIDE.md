@@ -80,7 +80,7 @@ Controls how the encoder manages bitrate (how many bits each frame gets).
 | `balanced` | Middle ground |
 | `quality` | Spend more time encoding for better-looking frames |
 
-**PSP recommendation:** `balanced` or `speed`. At 368×208 resolution, the quality difference is hard to see on the PSP's small screen.
+**PSP recommendation:** `balanced` or `speed`. At PSP preset sizes, the quality difference is hard to see on the PSP's small screen.
 
 ---
 
@@ -125,7 +125,7 @@ HRD (Hypothetical Reference Decoder) forces the encoder to produce a bitstream t
 
 When enabled, the encoder scans each frame before encoding it to make smarter compression decisions. This adds ~1 frame of latency.
 
-**PSP recommendation:** `disabled`. The PSP is already at 15 fps — adding latency is not worth the marginal quality improvement.
+**PSP recommendation:** `disabled`. The PSP is already latency constrained — adding latency is not worth the marginal quality improvement.
 
 ---
 
@@ -178,7 +178,7 @@ FEC adds redundant data to the stream so the PSP can recover from lost Wi-Fi pac
 | 30–50 | Poor Wi-Fi, frequent packet loss |
 | 50+ | Very unreliable network — but wastes bandwidth |
 
-**PSP recommendation:** `20–30`. Our testing showed FEC 20% worked well. Going to 50% is conservative but safe. Below 20% caused poor performance in testing.
+**PSP recommendation:** `35` as a starting point. Lower values may work on clean networks; higher values spend more of the small PSP bandwidth budget on parity.
 
 ---
 
@@ -223,7 +223,7 @@ Allows streaming without a physical monitor connected. Useful for dedicated stre
 
 ## A/B Test Results Summary
 
-We tested 14 encoder combinations on PSP at 368×208@15 fps, 384 kbps for 60 seconds each:
+Earlier hardware tests covered 14 encoder combinations on PSP at the old low-resolution profile. Keep the encoder choices below, but use the v1.2 preset ladder for stream size, frame rate, bitrate, packet size, and audio state:
 
 | Rank | Configuration | Peak FPS | Decode Latency | Stability | Notes |
 |------|--------------|----------|---------------|-----------|-------|
@@ -248,7 +248,7 @@ amd_enforce_hrd = disabled
 amd_preanalysis = disabled
 amd_vbaq = enabled
 qp = 28
-fec_percentage = 20
+fec_percentage = 35
 hevc_mode = 0
 av1_mode = 0
 ```

@@ -8,6 +8,50 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ---
 
+## [1.2.0] - 2026-05-18
+
+### Streaming Presets
+- Added a dedicated Preset row with PSP-focused Performance, Balanced, and Quality defaults.
+- Performance now defaults to 300x170 at 30 fps, 384 kbps, 1056-byte packets, and audio disabled.
+- Balanced now defaults to 360x204 at 20 fps, 480 kbps, 1200-byte packets, and audio enabled.
+- Quality now defaults to native 480x272 at 10 fps, 576 kbps, 1200-byte packets, and audio enabled.
+- Built-in stream sizes use the PSP LCD aspect ratio so presets fill the display without fixed black bars.
+- The Resolution row is independent from the Preset row, so manual resolution changes no longer reapply the whole preset ladder.
+- Packet size is now configurable from the settings menu and is saved to `config.ini`.
+
+### Pairing and Host Flow
+- Pairing now completes the authenticated HTTPS `pairchallenge` confirmation after the signed pairing secret.
+- Failed or cancelled pair attempts now best-effort unpair from the host so later attempts do not inherit stale half-paired state.
+- Stale paired-host entries are cleared when a host reports paired but returns an empty app list, allowing the user to pair again without manual config cleanup.
+- App-list loading and launch transitions prime both display buffers to avoid stale host-list/loading frames during slow network work.
+- Game-list fetch failure can fall back to a Desktop launch tile when the host app list is unavailable.
+
+### Input
+- Reworked the default PSP-to-Xbox mapping for full controller coverage:
+  - L + Triangle/Cross/Square/Circle maps to right stick up/down/left/right.
+  - L + D-pad Left/Right maps to LT/RT.
+  - L + D-pad Down/Up maps to L3/R3.
+- The Button Mapping UI now exposes the combo modifier, all virtual actions, and a right-stick source selector.
+- Added an optional `modifier + analog nub` right-stick mode.
+- Mapping files are versioned and legacy defaults migrate to the new v2 map.
+- Browser mode now sends mouse/keyboard input only, with stronger analog mouse acceleration.
+- App-owned combos such as HUD toggle and stream exit are consumed locally instead of also sending host input.
+
+### Telemetry and HUD
+- Added diagnostics telemetry for CPU, GPU, ME, RAM, media bandwidth, usable video bandwidth, audio bandwidth, local drops, loss, and FEC.
+- Diagnostics telemetry updates once per second even when the HUD is hidden.
+- HUD layout now places decode timing alongside latency and shows loss/FEC values from the RTP/FEC path.
+
+### Low-Work PSP Path
+- Performance preset disables local audio decode/playback by default to reduce PSP CPU, memory, and audio-thread work.
+- Audio Disabled remains client-side and can be changed from the PSP settings menu.
+- Video rendering applies the stream color/dither adjustment only to decoded video output, not to menu UI or HUD text.
+- Retail builds compile out diagnostics-only logging, telemetry formatting, and debug sampling at call sites so public XMB builds do less PSP work.
+
+### Build and Documentation
+- Public docs updated for v1.2 presets, packet-size setup, pairing behavior, and controller mapping.
+- Generated local build artifacts and internal audit notes are ignored so release diffs stay focused.
+
 ## [1.1.0] — 2026-05-06
 
 ### Networking

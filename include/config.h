@@ -34,38 +34,58 @@ typedef struct {
  * ~2-3 Mbps real-world with high packet loss on bursts).
  *
  * Low defaults are CRITICAL for stability:
- *  - 500 kbps keeps IDR keyframes under ~15KB (~15 RTP packets),
- *    dramatically reducing burst packet loss vs 1000+ kbps (~48KB/~47 pkts).
- *  - 15 FPS halves bandwidth pressure vs 30 FPS, giving WiFi headroom.
- *  - 480x272 is the sceMpeg AVC hardware decoder maximum.
+ *  - 300x170 is the lowest even PSP-panel-aspect stream above the host floor.
+ *  - 30 FPS is the current practical Performance anchor after the
+ *    29/30/31/32/33/34/35/36/37/40 fps sweep.
+ *  - 384 kbps / 1056-byte packets is the current Performance anchor:
+ *    adjacent bitrate and packet brackets did not improve PSP survival.
  *--------------------------------------------------------------------------*/
 /*
- * PSP-1000 Mathematical Optimum (706 hardware samples, 14 test runs):
+ * PSP-1000 current hardware evidence:
  *
  *   CPU:  Allegrex MIPS32 @ 333MHz, 16KB L1i+L1d, in-order single-issue
- *   WiFi: 802.11b 11Mbps theoretical, ~4.5Mbps sustained UDP
+ *   WiFi: 802.11b 11Mbps theoretical; burst loss is the practical limit
  *   ME:   YUV→RGBA in ~31µs (uncached DMA via 0x40000000)
  *   GE:   Bilinear upscale to 480×272 in ~2ms
  *
- *   Decode cost: 560 µs per 1000 pixels + 3031 µs fixed overhead (Run 101 measured)
- *   Bitrate:     500kbps flat (proven safe on 802.11b)
- *   VSync:       60Hz → valid fps: 15, 20, 30, 60
+ *   300x170@30fps = 1,530,000 pixels/sec. The latest 2026-05-17
+ *   Performance sweep has not promoted any preset to production readiness:
+ *   - 30fps/384kbps/p1056/FEC35/min1/audio60 is the best current
+ *     exact-aspect Performance packet bracket.
+ *   - 31fps and 35fps remain high-side evidence points, not stable defaults.
+ *   - 360x204@20fps/480kbps is the current Balanced exact-aspect candidate.
+ *   - 480x272@10fps/576kbps is the required native Quality bracket anchor.
  *
- *   Quality:     368×208 @15fps @500kbps  → 45.9ms/frame (68.8% of 66.7ms budget)
- *   Balanced:    256×144 @30fps @500kbps  → 23.7ms/frame (71.0% of 33.3ms budget)
- *   Performance: 256×144 @20fps @500kbps  → 23.7ms/frame (47.3% of 50ms budget)
+ *   Defaults use the practical Performance anchor because it is the best
+ *   repeatable low-work setting found so far on PSP-1000 hardware. Any future
+ *   changes should be based on real PSP playback, input, audio, HUD, and log
+ *   evidence rather than desktop-only testing.
+ *   VSync:       60Hz -> valid fps: 10, 15, 20, 30, 60
  *
- *   NOTE: 192x112 dropped — Sunshine rejects resolutions below ~256x144.
+ *   Performance: 300x170 @30fps @384kbps p1056, audio and AV encryption disabled.
+ *   Balanced:    360x204 @20fps @480kbps p1200, audio enabled, still stress-only.
+ *   Quality:     480x272 @10fps @576kbps p1200, audio enabled, native requirement.
  *
- *   Bitrate: 500kbps flat (proven stable on 802.11b, IDR < 15KB).
- *   Higher bitrate scales decode cost ~linearly (804kbps → 637 µs/Kpx MEASURED).
+ *   Audio Disabled is client-side low work: keep audio RTSP keepalive,
+ *   drain/drop audio RTP, and skip Opus/SRC/playback. It is not zero-RTP
+ *   without explicit server support.
+ *
+ *   NOTE: non-30:17 sizes are not presets because they can introduce bars,
+ *   aspect distortion, or host-side padding. Sunshine also rejects very small
+ *   streams, so Performance starts at 300x170 instead of 240x136.
+ *
+ *   Higher bitrate and packet sizes are not promoted from comments; they must
+ *   prove better end-to-end behavior on real PSP hardware.
  */
-#define DEFAULT_WIDTH           368     /* Quality preset — best visual at 15fps */
-#define DEFAULT_HEIGHT          208     /* ~16:9 (1.769), mod-16 aligned */
-#define DEFAULT_FPS             15      /* 60Hz/4 — highest safe fps for 368x208 */
-#define DEFAULT_BITRATE         384     /* 384kbps — WiFi-safe default */
-#define MAX_BITRATE             2760    /* ~4.5Mbps WiFi - 25% FEC - 15% safety */
-#define DEFAULT_PACKET_SIZE     1024
+#define DEFAULT_WIDTH           300
+#define DEFAULT_HEIGHT          170
+#define DEFAULT_FPS             30
+#define MIN_BITRATE             192
+#define DEFAULT_BITRATE         384
+#define MAX_BITRATE             2760
+#define MIN_STREAM_PACKET_SIZE  512
+#define MAX_STREAM_PACKET_SIZE  1392
+#define DEFAULT_PACKET_SIZE     1056
 #define DEFAULT_CONTROL_MODE    CONTROL_MODE_XBOX
 
 /*--------------------------------------------------------------------------
@@ -79,9 +99,10 @@ typedef struct {
  *
  * Reads configuration from "ms0:/moonlight/config.ini" file.
  * If the file doesn't exist or is corrupted, initializes with defaults:
- * - 480x272 (PSP native, sceMpeg AVC hardware limit)
+ * - 300x170
  * - 30 FPS
- * - 1500 kbps bitrate
+ * - 384 kbps bitrate
+ * - 1056 byte packet size
  *
  * Returns: 0 on success, -1 on error (defaults applied)
  */
@@ -149,10 +170,11 @@ int config_add_paired_host(PspConfig *config, const char *ip);
  * @config: Pointer to PspConfig structure to initialize
  *
  * Sets defaults:
- * - 480x272 (PSP native + sceMpeg AVC hardware decoder maximum)
- * - 15 FPS (stable on 802.11b)
- * - 500 kbps bitrate (small IDRs for reliable WiFi delivery)
- * - Analog control mode
+ * - 300x170
+ * - 30 FPS
+ * - 384 kbps bitrate
+ * - 1056 byte packet size
+ * - Xbox control mode
  */
 void configSetDefaults(PspConfig *config);
 

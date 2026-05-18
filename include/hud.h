@@ -21,6 +21,18 @@ typedef struct {
     int   battery_pct;      /* PSP battery percentage (0-100) */
     int   host_proc_ms;     /* Host-side encode latency in ms */
     int   decode_ms;        /* Per-frame decode duration in ms */
+    int   cpu_pct;          /* Main CPU decode-side utilization window */
+    int   gpu_pct;          /* GU submit/sync utilization window */
+    int   me_pct;           /* Media Engine conversion utilization window */
+    int   ram_used_pct;     /* Stream RAM used relative to stream-start free RAM */
+    int   ram_free_kb;      /* Current free RAM in KB */
+    int   ram_largest_kb;   /* Largest free memory block in KB */
+    int   bw_rx_kbps;       /* Raw UDP media bandwidth */
+    int   bw_usable_kbps;   /* H.264 bytes accepted by reassembly */
+    int   bw_audio_kbps;    /* Raw UDP audio bandwidth */
+    int   bw_drop_kbps;     /* Video bytes dropped before decode */
+    int   bw_usable_pct;    /* H.264 usable bytes / raw video bytes */
+    int   bw_video_packets_s; /* Video packets per second */
 } HudStats;
 
 /*============================================================================
@@ -69,6 +81,14 @@ int hud_handle_input(u32 buttons);
  * Returns: 1 if visible, 0 if hidden
  */
 int hud_is_visible(void);
+
+/*
+ * hud_overlay_visible - Check if the HUD overlay itself should be drawn.
+ *
+ * hud_is_visible() also stays true during post-toggle input cooldown, while
+ * this returns only the real overlay state.
+ */
+int hud_overlay_visible(void);
 
 /*
  * hud_shutdown - Clean up HUD resources

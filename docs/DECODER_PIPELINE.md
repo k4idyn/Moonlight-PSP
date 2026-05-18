@@ -1,9 +1,9 @@
-﻿# OpenH264 + ME Dual-Core Decode Pipeline
+# OpenH264 + ME Dual-Core Decode Pipeline
 
 _PSP Moonlight - OpenH264 low-latency decoder_
 
 This document describes the active H.264 decode pipeline used in PSP Moonlight. The prior
-`sceMpeg`-based approach (see `docs/ME_DECODER_THREAD_README.md` for historical context) was
+`sceMpeg`-based approach (see `docs/ME_DECODER_THREAD.md` for historical context) was
 abandoned because the `sceMpeg` ringbuffer model is incompatible with the Moonlight RTP stream
 model. The legacy FFmpeg pipeline has been replaced by a custom OpenH264 PSP port optimised
 for low-latency streaming. Everything in this document describes the current software pipeline.
@@ -52,7 +52,7 @@ Throughput = `max(OpenH264_decode_ms, ME_convert_ms)` - not their sum.
 | Internal buffering | May buffer frames for reordering | No reorder buffering (streaming mode) |
 | Thread overhead | Thread-safe mutexes (unused on PSP) | Compiled with DISABLE_DECODER_MT, zero sync |
 | Error concealment | Full re-decode on error | SLICE_COPY - copies previous slice, no re-decode |
-| CABAC support | Not available in PSP build | CAVLC is required for normal PSP v1.1 playback. CABAC test runs exist only to verify host-side detection and fail-fast behavior; normal-mode CABAC streams are treated as unsupported and aborted. |
+| CABAC support | Not available in PSP build | CAVLC is required for normal PSP playback. CABAC streams are treated as unsupported and return to the menu instead of falling back to a slow decode path. |
 | Trace logging | Always active | Disabled via DECODER_OPTION_TRACE_LEVEL=0 |
 | Source control | Binary cross-compiled library | Full source - recompilable with PSP-specific flags |
 

@@ -82,6 +82,8 @@ static const unsigned int k_tile_colours[] = {
 #define PALETTE_SIZE  (int)(sizeof(k_tile_colours)/sizeof(k_tile_colours[0]))
 #define UI_COL_SHADOW 0x50000000u  /* Uniform tile drop-shadow */
 
+#define DESKTOP_FALLBACK_APP_ID 881448767
+
 /* =========================================================================
  * Internal tile descriptor
  * ========================================================================= */
@@ -103,7 +105,7 @@ typedef struct {
     float    focus_anim;     /* 0.0 -> 1.0 scaling factor */
     char     cached_host[64];
     int      empty_repaired; /* 1 = already forced re-pair for 0-app list */
-    uint32_t sentinel; 
+    uint32_t sentinel;
 } GridState;
 
 /* Target 2026 high-fluidity motion */
@@ -120,6 +122,22 @@ static void check_corruption(const char *loc) {
         grid_log("[CRITICAL] GridState corruption at %s! sentinel=0x%08X\n", loc, s_state.sentinel);
         s_state.sentinel = 0xDEADBEEF;
     }
+}
+
+static void set_desktop_fallback_tile(const char *reason)
+{
+    memset(s_tiles, 0, sizeof(s_tiles));
+    strncpy(s_tiles[0].title, "Desktop", sizeof(s_tiles[0].title) - 1);
+    s_tiles[0].title[sizeof(s_tiles[0].title) - 1] = '\0';
+    s_tiles[0].app_id = DESKTOP_FALLBACK_APP_ID;
+    s_tiles[0].bg_colour = k_tile_colours[0];
+    s_tiles[0].icon_rgb565 = NULL;
+    s_num_tiles = 1;
+    s_selected = 0;
+    s_state.scroll_curr = 0.0f;
+    s_state.focus_anim = 0.0f;
+    grid_log("Desktop fallback tile enabled after app-list failure (%s), appid=%d\n",
+             reason ? reason : "unknown", DESKTOP_FALLBACK_APP_ID);
 }
 
 static void update_animations(void) {
@@ -150,13 +168,22 @@ static int tile_screen_pos(int idx, int *out_x, int *out_y)
     /* Center the current scroll 'focus' point at (SCREEN_W / 2) */
     float center_x = (float)SCREEN_W / 2.0f;
     float tile_center_offset = (float)ICON_W / 2.0f;
-    
+
     *out_x = (int)(center_x - tile_center_offset + ((float)idx - scroll) * (float)(ICON_W + GRID_PAD));
     *out_y = GRID_START_Y;
-    
+
     if (*out_x + ICON_W < -40) return 0;
     if (*out_x > SCREEN_W + 40) return 0;
     return 1;
+}
+
+static void render_loading_frame(const char *label)
+{
+    ui_begin_frame();
+    ui_draw_gradient_bg(g_ui_bg_color, g_ui_bg_color);
+    ui_draw_header("Game Library");
+    ui_draw_spinner(-1, SCREEN_H / 2 - 20, label);
+    ui_end_frame();
 }
 
 /* =========================================================================
@@ -195,7 +222,7 @@ static void render_grid(void)
         int focused = (i == s_selected);
 
         /* Carousel Layer Order: Shadow -> Solid Card Base -> Flat Image -> Thick Overlay Bezel */
-        
+
         int pad = 6; /* 6px padding: Card is physically larger than the image */
         int card_x = ox - pad;
         int card_y = oy - pad;
@@ -250,12 +277,11 @@ static void load_games_from_server(const char *host_ip)
 {
     static GameList s_game_list;
 
-    /* Show loading spinner */
-    ui_begin_frame();
-    ui_draw_gradient_bg(g_ui_bg_color, g_ui_bg_color);
-    ui_draw_header("Game Library");
-    ui_draw_spinner(-1, SCREEN_H / 2 - 20, "Parsing games list...");
-    ui_end_frame();
+    /* Fill both display buffers with the app-list loading state before the
+     * blocking HTTPS/icon work starts. Otherwise one buffer can still contain
+     * Host Discovery and the LCD alternates hosts/apps during the handoff. */
+    render_loading_frame("Parsing games list...");
+    render_loading_frame("Parsing games list...");
 
     game_list_init(&s_game_list, host_ip);
     int ret = game_list_fetch(&s_game_list);
@@ -267,8 +293,8 @@ static void load_games_from_server(const char *host_ip)
         ui_draw_error_modal("Failed to Load Games", msg, "Check host IP and Sunshine.   {O}: Back");
         ui_end_frame();
         sceKernelDelayThread(3 * 1000 * 1000);
-        s_num_tiles = 0;
         s_fetch_error = 1;
+        set_desktop_fallback_tile("fetch");
         return;
     }
     s_fetch_error = 0;
@@ -290,6 +316,7 @@ static void load_games_from_server(const char *host_ip)
     }
     s_num_tiles = count;
     grid_log("load_games_from_server: populated %d tiles (count=%d)\n", s_num_tiles, count);
+    diag_log_flush();
     check_corruption("load_games_from_server_finish");
 }
 
@@ -300,7 +327,7 @@ static void load_games_from_server(const char *host_ip)
 extern "C" int game_grid_ui_run(const char *host_ip)
 {
 
-    grid_log("game_grid_ui_run: entered (host=%s cached=%s num_tiles=%d)\n", 
+    grid_log("game_grid_ui_run: entered (host=%s cached=%s num_tiles=%d)\n",
              host_ip ? host_ip : "NULL", s_cached_host, s_num_tiles);
     check_corruption("game_grid_ui_run_entry");
 
@@ -340,13 +367,22 @@ extern "C" int game_grid_ui_run(const char *host_ip)
 
     check_corruption("game_grid_ui_run_loop_start");
 
+    /* The game list is the launch boundary between menu UI and stream UI.
+     * Paint it into both display buffers before accepting input so a later
+     * app launch cannot flip back to a stale loading/host-list buffer. */
+    render_grid();
+    render_grid();
+    (void)ui_process_input();
+    grid_log("game_grid_ui_run: primed both display buffers before input\n");
+    diag_log_flush();
+
     /* Auto-launch DISABLED — manual navigation only via RemoteJoy */
 
     while (1) {
         UIEvent evt = ui_process_input();
 
         if (evt != UI_EVT_NONE) {
-            grid_log("game_grid_ui_run: event=%d num_tiles=%d selected=%d\n", 
+            grid_log("game_grid_ui_run: event=%d num_tiles=%d selected=%d\n",
                      (int)evt, s_num_tiles, s_selected);
         }
 

@@ -10,7 +10,7 @@
  *   - 32-pixel sliced blitting (works around GPU texture cache limits)
  *   - Rotation support via sceGumRotateZ matrix transforms
  *   - Proper texture scale/offset management
- *   - sceKernelDcacheWritebackInvalidateAll() for cache coherency
+ *   - Targeted texture-range dcache writeback for cache coherency
  *
  * Both H.264 (sceMpeg) and JPEG (sceJpeg) decoded RGBA8888 frames
  * are rendered through this unified display path.
@@ -25,6 +25,8 @@
 #include <string.h>
 
 #include "shared.h"
+#include "runtime_telemetry.h"
+#include "hud.h"
 
 /* Unified resolution table — single source of truth for stream dimensions */
 #include "stream_resolution.h"
@@ -49,6 +51,63 @@ static void *s_frame_buffer = NULL;
 
 /* Last frame tracking — enables menu overlay redraw (PSPdisp pattern) */
 static void *s_last_frame_data = NULL;
+static u8 s_last_frame_copy[BUF_WIDTH * SCR_HEIGHT * 4] __attribute__((aligned(64)));
+static int s_last_frame_copy_valid = 0;
+
+static const ScePspIMatrix4 s_video_dither_matrix __attribute__((aligned(16))) = {
+    { -4,  0, -3,  1 },
+    {  2, -2,  3, -1 },
+    { -3,  1, -4,  0 },
+    {  3, -1,  2, -2 }
+};
+
+/* Stable frame storage is only needed while the HUD is compositing over
+ * repeated video. The normal stream path can hand decoded buffers directly to
+ * the GE, avoiding a per-frame CPU memcpy of the full texture stride. */
+static void *display_prepare_frame_texture(void *frame_data,
+                                           int src_w, int src_h,
+                                           int tex_stride)
+{
+    size_t src_row_bytes;
+    size_t tex_row_bytes;
+    size_t copy_span;
+    int y;
+
+    if (!frame_data)
+        return NULL;
+
+    if (frame_data == (void *)s_last_frame_copy && s_last_frame_copy_valid) {
+        s_last_frame_data = s_last_frame_copy;
+        return frame_data;
+    }
+
+    src_row_bytes = (size_t)src_w * 4u;
+    tex_row_bytes = (size_t)tex_stride * 4u;
+    copy_span = tex_row_bytes * (size_t)src_h;
+
+    if (hud_overlay_visible() &&
+        src_w <= BUF_WIDTH && src_h <= SCR_HEIGHT &&
+        src_w <= tex_stride &&
+        tex_stride <= BUF_WIDTH &&
+        copy_span <= sizeof(s_last_frame_copy)) {
+        const u8 *src = (const u8 *)frame_data;
+        u8 *dst = s_last_frame_copy;
+
+        for (y = 0; y < src_h; y++) {
+            memcpy(dst + (size_t)y * tex_row_bytes,
+                   src + (size_t)y * tex_row_bytes,
+                   src_row_bytes);
+        }
+
+        s_last_frame_data = s_last_frame_copy;
+        s_last_frame_copy_valid = 1;
+        return s_last_frame_copy;
+    }
+
+    s_last_frame_data = frame_data;
+    s_last_frame_copy_valid = 0;
+    return frame_data;
+}
 
 /* ------------------------------------------------------------------ *
  * Vertex struct for 2D textured sprite (proven PSP hardware approach)
@@ -233,14 +292,10 @@ void display_init(void)
  * ------------------------------------------------------------------ */
 void display_frame(void *frame_data)
 {
+    u32 gpu_start_us;
+
     if (!frame_data)
         return;
-
-    s_last_frame_data = frame_data;
-
-    sceKernelDcacheWritebackInvalidateAll();
-
-    sceGuStart(GU_DIRECT, display_list);
 
     /* Determine actual source dimensions from unified resolution table */
     int src_w = g_stream_res.initialized ? g_stream_res.width  : (g_psp_config.width  > 0 ? g_psp_config.width  : PSP_LCD_WIDTH);
@@ -249,6 +304,18 @@ void display_frame(void *frame_data)
     /* Texture buffer width (stride in pixels) — from resolution table.
      * Must be power-of-2 and >= source width. */
     int tex_stride = g_stream_res.initialized ? g_stream_res.stride : ((src_w > 512) ? 1024 : 512);
+
+    frame_data = display_prepare_frame_texture(frame_data, src_w, src_h, tex_stride);
+    if (!frame_data)
+        return;
+
+    /* Only the active texture rows need to be visible to the GE. The old
+     * whole-cache writeback evicted hot decoder/network state every frame. */
+    sceKernelDcacheWritebackRange(frame_data, tex_stride * src_h * 4);
+
+    gpu_start_us = sceKernelGetSystemTimeLow();
+
+    sceGuStart(GU_DIRECT, display_list);
 
     /* RESTORE GU STATE AFTER POTENTIAL HUD/UI MODIFICATION
      * The HUD uses intraFont which corrupts TexScale, TexOffset, Mode, Disable Blending, etc.
@@ -261,7 +328,14 @@ void display_frame(void *frame_data)
     sceGuTexFilter(GU_NEAREST, GU_NEAREST); /* Reset filter — set per-pass below */
 
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuSetDither(&s_video_dither_matrix);
+    sceGuEnable(GU_DITHER);
+    /* The YUV->RGBA converter already applies the video-only black-point,
+     * luma gain, and ordered dither. Do not dim the finished texture here:
+     * GPU modulation compresses the range again and works against screenshot
+     * review without reducing decode, network, or memory load. */
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuColor(0xFFFFFFFF);
 
     if (src_w <= 512) {
         /* Single-pass: source fits in one 512-wide texture page.
@@ -300,8 +374,13 @@ void display_frame(void *frame_data)
         display_sliced_blit_upscale(pass2_src_w, src_h, pass2_scr_w, SCR_HEIGHT, pass1_scr_w, 0);
     }
 
+    sceGuDisable(GU_DITHER);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuColor(0xFFFFFFFF);
+
     sceGuFinish();
     sceGuSync(0, 0);
+    telemetry_accum_gpu(sceKernelGetSystemTimeLow() - gpu_start_us);
 }
 
 /* ------------------------------------------------------------------ *

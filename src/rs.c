@@ -37,6 +37,8 @@
 /* #include <stdio.h> -- not available on PSP */
 #include <stdlib.h>
 #include <string.h>
+#include <pspkernel.h>
+#include <pspthreadman.h>
 
 /* #include <assert.h> */
 #include "rs.h"
@@ -84,10 +86,11 @@ static gf gf_mul_table[(GF_SIZE + 1)*(GF_SIZE + 1)] __attribute__((aligned (256)
 /* Static RS workspaces (PSP-1000 deterministic memory policy).
  * We maintain a single active reed_solomon context in fixed storage. */
 static reed_solomon s_rs_ctx;
-static gf s_rs_vm_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+static gf s_rs_vm_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX] __attribute__((unused));
 static gf s_rs_top_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
 static gf s_rs_matrix_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
 static gf s_rs_parity_buf[DATA_SHARDS_MAX * DATA_SHARDS_MAX];
+static SceUID s_rs_sem = -1;
 
 /*
  * modnn(x) computes x % GF_SIZE, where GF_SIZE is 2**GF_BITS - 1,
@@ -126,7 +129,7 @@ static void mul(gf *dst1, gf *src1, gf c, int sz) {
 }
 
 /* y = a.dot(b) */
-static gf* multiply1(gf *a, int ar, int ac, gf *b, int br, int bc) {
+static __attribute__((unused)) gf* multiply1(gf *a, int ar, int ac, gf *b, int br, int bc) {
     gf *new_m, tg;
     int r, c, i, ptr = 0;
 
@@ -232,7 +235,7 @@ static void generate_gf(void) {
  * (Gauss-Jordan, adapted from Numerical Recipes in C)
  * Return non-zero if singular.
  */
-static int invert_mat(gf *src, int k) {
+static int __attribute__((unused)) invert_mat(gf *src, int k) {
     gf c, *p;
     int irow, icol, row, col, i, ix;
 
@@ -281,7 +284,7 @@ static int invert_mat(gf *src, int k) {
             (void)0;
             goto fail ;
         }
-        
+
         found_piv:
         ++(ipiv[icol]);
         /*
@@ -350,7 +353,7 @@ static int invert_mat(gf *src, int k) {
 /*
  * Not check for input params
  * */
-static gf* sub_matrix(gf* matrix, int rmin, int cmin, int rmax, int cmax,  int nrows, int ncols) {
+static __attribute__((unused)) gf* sub_matrix(gf* matrix, int rmin, int cmin, int rmax, int cmax,  int nrows, int ncols) {
     int i, j, ptr = 0;
     int rows = rmax - rmin;
     int cols = cmax - cmin;
@@ -395,12 +398,29 @@ static inline int code_some_shards(gf* matrixRows, gf** inputs, gf** outputs, in
 void reed_solomon_init(void) {
     generate_gf();
     init_mul_table();
+    if (s_rs_sem < 0) {
+        s_rs_sem = sceKernelCreateSema("rs_global", 0, 1, 1, NULL);
+    }
+}
+
+void reed_solomon_global_lock(void) {
+    if (s_rs_sem < 0) {
+        reed_solomon_init();
+    }
+    if (s_rs_sem >= 0) {
+        sceKernelWaitSema(s_rs_sem, 1, NULL);
+    }
+}
+
+void reed_solomon_global_unlock(void) {
+    if (s_rs_sem >= 0) {
+        sceKernelSignalSema(s_rs_sem, 1);
+    }
 }
 
 reed_solomon* reed_solomon_new(int data_shards, int parity_shards) {
-    gf* vm = s_rs_vm_buf;
-    gf* top;
     reed_solomon* rs = &s_rs_ctx;
+    int i, j;
 
     memset(rs, 0, sizeof(*rs));
     rs->data_shards = data_shards;
@@ -411,37 +431,17 @@ reed_solomon* reed_solomon_new(int data_shards, int parity_shards) {
         return NULL;
     }
 
-    memset(vm, 0, (size_t)(data_shards * rs->shards));
-    {
-        int ptr = 0;
-        for (int row = 0; row < rs->shards; row++) {
-            for (int col = 0; col < data_shards; col++)
-                vm[ptr++] = row == col ? 1 : 0;
+    memset(s_rs_matrix_buf, 0, sizeof(s_rs_matrix_buf));
+    memset(s_rs_parity_buf, 0, sizeof(s_rs_parity_buf));
+    rs->m = s_rs_matrix_buf;
+    rs->parity = s_rs_parity_buf;
+
+    /* Sunshine/moonlight-common-c nanors parity matrix. */
+    for (j = 0; j < parity_shards; j++) {
+        gf *row = rs->parity + j * data_shards;
+        for (i = 0; i < data_shards; i++) {
+            row[i] = inverse[(parity_shards + i) ^ j];
         }
-    }
-
-    top = sub_matrix(vm, 0, 0, data_shards, data_shards, rs->shards, data_shards);
-    if (NULL == top) {
-        return NULL;
-    }
-
-    if (invert_mat(top, data_shards) != 0) {
-        return NULL;
-    }
-
-    rs->m = multiply1(vm, rs->shards, data_shards, top, data_shards, data_shards);
-    if (NULL == rs->m) {
-        return NULL;
-    }
-
-    for (int j = 0; j < parity_shards; j++) {
-        for (int i = 0; i < data_shards; i++)
-            rs->m[(data_shards + j)*data_shards + i] = inverse[(parity_shards + i) ^ j];
-    }
-
-    rs->parity = sub_matrix(rs->m, data_shards, 0, rs->shards, data_shards, rs->shards, data_shards);
-    if (NULL == rs->parity) {
-        return NULL;
     }
 
     return rs;
@@ -466,72 +466,128 @@ void reed_solomon_release(reed_solomon* rs) {
  * */
 static gf s_dataDecodeMatrix[DATA_SHARDS_MAX*DATA_SHARDS_MAX];
 static unsigned char* s_subShards[DATA_SHARDS_MAX];
-static unsigned char* s_outputs[DATA_SHARDS_MAX];
+static gf s_nano_erasures[DATA_SHARDS_MAX];
+static gf s_nano_colperm[DATA_SHARDS_MAX];
+static gf s_nano_rowperm[DATA_SHARDS_MAX];
+static gf s_nano_marks[DATA_SHARDS_MAX];
 
-static int reed_solomon_decode(reed_solomon* rs, unsigned char **data_blocks, int block_size, unsigned char **dec_fec_blocks, unsigned int *fec_block_nos, unsigned int *erased_blocks, int nr_fec_blocks) {
-    gf* dataDecodeMatrix = s_dataDecodeMatrix;
-    unsigned char** subShards = s_subShards;
-    unsigned char** outputs = s_outputs;
-    gf* m = rs->m;
-    int i, j, c, swap, subMatrixRow, dataShards;
+static int nanors_invert_mat(gf *src, gf *wrk, unsigned char **dst,
+                             int V0, int K, int T, gf *c, gf *d)
+{
+    int V0b = V0;
+    int W = K - V0;
+    int i, j, x, row;
+    gf u;
 
-    /* the erased_blocks should always sorted
-     * if sorted, nr_fec_blocks times to check it
-     * if not, sort it here
-     * */
-    for (i = 0; i < nr_fec_blocks; i++) {
-        swap = 0;
-        for (j = i+1; j < nr_fec_blocks; j++) {
-            if (erased_blocks[i] > erased_blocks[j]) {
-                /* the prefix is bigger than the following, swap */
-                c = erased_blocks[i];
-                erased_blocks[i] = erased_blocks[j];
-                erased_blocks[j] = c;
-
-                swap = 1;
-            }
-        }
-        if (!swap)
-            break;
+    for (i = 0; i < W; i++) {
+        int dr = d[i] * K;
+        for (j = 0; j < W; j++)
+            wrk[i * W + j] = src[dr + c[V0 + j]];
     }
 
-    j = 0;
-    subMatrixRow = 0;
-    dataShards = rs->data_shards;
-    for (i = 0; i < dataShards; i++) {
-        if (j < nr_fec_blocks && i == (int)erased_blocks[j])
-            j++;
-        else {
-            /* this row is ok */
-            for (c = 0; c < dataShards; c++)
-                dataDecodeMatrix[subMatrixRow*dataShards + c] = m[i*dataShards + c];
-
-            subShards[subMatrixRow] = data_blocks[i];
-            subMatrixRow++;
+    for (; V0 < K; V0++) {
+        int dr = d[V0 - V0b] * K;
+        for (row = 0; row < V0b; row++) {
+            u = src[dr + c[row]];
+            addmul(dst[c[V0]], dst[c[row]], u, T);
         }
     }
 
-    for (i = 0; i < nr_fec_blocks && subMatrixRow < dataShards; i++) {
-        subShards[subMatrixRow] = dec_fec_blocks[i];
-        j = dataShards + fec_block_nos[i];
-        for (c = 0; c < dataShards; c++)
-            dataDecodeMatrix[subMatrixRow*dataShards + c] = m[j*dataShards + c];
-
-        subMatrixRow++;
+    for (x = 0; x < W; x++) {
+        u = wrk[x * W + x];
+        if (u == 0)
+            return -1;
+        u = inverse[u];
+        mul(wrk + x * W + x, wrk + x * W + x, u, W);
+        mul(dst[c[V0b + x]], dst[c[V0b + x]], u, T);
+        for (row = x + 1; row < W; row++) {
+            u = wrk[row * W + x];
+            addmul(wrk + row * W, wrk + x * W, u, W);
+            addmul(dst[c[V0b + row]], dst[c[V0b + x]], u, T);
+        }
     }
 
-    if (subMatrixRow < dataShards)
+    for (x = W - 1; x >= 0; x--) {
+        unsigned char *from = dst[c[V0b + x]];
+        for (row = 0; row < x; row++) {
+            u = wrk[row * W + x];
+            addmul(dst[c[V0b + row]], from, u, T);
+        }
+    }
+
+    return 0;
+}
+
+static int nanors_decode_shards(reed_solomon* rs, unsigned char **data,
+                                unsigned char *marks, int nr_shards,
+                                int block_size)
+{
+    int ds = rs->data_shards;
+    int gaps = 0;
+    int i, j;
+
+    if (nr_shards < rs->shards)
         return -1;
 
-    invert_mat(dataDecodeMatrix, dataShards);
+    for (i = 0; i < ds; i++) {
+        if (marks[i])
+            s_nano_erasures[gaps++] = (gf)i;
+    }
+    if (gaps == 0)
+        return 0;
 
-    for (i = 0; i < nr_fec_blocks; i++) {
-        j = erased_blocks[i];
-        outputs[i] = data_blocks[j];
-        memmove(dataDecodeMatrix+i*dataShards, dataDecodeMatrix+j*dataShards, dataShards);
+    for (i = 0, j = 0; i < ds - gaps; i++, j++) {
+        while (j < ds && marks[j])
+            j++;
+        if (j >= ds)
+            return -1;
+        s_nano_colperm[i] = (gf)j;
+    }
+    for (i = 0, j = ds - gaps; i < gaps; i++, j++)
+        s_nano_colperm[j] = s_nano_erasures[i];
+
+    for (i = 0, j = ds; i < gaps; i++, j++) {
+        while (j < nr_shards && marks[j])
+            j++;
+        if (j >= nr_shards)
+            return -1;
+        s_nano_rowperm[i] = (gf)(j - ds);
+        memcpy(data[s_nano_erasures[i]], data[j], block_size);
     }
 
-    return code_some_shards(dataDecodeMatrix, subShards, outputs, dataShards, nr_fec_blocks, block_size);
+    return nanors_invert_mat(rs->parity, s_dataDecodeMatrix, data,
+                             ds - gaps, ds, block_size,
+                             s_nano_colperm, s_nano_rowperm);
+}
+
+static int reed_solomon_decode(reed_solomon* rs, unsigned char **data_blocks, int block_size, unsigned char **dec_fec_blocks, unsigned int *fec_block_nos, unsigned int *erased_blocks, int nr_fec_blocks) {
+    int i;
+    int total = rs->shards;
+
+    if (total > DATA_SHARDS_MAX)
+        return -1;
+
+    for (i = 0; i < total; i++) {
+        s_subShards[i] = NULL;
+        s_nano_marks[i] = 1;
+    }
+
+    for (i = 0; i < rs->data_shards; i++) {
+        s_subShards[i] = data_blocks[i];
+        s_nano_marks[i] = 0;
+    }
+
+    for (i = 0; i < nr_fec_blocks; i++) {
+        if (erased_blocks[i] < (unsigned int)rs->data_shards)
+            s_nano_marks[erased_blocks[i]] = 1;
+        if (fec_block_nos[i] < (unsigned int)rs->parity_shards) {
+            s_subShards[rs->data_shards + fec_block_nos[i]] = dec_fec_blocks[i];
+            s_nano_marks[rs->data_shards + fec_block_nos[i]] = 0;
+        }
+    }
+
+    return nanors_decode_shards(rs, s_subShards, s_nano_marks,
+                                total, block_size);
 }
 
 /**
@@ -599,7 +655,9 @@ int reed_solomon_reconstruct(reed_solomon* rs, unsigned char** shards, unsigned 
             }
 
             if (dn == pn) {
-                reed_solomon_decode(rs, data_blocks, block_size, dec_fec_blocks, fec_block_nos, erased_blocks, dn);
+                int ret = reed_solomon_decode(rs, data_blocks, block_size, dec_fec_blocks, fec_block_nos, erased_blocks, dn);
+                if (ret != 0)
+                    err = ret;
             } else
                 err = -1;
         }

@@ -24,8 +24,9 @@
  * Constants
  *============================================================================*/
 
-/* GU command list buffer for HUD — 16 KB (sufficient for overlay) */
-static u32 __attribute__((aligned(16))) hud_display_list[16 * 1024 / 4];
+/* GU command list buffer for HUD. 96 KB prevents intraFont/stat expansion
+ * from overrunning the list when diagnostics are enabled. */
+static u32 __attribute__((aligned(16))) hud_display_list[96 * 1024 / 4];
 
 /* HUD overlay colors — derived from the active theme where possible.
  * The semi-transparent BG and border stay fixed so the overlay is
@@ -36,11 +37,16 @@ static u32 __attribute__((aligned(16))) hud_display_list[16 * 1024 / 4];
 #define HUD_BORDER_COLOR    UI_COL_BORDER
 
 /* HUD dimensions and positioning */
-#define HUD_WIDTH           200
+#define HUD_WIDTH           238
 #define HUD_X               (FRAME_WIDTH - HUD_WIDTH - 10)  /* Top-right */
 #define HUD_Y               10
 #define HUD_PADDING         8
 #define HUD_LINE_HEIGHT     16
+#ifdef RETAIL_BUILD
+#define HUD_STAT_LINES      4
+#else
+#define HUD_STAT_LINES      8
+#endif
 
 /* Menu item indices */
 #define MENU_ITEM_PAUSE     0
@@ -68,7 +74,7 @@ typedef struct {
  * Internal State
  *============================================================================*/
 
-static HudStats g_stats = { 0, 0.0f, 0.0f, 0.0f, 0, 0 };     /* Current statistics (latency, fps) */
+static HudStats g_stats = { 0 };             /* Current statistics (latency, fps) */
 static int g_hud_visible = 0;               /* HUD visibility flag */
 static int g_hud_cooldown = 0;              /* Frames to suppress input after toggle */
 static int g_selected_item = 0;             /* Currently selected menu item */
@@ -160,18 +166,13 @@ void hud_render(void)
 
     ui_set_blend(1);
     /* Compute panel height dynamically based on content:
-     * 5 stat lines + optional Host/Decode lines + separator + 2 menu items + padding */
+     * stat lines + separator + 2 menu items + padding */
     {
         int hud_height = HUD_PADDING                               /* top pad  */
-                       + (HUD_LINE_HEIGHT + 4)                     /* Latency  */
-                       + 4 * (HUD_LINE_HEIGHT + 2)                 /* FPS..Bat */
+                       + HUD_STAT_LINES * (HUD_LINE_HEIGHT + 2)    /* stats    */
                        + 6                                         /* separator*/
                        + MENU_ITEM_COUNT * HUD_LINE_HEIGHT         /* menu     */
                        + HUD_PADDING;                              /* bot pad  */
-        if (g_stats.host_proc_ms > 0)
-            hud_height += HUD_LINE_HEIGHT + 2;                     /* Host ln  */
-        if (g_stats.decode_ms > 0)
-            hud_height += HUD_LINE_HEIGHT + 2;                     /* Decode ln */
         /* Panel background — semi-transparent dark with rounded corners */
         ui_draw_rect_rounded(HUD_X, HUD_Y, HUD_WIDTH, hud_height, 6, HUD_BG_COLOR);
     }
@@ -181,7 +182,8 @@ void hud_render(void)
     y_offset = HUD_Y + HUD_PADDING;
 
     /* Stats using UIManager intraFont text */
-    snprintf(buf, sizeof(buf), "Latency: %dms", g_stats.latency_ms);
+    snprintf(buf, sizeof(buf), "Lat:%dms  Dec:%dms",
+             g_stats.latency_ms, g_stats.decode_ms);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 4;
 
@@ -189,28 +191,38 @@ void hud_render(void)
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-    snprintf(buf, sizeof(buf), "Loss: %.1f%%", g_stats.packet_loss_pct);
+    snprintf(buf, sizeof(buf), "Loss: %.1f%%  FEC: %.1f%%",
+             g_stats.packet_loss_pct, g_stats.fec_recovery_pct);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-    snprintf(buf, sizeof(buf), "FEC: %.1f%%", g_stats.fec_recovery_pct);
+#ifndef RETAIL_BUILD
+    snprintf(buf, sizeof(buf), "CPU:%d%% GPU:%d%% ME:%d%%",
+             g_stats.cpu_pct, g_stats.gpu_pct, g_stats.me_pct);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-    snprintf(buf, sizeof(buf), "Battery: %d%%", g_stats.battery_pct);
+    snprintf(buf, sizeof(buf), "RAM:%d%% %dK/%dK",
+             g_stats.ram_used_pct, g_stats.ram_free_kb, g_stats.ram_largest_kb);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-    if (g_stats.host_proc_ms > 0) {
-        snprintf(buf, sizeof(buf), "Host: %dms", g_stats.host_proc_ms);
-        draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
-        y_offset += HUD_LINE_HEIGHT + 2;
-    }
-    if (g_stats.decode_ms > 0) {
-        snprintf(buf, sizeof(buf), "Decode: %dms", g_stats.decode_ms);
-        draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
-        y_offset += HUD_LINE_HEIGHT + 2;
-    }
+    snprintf(buf, sizeof(buf), "BW:%dk U:%dk A:%dk",
+             g_stats.bw_rx_kbps, g_stats.bw_usable_kbps, g_stats.bw_audio_kbps);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    snprintf(buf, sizeof(buf), "Drop:%dk U:%d%% P:%d/s",
+             g_stats.bw_drop_kbps, g_stats.bw_usable_pct,
+             g_stats.bw_video_packets_s);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+#endif
+
+    snprintf(buf, sizeof(buf), "Host:%dms Bat:%d%%",
+             g_stats.host_proc_ms, g_stats.battery_pct);
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
     y_offset += 6;
 
     /* Draw menu items using UIManager text */
@@ -281,6 +293,8 @@ int hud_handle_input(u32 buttons)
                            g_hud_visible ? "ON" : "OFF", buttons);
             if (g_hud_visible) {
                 g_selected_item = 0;  /* Reset selection when opening */
+            } else {
+                quit_selected = 3;    /* Closed overlay, no stream action */
             }
         }
     }
@@ -317,6 +331,8 @@ int hud_handle_input(u32 buttons)
         /* Close HUD with Circle button */
         if (button_pressed(buttons, PSP_CTRL_CIRCLE)) {
             g_hud_visible = 0;
+            quit_selected = 3;        /* Closed overlay, no stream action */
+            diag_log_write("HUD", "Close (Circle)\n");
         }
     }
 
@@ -331,6 +347,11 @@ int hud_is_visible(void)
     /* Also report visible during cooldown so main.c suppresses
      * input_poll_and_send — prevents R+Up leak to Sunshine. */
     return g_hud_visible || (g_hud_cooldown > 0);
+}
+
+int hud_overlay_visible(void)
+{
+    return g_hud_visible;
 }
 
 void hud_shutdown(void)

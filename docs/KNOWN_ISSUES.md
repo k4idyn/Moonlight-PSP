@@ -1,89 +1,102 @@
 # Known Issues
 
-_PSP Moonlight v1.1.0_
+_PSP Moonlight v1.2.0_
 
-This document lists user-facing limitations, compatibility notes, and practical guidance for stable streaming on PSP hardware.
+This document lists user-facing limitations, compatibility notes, and practical guidance for stable PSP streaming.
 
 ---
 
 ## Current Limitations
 
-### CAVLC host output is required for stable normal playback
-**Impact:** CABAC streams are intentionally treated as unsupported in normal playback mode.
-**Guidance:** Configure Sunshine entropy coding to CAVLC (`amd_coder=cavlc`, `nvenc_h264_cavlc=enabled`, `qsv_coder=cavlc`).
+### CAVLC host output is required for normal playback
+
+**Impact:** CABAC can be too expensive for PSP playback and may cause stalls or heavy jitter.
+
+**Guidance:** Configure Sunshine entropy coding to CAVLC:
+
+- NVIDIA: `nvenc_h264_cavlc = enabled`
+- AMD: `amd_coder = cavlc`
+- Intel QSV: `qsv_coder = cavlc`
+
+### PSP Wi-Fi is the main bottleneck
+
+**Impact:** PSP hardware is limited to 2.4 GHz Wi-Fi. Burst loss, crowded channels, or weak signal can cause stutter, recovery pauses, or audio artifacts.
+
+**Guidance:** Start with the Performance preset, keep the PSP close to the access point, and avoid congested 2.4 GHz channels.
+
+### Performance preset disables local audio
+
+**Impact:** Performance mode prioritizes video and input responsiveness by skipping local Opus decode and audio playback on the PSP.
+
+**Guidance:** Switch Audio to Enabled, or use Balanced/Quality, if you need sound. Audio Disabled is client-side and does not require changing Sunshine settings.
+
+### Native resolution costs more decode time
+
+**Impact:** Quality mode uses the native 480x272 PSP resolution, so it runs at 10 fps by default.
+
+**Guidance:** Use Quality when native detail matters. Use Balanced or Performance when smoothness matters more.
+
+### Very high resolutions are not practical
+
+**Impact:** Resolutions above the PSP LCD add host/network/decode work without useful display detail.
+
+**Guidance:** Stay within the built-in presets unless you are testing a specific custom stream size.
 
 ### Icon download/cache behavior
-**Impact:** Game-library icons use the normal Sunshine box-art path with static-memory decode and raw RGB565 cache files.
+
+**Impact:** Game-library icons use Sunshine box-art paths with static PNG decode and raw RGB565 cache files.
+
 **Guidance:** If icons appear stale or missing, clear `ms0:/PSP/GAME/Moonlight/cache/` and refresh the game library.
 
-### No tearless double buffering yet
-**Impact:** Fast horizontal motion can show tearing.
-**Status:** Planned future improvement.
+### Power-switch resume is limited
 
-### Practical performance ceiling on PSP hardware
-**Impact:** Effective framerate depends on stream profile, signal quality, and host encode settings. Overly aggressive settings can cause stutter or delayed recovery.
-**Guidance:** Start with 480x272 at 15 fps and tune upward only if stable.
+**Impact:** Sleep/resume behavior depends on the host session state and Wi-Fi reconnect timing.
 
-### High resolutions are not practical on PSP
-**Impact:** Resolutions significantly above 480x272 can exceed decode/network limits and degrade usability.
-**Guidance:** 368x208 and 480x272 are recommended operating ranges.
-
-### Wi-Fi quality remains the primary bottleneck
-**Impact:** Burst loss or weak 2.4 GHz conditions can still cause occasional recovery events and audio artifacts.
-**Guidance:** Improve signal quality, reduce bitrate, and avoid congested channels.
+**Guidance:** If resume does not reconnect cleanly, quit the stream and relaunch from the game library.
 
 ---
 
-## Hotspot and Remote Session Notes (UPnP)
+## Hotspot and Remote Session Notes
 
 PSP Moonlight supports UPnP IGD port mapping assistance for hotspot and remote/NAT-constrained sessions.
 
 ### What UPnP assist does
 
-- Requests temporary UDP mappings for active video/audio RTP/RTCP ports
-- Cleans mappings on session teardown/failure
-- Improves connection reliability when direct inbound NAT traversal is required
+- Requests temporary UDP mappings for active video/audio RTP and RTCP ports.
+- Cleans mappings on session teardown or failure.
+- Improves compatibility when inbound NAT traversal is required.
 
 ### When UPnP assist may not work
 
-- Gateway/hotspot does not implement UPnP IGD
-- UPnP is disabled by network policy
-- Carrier-grade NAT or restricted ISP/mobile network behavior blocks expected routing
+- Gateway or hotspot does not implement UPnP IGD.
+- UPnP is disabled by network policy.
+- Carrier-grade NAT or restricted mobile networks block expected routing.
 
 ### Recommended remote-session checklist
 
-- Enable UPnP on the gateway/hotspot if available
-- Confirm Sunshine host is reachable on the intended route
-- Keep host profile conservative first (H.264 Baseline, CAVLC, moderate bitrate)
+- Enable UPnP on the gateway or hotspot if available.
+- Confirm Sunshine is reachable on the intended route.
+- Start with H.264 Baseline + CAVLC and the Performance preset.
 
 ---
 
-## Host Compatibility Guidance
-
-### Network behavior notes (current branch)
-
-- Client bitrate is now used directly at launch (no hidden startup downscale).
-- Transport adaptation decisions are based on network/FEC signals; decoder FPS is displayed for diagnostics but does not directly classify link quality.
-- RTCP receiver reports now use interval-loss accounting and RTP-clock jitter units for host-side quality feedback.
-
-### Recommended baseline stream profile
+## Recommended Starting Profile
 
 - Codec: H.264
 - Profile: Baseline
-- Entropy: CAVLC (required; CABAC is treated as unsupported in normal PSP mode)
-- Initial target: 480x272 @ 15 fps
-- Initial bitrate: around 384 kbps
+- Entropy: CAVLC
+- PSP preset: Performance
+- Stream: 300x170 @ 30 fps
+- Bitrate: 384 kbps
+- Packet size: 1056 bytes
+- Audio: Disabled
 
-### If video is unstable
-
-- Reduce bitrate first
-- Then reduce resolution to 368x208
-- Verify Wi-Fi strength and channel congestion
+If that is stable and you need more detail or audio, move to Balanced. If you want native PSP resolution, use Quality.
 
 ---
 
 ## Out of Scope
 
 - H.265/AV1 decode on PSP
-- Full parity with modern desktop-class hardware decoders
-- Non-PSP platform-specific support requirements
+- Desktop-class visual quality at modern streaming bitrates
+- Non-PSP platform support

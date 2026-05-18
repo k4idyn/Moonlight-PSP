@@ -17,13 +17,15 @@
 #include <stdlib.h>
 #include <pspkernel.h>
 #include "rtp_fec.h"
+#include "rtp_reassembly.h"
 #include "rs.h"
 #include "diag_log.h"
 #include "control_stream.h"
 #include "sw_decode_pipeline.h"
 #include "decode_flags.h"
 #include "signal_strength.h"
-#include "settings_menu.h"
+#include "config.h"
+#include "runtime_telemetry.h"
 
 extern PspConfig g_psp_config;
 
@@ -44,33 +46,32 @@ static u32 s_cached_data = 0;
 static u32 s_cached_parity = 0;
 
 /* Consecutive unrecoverable frame counter — escalate to IDR after threshold.
- * MUST be 1: any single dropped frame breaks the H.264 reference chain,
- * causing all subsequent P-frames to decode against a stale reference.
- * RFI is useless without intra-refresh (g_intra_refresh_active == 0). */
+ * Dropped frames are not submitted to OpenH264, so a single network loss
+ * must not force a full IDR wait. Escalate only after sustained loss or
+ * when the decoder has actually marked refs bad. */
 static int s_consec_unrecoverable = 0;
-#define UNRECOVERABLE_IDR_THRESHOLD 1
+#define UNRECOVERABLE_IDR_THRESHOLD 4
 
 /* Catastrophic single-frame loss threshold — differentiated log message */
 #define CATASTROPHIC_LOSS_THRESHOLD 3
 
 /* ── Phase 4: Predictive Frame Drop — sliding window ──────────────
- * Track last 32 frame results to detect WiFi burst loss patterns.
- * 802.11b has characteristic 50-200ms dropout periods (~1.5-6 frames
- * at 30fps). When recent loss rate predicts continued loss, pre-request
- * IDR and skip futile FEC processing. */
+ * Track last 32 frame results to detect WiFi burst loss patterns. Prediction
+ * is advisory only: recovery/drop decisions stay tied to actual packet and
+ * FEC state so the predictor cannot create IDR storms or visible debug text. */
 #define PRED_WINDOW_SIZE  32
 #define PRED_RECENT_SIZE  8    /* recent window for burst detection */
 #define PRED_BURST_THRESH 4   /* drops in recent window = burst active */
-#define PRED_SKIP_THRESH  5   /* predicted loss count to trigger skip */
 
 static u8  s_pred_window[PRED_WINDOW_SIZE]; /* 0=ok, 1=dropped */
 static int s_pred_idx = 0;
 static int s_pred_count = 0;
-static int s_pred_idr_requested = 0;
+static u32 s_pred_log_count = 0;
 
 /* ── RTP / NV_VIDEO_PACKET layout (matches moonlight-common-c) ───── */
 #define FIXED_RTP_HEADER_SIZE 12
 #define RTP_FLAG_EXTENSION    0x10
+#define MAX_RTP_HEADER_SIZE   16
 #define NV_VIDEO_PKT_SIZE     16
 
 #define FLAG_SOF              0x04
@@ -86,6 +87,12 @@ static inline void write_le32(u8 *p, u32 v)
     p[1] = (u8)(v >> 8);
     p[2] = (u8)(v >> 16);
     p[3] = (u8)(v >> 24);
+}
+
+static inline void write_be16(u8 *p, u16 v)
+{
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)(v);
 }
 
 /* ── Per-frame FEC buffer ────────────────────────────────────────── */
@@ -136,6 +143,7 @@ typedef struct {
     u32 parity_packets;   /* parity shards */
     u32 total_packets;    /* data + parity */
     u32 received_count;   /* packets received for this block */
+    u32 received_data_count; /* data shards received for this block */
     u32 fec_percentage;
     u32 base_slot;        /* starting slot index in g_slots[] */
     u32 max_slots;        /* max slots allocated for this block */
@@ -146,8 +154,23 @@ typedef struct {
 static fec_block_t g_fec_blocks[MAX_FEC_MULTI_BLOCKS];
 static u32 g_num_fec_blocks = 1;
 
+static void note_current_frame_drop_for_recovery(void)
+{
+    if (g_last_good_frame != 0 && g_current_frame != 0xFFFFFFFF) {
+        rtp_reassembly_note_frame_loss(g_current_frame, g_current_frame);
+    }
+}
+
+static void request_current_frame_rfi(void)
+{
+    if (g_current_frame != 0xFFFFFFFF) {
+        control_stream_request_rfi(g_current_frame, g_current_frame);
+    }
+}
+
 /* Total video bytes received — for bandwidth estimation by control_stream.c */
 volatile u32 g_fec_total_bytes_received = 0;
+volatile u32 g_fec_packets_received = 0;
 
 /* ── Aggregate FEC recovery statistics ───────────────────────────── */
 volatile u32 g_fec_packets_recovered  = 0;  /* data packets RS-recovered */
@@ -165,6 +188,17 @@ static void reset_frame_receive_status(void);
 static void update_fec_status_cache(void);
 static void maybe_send_fec_status(void);
 static void mark_frame_packet_received(u32 index, int is_data_packet);
+#ifndef RETAIL_BUILD
+static void log_frame_receive_mask(u32 missing_data_packets);
+static void log_late_frame_packet(u32 frame_index,
+                                  u32 current_frame,
+                                  s32 frame_delta,
+                                  u16 seq,
+                                  u32 fec_index,
+                                  u32 data_pkts,
+                                  u32 parity_pkts,
+                                  u32 total_pkts);
+#endif
 
 /* ── Init / Reset ────────────────────────────────────────────────── */
 
@@ -188,7 +222,7 @@ void rtp_fec_init(void)
 void rtp_get_video_stats(RtpVideoStats *out)
 {
     if (!out) return;
-    out->packets_received  = g_fec_total_bytes_received / MAX_PKT_SIZE; /* approximate */
+    out->packets_received  = g_fec_packets_received;
     out->packets_recovered = g_fec_packets_recovered;
     out->packets_failed    = g_fec_packets_failed;
     out->frames_dropped    = g_fec_frames_dropped;
@@ -216,6 +250,10 @@ void rtp_fec_reset(void)
     g_fec_recovery_clean = 0;
     s_consec_unrecoverable = 0;
     g_consecutive_frame_drops = 0;
+    memset(s_pred_window, 0, sizeof(s_pred_window));
+    s_pred_idx = 0;
+    s_pred_count = 0;
+    s_pred_log_count = 0;
 
     /* Reset multi-FEC block state */
     g_num_fec_blocks = 1;
@@ -225,6 +263,7 @@ void rtp_fec_reset(void)
             g_fec_blocks[b].seen = 0;
             g_fec_blocks[b].recovered = 0;
             g_fec_blocks[b].received_count = 0;
+            g_fec_blocks[b].received_data_count = 0;
         }
     }
 
@@ -281,6 +320,79 @@ static void mark_frame_packet_received(u32 index, int is_data_packet)
     else
         g_received_parity_count++;
 }
+
+#ifndef RETAIL_BUILD
+static void log_frame_receive_mask(u32 missing_data_packets)
+{
+    u32 mask0 = 0;
+    u32 mask1 = 0;
+    u32 mask2 = 0;
+    u32 mask3 = 0;
+    u32 limit = g_total_packets;
+    u32 i;
+
+    if (limit > FEC_MAX_PACKETS)
+        limit = FEC_MAX_PACKETS;
+
+    for (i = 0; i < limit; i++) {
+        if (!g_received_from_network[i])
+            continue;
+
+        if (i < 32U)
+            mask0 |= (1U << i);
+        else if (i < 64U)
+            mask1 |= (1U << (i - 32U));
+        else if (i < 96U)
+            mask2 |= (1U << (i - 64U));
+        else if (i < 128U)
+            mask3 |= (1U << (i - 96U));
+    }
+
+    diag_log_write("FEC",
+                   "RXMAP frame=%u baseSeq=%u data=%u parity=%u total=%u recv=%u dataRecv=%u parityRecv=%u highest=%u missingData=%u rxmask=%08X%08X%08X%08X\n",
+                   g_current_frame,
+                   (unsigned)g_lowest_seq,
+                   g_data_packets,
+                   g_parity_packets,
+                   g_total_packets,
+                   g_received_count,
+                   g_received_data_count,
+                   g_received_parity_count,
+                   g_highest_received_index,
+                   missing_data_packets,
+                   mask3, mask2, mask1, mask0);
+}
+
+static void log_late_frame_packet(u32 frame_index,
+                                  u32 current_frame,
+                                  s32 frame_delta,
+                                  u16 seq,
+                                  u32 fec_index,
+                                  u32 data_pkts,
+                                  u32 parity_pkts,
+                                  u32 total_pkts)
+{
+    static u32 s_late_log_count = 0;
+
+    if (frame_delta < -8 || frame_delta >= 0)
+        return;
+
+    s_late_log_count++;
+    if (s_late_log_count <= 20 || (s_late_log_count % 100) == 0) {
+        diag_log_write("FEC",
+                       "LATEPKT frame=%u current=%u delta=%d seq=%u slot=%u data=%u parity=%u total=%u count=%u\n",
+                       frame_index,
+                       current_frame,
+                       (int)frame_delta,
+                       (unsigned)seq,
+                       fec_index,
+                       data_pkts,
+                       parity_pkts,
+                       total_pkts,
+                       s_late_log_count);
+    }
+}
+#endif
 
 static void update_fec_status_cache(void)
 {
@@ -352,16 +464,246 @@ static int rtp_nv_offset_from_packet(const u8 *packet, int packet_len)
     int off = FIXED_RTP_HEADER_SIZE;
     if (!packet || packet_len < off)
         return -1;
+
+    /* GameStream video packets match moonlight-common-c's fixed RTP
+     * extension handling: the X bit means exactly one 4-byte extension
+     * header before NV_VIDEO_PACKET. Do not trust the extension length word
+     * here; recovered RTP headers may contain zero/stale extension fields
+     * until we patch them from a real packet. */
     if (packet[0] & RTP_FLAG_EXTENSION) {
-        u16 ext_words;
         if (packet_len < off + 4)
             return -1;
-        ext_words = read_be16(packet + off + 2);
-        off += 4 + (int)ext_words * 4;
+        off += 4;
     }
     if (packet_len < off + NV_VIDEO_PKT_SIZE)
         return -1;
     return off;
+}
+
+static int fec_configured_packet_size(void)
+{
+    int packet_size = g_psp_config.packetSize > 0 ?
+                      g_psp_config.packetSize : DEFAULT_PACKET_SIZE;
+
+    packet_size -= (packet_size % 16);
+    if (packet_size < MIN_STREAM_PACKET_SIZE)
+        packet_size = MIN_STREAM_PACKET_SIZE;
+    if (packet_size > MAX_STREAM_PACKET_SIZE)
+        packet_size = MAX_STREAM_PACKET_SIZE;
+    return packet_size;
+}
+
+static int fec_recovery_symbol_size(void)
+{
+    int packet_size = fec_configured_packet_size();
+    int receive_size = packet_size + MAX_RTP_HEADER_SIZE;
+
+    if (receive_size > MAX_PKT_SIZE)
+        receive_size = MAX_PKT_SIZE;
+    if (receive_size < FIXED_RTP_HEADER_SIZE + NV_VIDEO_PKT_SIZE)
+        receive_size = FIXED_RTP_HEADER_SIZE + NV_VIDEO_PKT_SIZE;
+    return receive_size;
+}
+
+static int fec_recovered_data_len(const u8 *packet, int receive_size)
+{
+    int off = FIXED_RTP_HEADER_SIZE;
+    int packet_size = fec_configured_packet_size();
+    int len;
+
+    if (packet && (packet[0] & RTP_FLAG_EXTENSION)) {
+        off += 4;
+    }
+
+    len = off + packet_size;
+    if (len > receive_size)
+        len = receive_size;
+    if (len > MAX_PKT_SIZE)
+        len = MAX_PKT_SIZE;
+    return len;
+}
+
+static const u8 *fec_slot_nv(u32 slot, int *nv_off_out)
+{
+    int nv_off;
+
+    if (slot >= FEC_MAX_PACKETS || !g_slots[slot].received ||
+        g_slots[slot].len <= 0) {
+        return NULL;
+    }
+
+    nv_off = rtp_nv_offset_from_packet(g_slots[slot].data, g_slots[slot].len);
+    if (nv_off < 0) {
+        return NULL;
+    }
+
+    if (nv_off_out) {
+        *nv_off_out = nv_off;
+    }
+    return g_slots[slot].data + nv_off;
+}
+
+static u32 fec_nv_stream_packet_index(const u8 *nv)
+{
+    return (read_le32(nv) >> 8) & 0x00FFFFFFU;
+}
+
+static void fec_patch_recovered_packet_header(u32 slot, u32 block_num,
+                                              u32 last_block_num)
+{
+    const u8 *ref = NULL;
+    u8 *dst;
+    u8 *nv;
+    int nv_off;
+    u32 i;
+
+    if (slot >= FEC_MAX_PACKETS || !g_slots[slot].received ||
+        g_slots[slot].len < FIXED_RTP_HEADER_SIZE) {
+        return;
+    }
+
+    for (i = 0; i < g_total_packets && i < FEC_MAX_PACKETS; i++) {
+        if (i != slot && g_received_from_network[i] &&
+            g_slots[i].received &&
+            g_slots[i].len >= FIXED_RTP_HEADER_SIZE) {
+            ref = g_slots[i].data;
+            break;
+        }
+    }
+    if (!ref) {
+        for (i = 0; i < g_total_packets && i < FEC_MAX_PACKETS; i++) {
+            if (i != slot && g_slots[i].received &&
+                g_slots[i].len >= FIXED_RTP_HEADER_SIZE) {
+                ref = g_slots[i].data;
+                break;
+            }
+        }
+    }
+    if (!ref)
+        return;
+
+    dst = g_slots[slot].data;
+
+    /* Align with moonlight-common-c recovered video packet handling. The
+     * Reed-Solomon shard covers the video payload, but RTP header fields are
+     * reconstructed from the surrounding frame state before the NV header is
+     * parsed or handed to reassembly. */
+    dst[0] = ref[0];
+    dst[1] = (u8)((dst[1] & 0x80) | (ref[1] & 0x7F));
+    write_be16(dst + 2, (u16)(g_lowest_seq + slot));
+    memcpy(dst + 4, ref + 4, 8);
+
+    nv_off = rtp_nv_offset_from_packet(dst, g_slots[slot].len);
+    if (nv_off < 0)
+        return;
+
+    nv = dst + nv_off;
+    write_le32(nv + 4, g_current_frame);
+    nv[11] = (u8)((((last_block_num & 0x03U) << 2) |
+                   (block_num & 0x03U)) << 4);
+}
+
+static void fec_log_recovered_packet_reject(u32 slot, const char *reason, u8 flags)
+{
+    static u32 s_reject_log_count = 0;
+
+    s_reject_log_count++;
+    if (s_reject_log_count <= 5 || (s_reject_log_count % 60) == 0) {
+        int nv_off = -1;
+        u32 spi = 0;
+        u32 frame = 0;
+        u32 fec_info = 0;
+        u8 mf = 0;
+
+        if (slot < FEC_MAX_PACKETS && g_slots[slot].received) {
+            nv_off = rtp_nv_offset_from_packet(g_slots[slot].data,
+                                               g_slots[slot].len);
+            if (nv_off >= 0) {
+                const u8 *nv = g_slots[slot].data + nv_off;
+                spi = fec_nv_stream_packet_index(nv);
+                frame = read_le32(nv + 4);
+                mf = nv[11];
+                fec_info = read_le32(nv + 12);
+            }
+        }
+
+        diag_log_write("FEC",
+                       "recovered packet reject frame=%u slot=%u flags=0x%02X reason=%s len=%d off=%d spi=%u nvFrame=%u mf=0x%02X fec=0x%08X\n",
+                       g_current_frame, slot, flags,
+                       reason ? reason : "invalid",
+                       (slot < FEC_MAX_PACKETS) ? g_slots[slot].len : 0,
+                       nv_off, spi, frame, mf, fec_info);
+    }
+}
+
+static int fec_validate_recovered_data_packet(u32 slot, u32 data_packets)
+{
+    const u8 *nv;
+    const u8 *adj_nv;
+    u8 flags;
+
+    nv = fec_slot_nv(slot, NULL);
+    if (!nv) {
+        fec_log_recovered_packet_reject(slot, "missing NV header", 0);
+        return 0;
+    }
+
+    flags = nv[8];
+    if (flags & ~(FLAG_SOF | FLAG_EOF | FLAG_CONTAINS_PIC)) {
+        fec_log_recovered_packet_reject(slot, "invalid flag bits", flags);
+        return 0;
+    }
+
+    if (slot == 0 && !(flags & FLAG_SOF)) {
+        fec_log_recovered_packet_reject(slot, "missing SOF", flags);
+        return 0;
+    }
+    if (slot != 0 && (flags & FLAG_SOF)) {
+        fec_log_recovered_packet_reject(slot, "unexpected SOF", flags);
+        return 0;
+    }
+
+    if (slot + 1 == data_packets) {
+        if (!(flags & FLAG_EOF)) {
+            fec_log_recovered_packet_reject(slot, "missing EOF", flags);
+            return 0;
+        }
+    } else if (flags & FLAG_EOF) {
+        fec_log_recovered_packet_reject(slot, "early EOF", flags);
+        return 0;
+    }
+
+    if (slot > 0 && slot + 1 < data_packets &&
+        !(flags & FLAG_CONTAINS_PIC)) {
+        fec_log_recovered_packet_reject(slot, "missing picture data", flags);
+        return 0;
+    }
+
+    if (slot > 0) {
+        adj_nv = fec_slot_nv(slot - 1, NULL);
+        if (adj_nv) {
+            u32 prev_spi = fec_nv_stream_packet_index(adj_nv);
+            u32 this_spi = fec_nv_stream_packet_index(nv);
+            if (this_spi != ((prev_spi + 1U) & 0x00FFFFFFU)) {
+                fec_log_recovered_packet_reject(slot, "SPI gap from previous", flags);
+                return 0;
+            }
+        }
+    }
+
+    if (slot + 1 < data_packets) {
+        adj_nv = fec_slot_nv(slot + 1, NULL);
+        if (adj_nv) {
+            u32 this_spi = fec_nv_stream_packet_index(nv);
+            u32 next_spi = fec_nv_stream_packet_index(adj_nv);
+            if (next_spi != ((this_spi + 1U) & 0x00FFFFFFU)) {
+                fec_log_recovered_packet_reject(slot, "SPI gap to next", flags);
+                return 0;
+            }
+        }
+    }
+
+    return 1;
 }
 
 static void drop_current_frame_strict(const char *reason, u32 missing)
@@ -395,8 +737,9 @@ static void drop_current_frame_strict(const char *reason, u32 missing)
     g_fec_recovery_clean = 0;
     g_frame_submitted = 1;
 
+    note_current_frame_drop_for_recovery();
+
     if (g_last_good_frame == 0 || g_refs_corrupted ||
-        missing >= CATASTROPHIC_LOSS_THRESHOLD ||
         g_consecutive_frame_drops >= CONSECUTIVE_DROP_IDR_LIMIT) {
         g_idr_fully_decoded = 0;
         g_fec_requested_idr = 1;
@@ -404,10 +747,7 @@ static void drop_current_frame_strict(const char *reason, u32 missing)
         if (g_consecutive_frame_drops >= CONSECUTIVE_DROP_IDR_LIMIT)
             g_consecutive_frame_drops = 0;
     } else {
-        if (missing >= CATASTROPHIC_LOSS_THRESHOLD ||
-            g_consecutive_frame_drops >= 4) {
-            control_stream_request_rfi(g_last_good_frame + 1, g_current_frame);
-        }
+        request_current_frame_rfi();
     }
 }
 
@@ -434,6 +774,8 @@ static void submit_frame_packets(void)
 {
     u32 i;
     int submitted = 0;
+
+    rtp_reassembly_prepare_fec_frame(g_current_frame);
 
     /* ── Multi-block submission ─────────────────────────────────────── */
     if (g_num_fec_blocks > 1) {
@@ -491,6 +833,7 @@ static void submit_frame_packets(void)
     g_frame_submitted = 1;
 
     /* Periodic FEC summary every ~30s (900 frames at 30fps) */
+#ifndef RETAIL_BUILD
     {
         static u32 s_fec_summary_count = 0;
         s_fec_summary_count++;
@@ -506,9 +849,10 @@ static void submit_frame_packets(void)
                            total_ok, total_fail, total_drop, total_attempts, pct);
         }
     }
+#endif
 
     /* Cache FEC values for CTRL PING piggyback (every frame) and send
-     * per-frame FEC status (0x5502) to Sunshine every 3rd frame.
+     * periodic per-frame FEC status (0x5502) to Sunshine.
      *
      * THROTTLE RATIONALE: At 30fps, sending FEC status every frame = 30
      * UDP sends/sec on the CTRL socket.  Combined with CTRL PING (5/sec),
@@ -518,31 +862,37 @@ static void submit_frame_packets(void)
      * pending-frame counter grows until it hits the threshold and
      * permanently stops sending video (observed at ~130s in 5-min tests).
      *
-     * Sending every 3rd frame (10/sec) still gives the server timely
-     * ACKs while reducing CTRL socket pressure 3x.  The CTRL PING
-     * piggyback (1/sec) provides additional redundancy. */
+     * Sending every 5th frame keeps the server informed while reducing
+     * CTRL socket pressure on PSP-1000 WiFi. */
     {
         static u32 s_fec_send_counter = 0;
-        u16 highest_seq = (u16)(g_lowest_seq + g_received_count - 1);
-        u16 next_contig = (u16)(g_lowest_seq + g_data_packets - 1);
-        u16 received_data = (u16)(g_received_count > g_parity_packets ?
-                                  g_received_count - g_parity_packets : g_received_count);
-        u16 received_parity = (u16)(g_received_count > received_data ?
-                                    g_received_count - received_data : 0);
+        {
+            u32 highest_seq = g_lowest_seq;
+            u32 next_contig = g_lowest_seq;
+            u32 received_data = g_received_count;
+            u32 received_parity = 0;
 
-        /* Always cache — CTRL PING piggyback reads these */
-        g_fec_last_highest_seq     = highest_seq;
-        g_fec_last_next_contig_seq = next_contig;
-        g_fec_last_data_pkts       = (u16)g_data_packets;
-        g_fec_last_parity_pkts     = (u16)g_parity_packets;
-        g_fec_last_recv_data       = received_data;
-        g_fec_last_recv_parity     = received_parity;
-        g_fec_last_fec_pct         = (u8)g_fec_percentage;
+            if (g_received_count > 0)
+                highest_seq = g_lowest_seq + g_received_count - 1;
+            if (g_data_packets > 0)
+                next_contig = g_lowest_seq + g_data_packets - 1;
+            if (received_data > g_data_packets) {
+                received_parity = received_data - g_data_packets;
+                received_data = g_data_packets;
+            }
 
-        update_fec_status_cache();
+            g_fec_last_highest_seq = (u16)highest_seq;
+            g_fec_last_next_contig_seq = (u16)next_contig;
+            g_fec_last_missing_before_highest = 0;
+            g_fec_last_data_pkts = (u16)g_data_packets;
+            g_fec_last_parity_pkts = (u16)g_parity_packets;
+            g_fec_last_recv_data = (u16)received_data;
+            g_fec_last_recv_parity = (u16)received_parity;
+            g_fec_last_fec_pct = (u8)g_fec_percentage;
+        }
 
         s_fec_send_counter++;
-        if (s_fec_send_counter >= 3) {
+        if (s_fec_send_counter >= 5) {
             s_fec_send_counter = 0;
             control_stream_send_fec_status(
                 g_current_frame,
@@ -607,17 +957,10 @@ static void attempt_multi_block_recovery_and_submit(void)
             reed_solomon *rs;
             unsigned char *packets[FEC_MAX_PACKETS];
             unsigned char marks[FEC_MAX_PACKETS];
-            int receiveSize = 0;
+            int receiveSize;
             int ret;
 
-            /* Find max packet size in this block */
-            for (i = 0; i < blk->total_packets && i < blk->max_slots; i++) {
-                u32 slot = blk->base_slot + i;
-                if (slot < FEC_MAX_PACKETS && g_slots[slot].received &&
-                    g_slots[slot].len > receiveSize)
-                    receiveSize = g_slots[slot].len;
-            }
-            if (receiveSize == 0) receiveSize = MAX_PKT_SIZE;
+            receiveSize = fec_recovery_symbol_size();
 
             memset(marks, 1, blk->total_packets);
             memset(packets, 0, sizeof(unsigned char *) * blk->total_packets);
@@ -644,10 +987,15 @@ static void attempt_multi_block_recovery_and_submit(void)
                 }
             }
 
-            /* RS context: reuse cached if params match */
+            /* RS context: rs.c uses one static context shared with audio RTP
+             * FEC, so hold the global lock across configure+reconstruct and
+             * verify the actual context shape before reusing the cached ptr. */
+            reed_solomon_global_lock();
             if (s_cached_rs &&
                 s_cached_data == blk->data_packets &&
-                s_cached_parity == blk->parity_packets) {
+                s_cached_parity == blk->parity_packets &&
+                s_cached_rs->data_shards == (int)blk->data_packets &&
+                s_cached_rs->parity_shards == (int)blk->parity_packets) {
                 rs = s_cached_rs;
             } else {
                 if (s_cached_rs) {
@@ -656,6 +1004,7 @@ static void attempt_multi_block_recovery_and_submit(void)
                 }
                 rs = reed_solomon_new(blk->data_packets, blk->parity_packets);
                 if (!rs) {
+                    reed_solomon_global_unlock();
                     any_rs_failed = 1;
                     continue;
                 }
@@ -666,14 +1015,22 @@ static void attempt_multi_block_recovery_and_submit(void)
 
             ret = reed_solomon_reconstruct(rs, packets, marks,
                                            blk->total_packets, receiveSize);
+            reed_solomon_global_unlock();
             g_fec_recovery_attempts++;
             if (ret == 0) {
                 for (i = 0; i < blk->data_packets && i < blk->max_slots; i++) {
                     u32 slot = blk->base_slot + i;
                     if (slot < FEC_MAX_PACKETS && marks[i] && packets[i]) {
+                        int recovered_len;
                         memcpy(g_slots[slot].data, packets[i], receiveSize);
-                        g_slots[slot].len = receiveSize;
                         g_slots[slot].received = 1;
+                        g_slots[slot].len = receiveSize;
+                        fec_patch_recovered_packet_header(
+                            slot, (u32)b,
+                            (g_num_fec_blocks > 0) ? g_num_fec_blocks - 1 : 0);
+                        recovered_len = fec_recovered_data_len(g_slots[slot].data,
+                                                               receiveSize);
+                        g_slots[slot].len = recovered_len;
                         g_fec_packets_recovered++;
                     }
                 }
@@ -688,29 +1045,15 @@ static void attempt_multi_block_recovery_and_submit(void)
     }
 
     if (any_unrecoverable || any_rs_failed) {
-        g_fec_frames_dropped++;
-        s_consec_unrecoverable++;
-        if (g_last_good_frame == 0) {
-            g_idr_fully_decoded = 0;
-            control_stream_request_idr();
-        } else if (g_refs_corrupted) {
-            g_idr_fully_decoded = 0;
-            control_stream_request_idr();
-        } else {
-            if (g_consecutive_frame_drops >= 4) {
-                control_stream_request_rfi(g_last_good_frame + 1, g_current_frame);
-            }
-        }
-        s_consec_unrecoverable = 0;
-        if (any_rs_failed) {
-            g_refs_corrupted = 1;
-            g_current_frame_is_corrupt = 1;
-        }
-        g_fec_recovery_clean = 0;
-    } else {
-        s_consec_unrecoverable = 0;
-        g_fec_recovery_clean = 1;
+        drop_current_frame_strict(any_rs_failed ?
+                                  "multi-block RS failed" :
+                                  "multi-block missing packets",
+                                  1);
+        return;
     }
+
+    s_consec_unrecoverable = 0;
+    g_fec_recovery_clean = 1;
 
     submit_frame_packets();
 }
@@ -727,27 +1070,11 @@ static void attempt_recovery_and_submit(void)
     /* Phase 4: Predictive frame drop — skip FEC if burst loss predicted */
     {
         int predicted = rtp_fec_get_predicted_loss();
-        if (predicted >= PRED_SKIP_THRESH && g_received_count < g_data_packets) {
-            g_fec_frames_dropped++;
-            g_consecutive_frame_drops++;
-            s_pred_window[s_pred_idx] = 1;
-            s_pred_idx = (s_pred_idx + 1) % PRED_WINDOW_SIZE;
-            if (s_pred_count < PRED_WINDOW_SIZE) s_pred_count++;
-            signal_strength_report_frame_drop();
-            if (!s_pred_idr_requested) {
-                pspDebugScreenPrintf("[PHASE4-PRED] skip-ahead: %d\n", predicted);
-                diag_log_write("FEC", "[PHASE4-PRED] skip-ahead: predicted %d loss, pre-IDR\n", predicted);
-                control_stream_request_idr();
-                s_pred_idr_requested = 1;
+        if (predicted >= PRED_BURST_THRESH) {
+            s_pred_log_count++;
+            if (s_pred_log_count <= 3 || (s_pred_log_count % 60) == 0) {
+                diag_log_write("FEC", "burst advisory: predicted %d, continuing FEC\n", predicted);
             }
-            g_frame_submitted = 1;
-            return;
-        }
-        if (predicted >= 3 && !s_pred_idr_requested) {
-            pspDebugScreenPrintf("[PHASE4-PRED] pre-IDR: %d\n", predicted);
-            diag_log_write("FEC", "[PHASE4-PRED] burst detected: predicted %d, pre-IDR\n", predicted);
-            control_stream_request_idr();
-            s_pred_idr_requested = 1;
         }
     }
 
@@ -780,7 +1107,6 @@ static void attempt_recovery_and_submit(void)
         s_pred_window[s_pred_idx] = 0;
         s_pred_idx = (s_pred_idx + 1) % PRED_WINDOW_SIZE;
         if (s_pred_count < PRED_WINDOW_SIZE) s_pred_count++;
-        s_pred_idr_requested = 0;
         signal_strength_report_frame_ok();
         submit_frame_packets();
         return;
@@ -788,6 +1114,7 @@ static void attempt_recovery_and_submit(void)
 
     /* Check if we have enough total packets for recovery */
     if (g_received_count < g_data_packets) {
+        g_fec_packets_failed += missing;
         g_fec_frames_dropped++;
         g_consecutive_frame_drops++;
         /* Phase 4: Record drop in prediction window + adaptive bitrate */
@@ -795,6 +1122,9 @@ static void attempt_recovery_and_submit(void)
         s_pred_idx = (s_pred_idx + 1) % PRED_WINDOW_SIZE;
         if (s_pred_count < PRED_WINDOW_SIZE) s_pred_count++;
         signal_strength_report_frame_drop();
+#ifndef RETAIL_BUILD
+        log_frame_receive_mask(missing);
+#endif
         diag_log_write("FEC", "frame %u unrecoverable: %u received < %u needed (missing %u) — DROPPING [total_dropped=%u consec=%u]\n",
                        g_current_frame, g_received_count, g_data_packets, missing, g_fec_frames_dropped, g_consecutive_frame_drops);
         update_fec_status_cache();
@@ -843,7 +1173,8 @@ static void attempt_recovery_and_submit(void)
          * VQ#15fps-v2: 102 unrecoverable drops triggered 123 IDR requests,
          * 38 "IDR accumulation incomplete" cycles, 0 IDRs delivered.
          * The wasted bandwidth from failed IDR deliveries contributed to
-         * progressive quality degradation over the 200s test. */
+        * progressive quality degradation over the 200s test. */
+        note_current_frame_drop_for_recovery();
         if (g_last_good_frame == 0) {
             /* No reference at all — must get an IDR to start decoding */
             g_idr_fully_decoded = 0;
@@ -851,16 +1182,18 @@ static void attempt_recovery_and_submit(void)
             s_consec_unrecoverable = 0;
         } else if (g_refs_corrupted) {
             /* Decode pipeline is broken — need IDR to reset DPB */
-            if (s_consec_unrecoverable >= UNRECOVERABLE_IDR_THRESHOLD) {
+            if (s_consec_unrecoverable >= UNRECOVERABLE_IDR_THRESHOLD ||
+                (int)missing >= (CATASTROPHIC_LOSS_THRESHOLD * 2)) {
                 diag_log_write("FEC", "IDR escalation: %d consecutive unrecoverable (refs corrupt)\n",
                                s_consec_unrecoverable);
-            } else if ((int)missing >= CATASTROPHIC_LOSS_THRESHOLD) {
-                diag_log_write("FEC", "IDR escalation: catastrophic loss (%u missing, refs corrupt)\n",
-                               missing);
+                g_idr_fully_decoded = 0;
+                control_stream_request_idr();
+                s_consec_unrecoverable = 0;
+            } else if (rtp_reassembly_waiting_for_idr()) {
+                control_stream_request_idr();
+            } else {
+                control_stream_request_rfi(g_last_good_frame + 1, g_current_frame);
             }
-            g_idr_fully_decoded = 0;
-            control_stream_request_idr();
-            s_consec_unrecoverable = 0;
         } else if (g_consecutive_frame_drops >= CONSECUTIVE_DROP_IDR_LIMIT) {
             /* Phase 3.6: 120 consecutive drops — force IDR (moonlight-common-c match) */
             diag_log_write("FEC", "IDR forced: %u consecutive drops >= %d limit\n",
@@ -870,14 +1203,22 @@ static void attempt_recovery_and_submit(void)
             g_consecutive_frame_drops = 0;
             s_consec_unrecoverable = 0;
         } else {
-            /* Refs clean — dropped frame is harmless, don't request IDR.
-             * Avoid RFI for isolated drops: on 802.11b, RFI recovery bursts
-             * often cost more packets than the single concealed frame. */
-            if (missing >= CATASTROPHIC_LOSS_THRESHOLD ||
-                g_consecutive_frame_drops >= 4) {
-                control_stream_request_rfi(g_last_good_frame + 1, g_current_frame);
+            /* Refs clean: request targeted RFI, not a full IDR. Baseline
+             * testing showed continuing through isolated drops can poison
+             * OpenH264 refs and collapse into no-output recovery. */
+            if (rtp_reassembly_waiting_for_idr()) {
+                control_stream_request_idr();
+            } else {
+                request_current_frame_rfi();
             }
-            s_consec_unrecoverable = 0;
+            if (s_consec_unrecoverable >= UNRECOVERABLE_IDR_THRESHOLD ||
+                (int)missing >= (CATASTROPHIC_LOSS_THRESHOLD * 2)) {
+                g_refs_corrupted = 1;
+                g_idr_fully_decoded = 0;
+                rtp_reassembly_note_frame_loss(g_last_good_frame + 1, g_current_frame);
+                diag_log_write("FEC", "refs marked corrupt after %d unrecoverable drops (missing=%u)\n",
+                               s_consec_unrecoverable, missing);
+            }
         }
         g_frame_submitted = 1; /* prevent timeout re-processing */
         return;
@@ -904,7 +1245,9 @@ static void attempt_recovery_and_submit(void)
      * and drop the frame — the decoder's error concealment will
      * repeat the previous frame (smooth) vs corrupt artifacts. */
     {
+#ifndef RETAIL_BUILD
         u32 parity_count = g_total_packets - g_data_packets;
+#endif
         u32 parity_received = 0;
         u32 idx;
         for (idx = g_data_packets; idx < g_total_packets; idx++) {
@@ -918,6 +1261,7 @@ static void attempt_recovery_and_submit(void)
              * Actual gate: one received parity shard per missing data shard. */
             g_fec_packets_failed += missing;
             g_fec_recovery_attempts++;
+#ifndef RETAIL_BUILD
             {
                 static u32 s_fec_skip_count = 0;
                 s_fec_skip_count++;
@@ -926,8 +1270,21 @@ static void attempt_recovery_and_submit(void)
                                    g_current_frame, parity_received, parity_count,
                                    missing, s_fec_skip_count);
             }
+#endif
             drop_current_frame_strict("insufficient parity for RS", missing);
             return;
+        }
+    }
+
+    if (g_psp_config.width <= 256 && g_psp_config.height <= 144 &&
+        g_psp_config.fps <= 20 && g_received_count <= g_data_packets) {
+        static u32 s_exact_rs_count = 0;
+        s_exact_rs_count++;
+        if (s_exact_rs_count <= 3 || (s_exact_rs_count % 120) == 0) {
+            diag_log_write("FEC",
+                           "attempting exact-threshold low-res RS frame %u missing=%u recv=%u data=%u [try#%u]\n",
+                           g_current_frame, missing, g_received_count,
+                           g_data_packets, s_exact_rs_count);
         }
     }
 
@@ -943,13 +1300,7 @@ static void attempt_recovery_and_submit(void)
                            g_current_frame, missing, g_received_count);
     }
 
-    receiveSize = 0;
-    for (i = 0; i < g_total_packets; i++) {
-        if (g_slots[i].received && g_slots[i].len > receiveSize) {
-            receiveSize = g_slots[i].len;
-        }
-    }
-    if (receiveSize == 0) receiveSize = MAX_PKT_SIZE;
+    receiveSize = fec_recovery_symbol_size();
 
     /* Build packet array and marks */
     memset(marks, 1, g_total_packets);
@@ -979,9 +1330,12 @@ static void attempt_recovery_and_submit(void)
      * Heap fragmentation from repeated small allocations can destabilize
      * the PSP's limited 12MB heap over long streaming sessions. */
     {
+        reed_solomon_global_lock();
         if (s_cached_rs &&
             s_cached_data == g_data_packets &&
-            s_cached_parity == g_parity_packets) {
+            s_cached_parity == g_parity_packets &&
+            s_cached_rs->data_shards == (int)g_data_packets &&
+            s_cached_rs->parity_shards == (int)g_parity_packets) {
             rs = s_cached_rs;  /* reuse */
         } else {
             if (s_cached_rs) {
@@ -990,6 +1344,7 @@ static void attempt_recovery_and_submit(void)
             }
             rs = reed_solomon_new(g_data_packets, g_parity_packets);
             if (!rs) {
+                reed_solomon_global_unlock();
                 diag_log_write("FEC", "reed_solomon_new failed (%u, %u) -- refs corrupted\n",
                                g_data_packets, g_parity_packets);
                 {
@@ -1006,28 +1361,28 @@ static void attempt_recovery_and_submit(void)
     }
 
     ret = reed_solomon_reconstruct(rs, packets, marks, g_total_packets, receiveSize);
+    reed_solomon_global_unlock();
     /* Do NOT release rs — keep cached for next frame */
 
     g_fec_recovery_attempts++;
 
     if (ret == 0) {
-        g_fec_packets_recovered += missing;
+        int recovered_invalid = 0;
         {
             static u32 s_recovery_ok_count = 0;
             s_recovery_ok_count++;
             if (s_recovery_ok_count <= 3 || (s_recovery_ok_count % 120) == 0)
-                diag_log_write("FEC", "recovery SUCCESS for frame %u (%u packets recovered)\n",
+                diag_log_write("FEC", "RS completed for frame %u (%u packets reconstructed)\n",
                                g_current_frame, missing);
         }
 
-        /* Copy recovered packets into slots at full receiveSize.
+        /* Copy recovered packets into slots using moonlight-common-c sizing.
          *
-         * FEC recovery produces packets padded to receiveSize.  Non-last
-         * data packets are genuinely receiveSize.  The LAST data packet
-         * may have trailing zero padding, but those zeros end up at the
-         * END of the assembled Annex-B frame (after all valid NAL data),
-         * where the H.264 parser ignores them (RBSP trailing bits / NAL
-         * boundary detection stops reading before the padding).
+         * RS reconstruction must use packetSize + MAX_RTP_HEADER_SIZE as the
+         * symbol length, then recovered data packets are requeued at
+         * dataOffset + packetSize.  Using the largest packet seen in the
+         * frame can make RS "succeed" against the wrong symbol length and
+         * produce subtle H.264 corruption that OpenH264 conceals as smear.
          *
          * Previous code tried to trim trailing zeros, but H.264 bitstreams
          * CAN legitimately contain runs of zero bytes (zero-valued DCT
@@ -1036,9 +1391,20 @@ static void attempt_recovery_and_submit(void)
          */
         for (i = 0; i < g_data_packets; i++) {
             if (marks[i] && packets[i]) {
+                int recovered_len;
                 memcpy(g_slots[i].data, packets[i], receiveSize);
-                g_slots[i].len = receiveSize;
                 g_slots[i].received = 1;
+                g_slots[i].len = receiveSize;
+                fec_patch_recovered_packet_header(i, 0, 0);
+                recovered_len = fec_recovered_data_len(g_slots[i].data,
+                                                       receiveSize);
+                g_slots[i].len = recovered_len;
+                if (!fec_validate_recovered_data_packet(i, g_data_packets)) {
+                    g_slots[i].received = 0;
+                    g_slots[i].len = 0;
+                    recovered_invalid = 1;
+                    break;
+                }
 
                 /* Slot-level recovery log silenced for performance.
                  * The frame-level summary above is sufficient. */
@@ -1048,14 +1414,22 @@ static void attempt_recovery_and_submit(void)
         /* FEC recovery is mathematically exact — if RS succeeded, the
          * recovered data is correct.  Don't request preemptive IDR here;
          * if the decode subsequently fails, the error path will request it.
+         */
+        if (recovered_invalid) {
+            g_fec_packets_failed += missing;
+            g_fec_recovery_clean = 0;
+            drop_current_frame_strict("recovered packet invalid", missing);
+            return;
+        }
+        /*
          * Removing this prevents IDR flooding (was triggering 10+ requests
          * per 19s of streaming in Run #17). */
+        g_fec_packets_recovered += missing;
         g_fec_recovery_clean = 1;  /* RS succeeded — data is bit-perfect */
         /* Phase 4: Record success in prediction window */
         s_pred_window[s_pred_idx] = 0;
         s_pred_idx = (s_pred_idx + 1) % PRED_WINDOW_SIZE;
         if (s_pred_count < PRED_WINDOW_SIZE) s_pred_count++;
-        s_pred_idr_requested = 0;
         signal_strength_report_frame_ok();
     } else {
         g_fec_packets_failed += missing;
@@ -1063,12 +1437,6 @@ static void attempt_recovery_and_submit(void)
                        g_current_frame, ret);
 
         g_fec_recovery_clean = 0;  /* Recovery failed — data is partial */
-        /* Phase 4: Record drop in prediction window */
-        s_pred_window[s_pred_idx] = 1;
-        s_pred_idx = (s_pred_idx + 1) % PRED_WINDOW_SIZE;
-        if (s_pred_count < PRED_WINDOW_SIZE) s_pred_count++;
-        signal_strength_report_frame_drop();
-
         /* RS failure means partial data will be submitted with gaps.
          * Mark refs corrupted so the decoder skips P-frames until
          * a clean IDR resets the reference chain. */
@@ -1114,15 +1482,14 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
 
     /* Track total bytes for bandwidth estimation */
     g_fec_total_bytes_received += (u32)packet_len;
+    g_fec_packets_received++;
 
     /* Parse RTP header */
     data_offset = FIXED_RTP_HEADER_SIZE;
     if (packet[0] & RTP_FLAG_EXTENSION) {
-        u16 ext_words;
         if (packet_len < data_offset + 4)
             return 0;
-        ext_words = read_be16(packet + data_offset + 2);
-        data_offset += 4 + (int)(ext_words * 4);
+        data_offset += 4;
     }
 
     if (packet_len < data_offset + NV_VIDEO_PKT_SIZE)
@@ -1154,8 +1521,19 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
      * (noise/stray peer traffic/corrupted headers). */
     if (g_current_frame != 0xFFFFFFFF) {
         s32 frame_delta = (s32)(frame_index - g_current_frame);
-        if (frame_delta < 0)
+        if (frame_delta < 0) {
+#ifndef RETAIL_BUILD
+            log_late_frame_packet(frame_index,
+                                  g_current_frame,
+                                  frame_delta,
+                                  seq,
+                                  fec_index,
+                                  data_pkts,
+                                  parity_pkts,
+                                  total_pkts);
+#endif
             return 1; /* stale/reordered packet from an already processed frame */
+        }
         if (frame_delta > 1000 || frame_delta < -1000)
             return 1; /* consume as junk */
     }
@@ -1176,6 +1554,17 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
         return 1; /* consume as junk */
     }
 
+    {
+        int payload_bytes = packet_len - (data_offset + NV_VIDEO_PKT_SIZE);
+        if (payload_bytes > 0) {
+            if (data_pkts > 0 && fec_index >= data_pkts) {
+                telemetry_accum_video_fec((u32)payload_bytes);
+            } else {
+                telemetry_accum_video_data((u32)payload_bytes);
+            }
+        }
+    }
+
     /* Debug: log first few packets to verify FEC parsing */
     {
         static int fec_debug_count = 0;
@@ -1191,11 +1580,11 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
         /* Bypassing FEC... */
         if (fec_index >= data_pkts && data_pkts > 0) {
             /* Drop parity packets — these must NOT reach reassembly */
-            return 1; 
+            return 1;
         }
         /* If it's a data packet or data_pkts is 0 (non-FEC data), let reassembly handle.
          * But if data_pkts is 0, we still want reassembly's FID jump check to protect us. */
-        return 0; 
+        return 0;
     }
 
     /* Frame transition — if new frame, submit previous and reset */
@@ -1234,6 +1623,7 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
                 g_fec_blocks[b].parity_packets = 0;
                 g_fec_blocks[b].total_packets = 0;
                 g_fec_blocks[b].received_count = 0;
+                g_fec_blocks[b].received_data_count = 0;
                 g_fec_blocks[b].fec_percentage = 0;
                 g_fec_blocks[b].seen = 0;
                 g_fec_blocks[b].recovered = 0;
@@ -1264,6 +1654,8 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
             blk->parity_packets = parity_pkts;
             blk->total_packets = total_pkts;
             blk->fec_percentage = fec_pct;
+            blk->received_count = 0;
+            blk->received_data_count = 0;
             blk->seen = 1;
         }
         if (fec_index >= blk->max_slots)
@@ -1296,23 +1688,30 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
                 (index < g_data_packets));
         g_received_count++;
         /* Track per-block received count for multi-FEC */
-        if (g_num_fec_blocks > 1)
+        if (g_num_fec_blocks > 1) {
             g_fec_blocks[fec_block_num].received_count++;
+            if (fec_index < g_fec_blocks[fec_block_num].data_packets)
+                g_fec_blocks[fec_block_num].received_data_count++;
+        }
     }
 
     /* Check if we have enough packets to attempt recovery/submit */
     if (!g_frame_submitted) {
         if (g_num_fec_blocks <= 1) {
-            /* Single-block: existing check */
-            if (g_received_count >= g_data_packets)
+            /* Only submit early once the data side is complete. Counting
+             * parity here can feed a frame before its EOF data packet has
+             * arrived, which later appears as a partial frame/RFI churn. */
+            if (g_received_data_count >= g_data_packets)
                 attempt_recovery_and_submit();
         } else {
-            /* Multi-block: all blocks must have enough packets */
+            /* Multi-block: all blocks must have complete data before an
+             * early submit. Missing data is recovered on frame transition. */
             int all_ready = 1;
             int b;
             for (b = 0; b < (int)g_num_fec_blocks; b++) {
                 fec_block_t *blk = &g_fec_blocks[b];
-                if (!blk->seen || blk->received_count < blk->data_packets) {
+                if (!blk->seen ||
+                    blk->received_data_count < blk->data_packets) {
                     all_ready = 0;
                     break;
                 }

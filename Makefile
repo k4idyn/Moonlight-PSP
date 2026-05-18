@@ -32,7 +32,7 @@ OBJS = src/main.o src/network_connect.o src/network_me.o \
        src/signal_strength.o src/safety_buffer.o src/audio_thread.o src/power_handler.o \
        src/moonlight_stubs.o src/ui_manager.o src/button_mapping_ui.o src/game_grid_ui.o src/pairing_pin_ui.o \
        src/netconf_ui.o src/osk_input.o src/stream_connect_ui.o src/wol.o src/exit_dialog.o \
-       src/diag_log.o \
+       src/diag_log.o src/runtime_telemetry.o \
        src/crypto_lite.o src/psp_mbedtls_entropy.o \
        src/stream_crypto.o src/client_identity.o src/icon_cache.o src/control_stream.o \
        src/opus_decode_psp.o \
@@ -120,26 +120,36 @@ OPUS_ALL_OBJS      = $(OPUS_SRC_OBJS) $(OPUS_CELT_OBJS) $(OPUS_SILK_OBJS) $(OPUS
 OPENH264_ROOT    = third_party/openh264
 OPENH264_LIB     = $(OPENH264_ROOT)/libopenh264_dec_psp.a
 OPENH264_INCDIR  = -I$(OPENH264_ROOT)
+CORE_HEADERS     = $(wildcard include/*.h)
 
 # ============================================================================
 # Build Mode
 # ============================================================================
-# RETAIL_BUILD=1 keeps diagnostics minimal and strips most log-file writes.
+# RETAIL_BUILD=1 disables diagnostic file writes and debug telemetry work.
 # This is the default for public release packaging.
 # For local hardware debugging/validation, use RETAIL_BUILD=0.
 RETAIL_BUILD ?= 1
+PSP_VIDEO_FEC_PERCENT ?= 35
+PSP_VIDEO_FEC_MIN_REQUIRED ?= 1
+PSP_AUDIO_PACKET_DURATION_MS ?= 60
 ifeq ($(RETAIL_BUILD),1)
 BUILD_MODE_DEFINES = -DRETAIL_BUILD
 else
 BUILD_MODE_DEFINES =
 endif
 
+PSP_TUNE_DEFINES = -DPSP_VIDEO_FEC_PERCENT=$(PSP_VIDEO_FEC_PERCENT) \
+                   -DPSP_VIDEO_FEC_MIN_REQUIRED=$(PSP_VIDEO_FEC_MIN_REQUIRED) \
+                   -DPSP_AUDIO_PACKET_DURATION_MS=$(PSP_AUDIO_PACKET_DURATION_MS)
+BUILD_DIR = .build
+TUNE_STAMP = $(BUILD_DIR)/tune.stamp
+
 # ============================================================================
 # Compiler Flags
 # ============================================================================
-CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(MBEDTLS_CFLAGS) \
+CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(PSP_TUNE_DEFINES) $(MBEDTLS_CFLAGS) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
-CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
+CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(PSP_TUNE_DEFINES) -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
            $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 
@@ -161,6 +171,13 @@ LIBS = $(OPENH264_LIB) \
 # ============================================================================
 all: me_helper $(TARGET).prx $(EXTRA_TARGETS)
 
+.PHONY: FORCE_TUNE_STAMP
+
+$(TUNE_STAMP): FORCE_TUNE_STAMP
+	@mkdir -p $(BUILD_DIR)
+	@printf "RETAIL_BUILD=%s\nPSP_VIDEO_FEC_PERCENT=%s\nPSP_VIDEO_FEC_MIN_REQUIRED=%s\nPSP_AUDIO_PACKET_DURATION_MS=%s\n" "$(RETAIL_BUILD)" "$(PSP_VIDEO_FEC_PERCENT)" "$(PSP_VIDEO_FEC_MIN_REQUIRED)" "$(PSP_AUDIO_PACKET_DURATION_MS)" > $@.tmp
+	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+
 .PHONY: smoke
 smoke:
 	bash scripts/smoke_checks.sh
@@ -174,14 +191,14 @@ me_helper:
 $(MBEDTLS_OBJS): mbedtls_%.o: $(MBEDTLS_LIBDIR)/%.c
 	$(CC) -std=gnu99 $(CFLAGS) -c -o $@ $<
 
-src/psp_mbedtls_entropy.o: src/psp_mbedtls_entropy.c
+src/psp_mbedtls_entropy.o: src/psp_mbedtls_entropy.c $(TUNE_STAMP)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/opus_decode_psp.o: src/opus_decode_psp.c
+src/opus_decode_psp.o: src/opus_decode_psp.c $(TUNE_STAMP)
 	$(CC) $(CFLAGS) $(OPUS_CFLAGS) -c -o $@ $<
 
 # OpenH264 decoder wrapper (C++ TU, needs openh264 include paths)
-src/openh264_decode.o: src/openh264_decode.cpp $(OPENH264_LIB)
+src/openh264_decode.o: src/openh264_decode.cpp $(OPENH264_LIB) $(CORE_HEADERS) $(TUNE_STAMP)
 	$(CXX) $(CXXFLAGS) $(OPENH264_INCDIR) -Iinclude -I$(PSPSDK)/include -I$(PSP_PREFIX)/include/oslib/intraFont -I$(PSP_PREFIX)/include -c -o $@ $<
 
 # Build OpenH264 PSP static library if not already built
@@ -203,14 +220,18 @@ $(OPUS_SILK_FIX_OBJS): opus_f_%.o: $(OPUS_ROOT)/silk/fixed/%.c
 # C-only standard — inject -std=gnu99 only for .c files.
 # build.mak passes $(CFLAGS) to psp-g++ too, so -std=gnu99 must NOT be in CFLAGS.
 # This pattern rule takes precedence over build.mak's suffix rule for src/*.c files.
-src/%.o: src/%.c
+src/%.o: src/%.c $(CORE_HEADERS) $(TUNE_STAMP)
 	$(CC) -std=gnu99 $(CFLAGS) -c -o $@ $<
 
-# Workaround for CreateProcess Windows character limits (long command lines)
-# Defined BEFORE build.mak include to avoid duplicate-target warning.
-$(TARGET).elf: $(OBJS) $(EXPORT_OBJ)
-	$(AR) rcs _all_objs.a $(OBJS)
-	$(CXX) -G0 _all_objs.a $(EXPORT_OBJ) $(addprefix -L,$(LIBDIR)) $(LIBS) -o $@
-	$(FIXUP) $@
-
 include $(PSPSDK)/lib/build.mak
+
+PSP_TOOL_BIN := $(shell psp-config --pspdev-path)/bin
+EXPORT_OBJ_RSP := $(subst \,/,$(EXPORT_OBJ))
+
+# Workaround for CreateProcess Windows character limits on the PSP-1000
+# release build. Keep PSPSDK's normal object order, but pass the long
+# object/library list through a GCC response file.
+$(TARGET).elf: $(OBJS) $(EXPORT_OBJ)
+	printf "%s\n" $(OBJS) $(EXPORT_OBJ_RSP) $(LIBS) > _link.rsp
+	$(LINK.c) -B$(PSP_TOOL_BIN)/ @_link.rsp -o $@
+	$(PSP_TOOL_BIN)/psp-fixup-imports.exe $@

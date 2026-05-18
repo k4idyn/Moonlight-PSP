@@ -48,9 +48,12 @@ Thumbs.db
 build/
 bin/
 obj/
+.build/
+release_artifacts/
 
 # Build temporaries
 _all_objs.a
+_link.rsp
 *.SFO
 
 # Log / dump artifacts
@@ -68,3 +71,7 @@ Moonlight/
 # Temp / config artifacts
 temp_config.ini
 tmp_*.c
+
+# Internal audit ledgers
+docs/HANDHELD_SOURCE_PASS.md
+docs/V2_RELEASE_AUDIT_RESOURCE_MAP.md

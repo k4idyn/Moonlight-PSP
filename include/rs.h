@@ -20,6 +20,12 @@ typedef struct _reed_solomon {
  * */
 void reed_solomon_init(void);
 
+/* The PSP build keeps the RS tables/context in static storage. Hold this
+ * lock across reed_solomon_new() + encode/reconstruct when multiple stream
+ * threads may use RS at the same time. */
+void reed_solomon_global_lock(void);
+void reed_solomon_global_unlock(void);
+
 reed_solomon* reed_solomon_new(int data_shards, int parity_shards);
 void reed_solomon_release(reed_solomon* rs);
 
@@ -42,4 +48,3 @@ int reed_solomon_encode(reed_solomon* rs, unsigned char** shards, int nr_shards,
  * */
 int reed_solomon_reconstruct(reed_solomon* rs, unsigned char** shards, unsigned char* marks, int nr_shards, int block_size);
 #endif
-

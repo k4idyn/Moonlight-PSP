@@ -1,6 +1,6 @@
 # Building PSP Moonlight
 
-_v1.1.0_
+_v1.2.0_
 
 This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
 
@@ -121,9 +121,9 @@ Expected output (abbreviated):
   PACK  EBOOT.PBP
 ```
 
-> **Known harmless warning:** The build prints a warning about a duplicate `moonlight.elf`
-> target from PSPSDK's `build.mak`. **This is not an error.** `EBOOT.PBP` is produced
-> successfully. Exit code will be 1 from make but all outputs exist.
+> **Known harmless warning:** Some PSPSDK setups print a warning about a duplicate
+> `moonlight.elf` target from `build.mak`. This is not an error when `EBOOT.PBP`
+> and `moonlight.prx` are produced and `make` exits successfully.
 
 ### Step 3 — Verify Outputs
 
@@ -145,7 +145,7 @@ ls -lh EBOOT.PBP moonlight.prx moonlight_me_helper/moonlight_me_helper.prx
 
 ## Installing on PSP
 
-**Custom firmware required.** Release validation targets ARK-4 on 6.60/6.61.
+**Custom firmware required.** ARK-4 on 6.60/6.61 is the supported target for public releases.
 
 ```
 ms0:/PSP/GAME/Moonlight/

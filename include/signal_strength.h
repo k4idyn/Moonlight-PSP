@@ -45,11 +45,13 @@ extern "C" {
 
 /* Phase 4: Adaptive bitrate constants */
 #define ADAPT_FAST_DROP_THRESHOLD  3      /* consecutive drops to trigger halve */
-#define ADAPT_SLOW_RECOVER_KBPS   25     /* kbps per second recovery rate */
+#define ADAPT_SLOW_RECOVER_KBPS   12     /* kbps per second recovery rate */
 #define ADAPT_GREEN_HOLDOFF_US    (5 * 1000 * 1000) /* 5s green before recovery */
+#define ADAPT_DROP_COOLDOWN_US    (15 * 1000 * 1000) /* hold post-drop cap */
 #define ADAPT_DEADZONE_PCT        15     /* +/-15% stability band */
 #define ADAPT_CEILING_MAX_KBPS    4000   /* absolute bitrate ceiling */
 #define ADAPT_CEILING_QUALITY_MULT 50    /* ceiling = quality * this */
+#define ADAPT_STREAM_FLOOR_KBPS   96     /* absolute PSP low-res recovery floor */
 
 /* Phase 4: RSSI/jitter history sizes */
 #define SIGNAL_RSSI_HISTORY_SIZE  16
@@ -80,7 +82,10 @@ typedef struct {
 
     /* Phase 4: Adaptive bitrate controller state */
     volatile int adapt_consecutive_drops; /* consecutive unrecoverable frames */
+    volatile int adapt_drop_events;       /* unrecoverable frames since last update */
     u32 adapt_last_green_time;            /* timestamp when all signals went green */
+    u32 adapt_cooldown_until;             /* timestamp until post-loss cap is held */
+    int adapt_cooldown_cap;               /* bitrate cap held during cooldown */
     int adapt_in_recovery;                /* 1 = slow-recover active */
     int adapt_prev_bitrate;               /* for dead-zone check */
 
@@ -118,6 +123,7 @@ void signal_strength_init(int base_bitrate_kbps);
  * used directly; only the global minimum floor is enforced.
  */
 int signal_strength_get_launch_bitrate_kbps(int configured_bitrate_kbps);
+int signal_strength_get_adaptive_floor_kbps(int base_bitrate_kbps);
 
 /*
  * signal_strength_update - Check signal and adjust bitrate

@@ -634,11 +634,13 @@ static int ssdp_discover_location(char *location, int location_size)
             if (tx > 0) {
                 probes_sent++;
             } else {
+#ifndef RETAIL_BUILD
                 int err = sceNetInetGetErrno();
                 if (i < 2) {
                     upnp_log("SSDP probe send failed (st=%s errno=%d)\n",
                              search_targets[i], err);
                 }
+#endif
             }
         }
     }

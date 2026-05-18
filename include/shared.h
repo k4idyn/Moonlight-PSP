@@ -63,7 +63,7 @@ typedef struct {
 /*--------------------------------------------------------------------------
  * Frame Ring Buffer - Decoded frame handoff from ME thread to main thread
  *--------------------------------------------------------------------------*/
-#define FRAME_RING_SLOTS    8   /* Deeper pipeline: prevents ring-full drops during decode bursts */
+#define FRAME_RING_SLOTS    8   /* Pointer queue; main drains to newest, decoder keeps latest on full */
 
 typedef struct FrameRingBuffer {
     void *frame_data[FRAME_RING_SLOTS];     /* Pointers to RGBA8888 (32-bit) frame data */

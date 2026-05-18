@@ -1,6 +1,6 @@
 # Architecture
 
-_PSP Moonlight v1.1.0_
+_PSP Moonlight v1.2.0_
 
 ## Overview
 
@@ -24,9 +24,9 @@ Main CPU (Allegrex MIPS32R2 @ 333 MHz)
   Network receive (UDP socket, 512-slot ring)
   RTP reassembly + frame boundary detection
   Reed-Solomon FEC repair (up to 66% parity) + predictive loss detection
-  OpenH264 H.264 decode (Baseline, CAVLC required for normal PSP v1.1 playback)
+  OpenH264 H.264 decode (Baseline, CAVLC required for normal PSP playback)
   Control stream (Moonlight protocol, input forward)
-  Opus stereo audio decode (48 kHz, fixed-point) + adaptive PLC
+  Opus mono host decode (48 kHz, fixed-point) + adaptive PLC
   PID-based adaptive bitrate controller
   Keyboard / scroll / controller battery events
   UI rendering + host discovery
@@ -86,9 +86,9 @@ src/
 │     Launch bitrate uses client-selected target directly
 │
 ├── stream_crypto.c          ← AES-GCM video decryption + AES-CBC control
-├── stream_resolution.c      ← Dynamic resolution scaling (4-step ladder)
-│     256×144 → 320×192 → 368×208 → 480×272
-│     EMA-smoothed decode time + loss rate triggers
+├── stream_resolution.c      ← PSP-aspect stream sizing
+│     300×170 Performance, 360×204 Balanced, 480×272 Quality
+│     Custom dimensions normalized to the PSP LCD aspect ratio
 ├── signal_strength.c        ← PID adaptive bitrate controller
 │     Composite quality: 40% RSSI + 30% CQ + 30% FEC
 │     Anti-windup integral clamping, dead-zone prevention
@@ -150,7 +150,7 @@ Largest statically accounted runtime pools:
 | `g_default_icon` | 65,536 | Generated default icon |
 | `s_decoder_storage` | 32,768 | Fixed Opus decoder storage |
 
-The older approximate table below is kept as subsystem orientation only; the measured segment/symbol accounting above is the release gate source of truth.
+The older approximate table below is kept as subsystem orientation only; the measured segment/symbol accounting above is the release accounting source of truth.
 
 | Region | Size | Contents |
 |---|---|---|
@@ -222,9 +222,10 @@ Control (UDP, port 47999)
   PING / IDR request (exp backoff)
 
 Audio (UDP, port 48000)
-  Opus stereo 48 kHz
+  Opus 48 kHz when audio is enabled
   Fixed-point Silk+CELT decoder
-  Quality-adaptive PLC (35/45/60ms)
+  Quality-adaptive PLC
   Dynamic ring depth scaling
   Separate crypto error tracking
+  Performance preset skips local decode/playback work
 ```

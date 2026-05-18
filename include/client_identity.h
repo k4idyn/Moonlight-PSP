@@ -29,8 +29,8 @@ extern "C" {
 /*
  * client_identity_ensure - Ensure client identity files exist.
  *
- * If client.crt, client.key, or config.ini client_unique_id are missing,
- * generate them. Otherwise, load from disk.
+ * If client.crt, client.key, or client.uid are missing, generate them.
+ * Otherwise, load from disk.
  *
  * @out_uid: Buffer of at least CLIENT_UID_LEN bytes to receive the unique ID.
  *

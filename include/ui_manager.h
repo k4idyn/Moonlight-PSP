@@ -18,7 +18,7 @@
  *   ui_clear(UI_COL_BG_TOP);    // clear the back buffer
  *   ui_draw_header("Title");    // draw top bar
  *   ui_draw_button(...);        // draw interactive element
- *   ui_end_frame();             // flush GU, swap buffers, wait VBlank
+ *   ui_end_frame();             // flush GU, wait VBlank, swap buffers
  *   ui_manager_shutdown();      // call on exit
  */
 
@@ -99,7 +99,7 @@ extern u32 g_ui_sel_color;
 /* =========================================================================
  * UI State Machine
  *
- * Maps 1-to-1 with the "UI Flow.txt" state transitions.
+ * Maps 1-to-1 with the UI flow documented in docs/UI_FLOW.md.
  * ========================================================================= */
 typedef enum {
     UI_STATE_BOOT        = 0,  /* Initial splash / loading                   */
@@ -187,10 +187,10 @@ void ui_apply_theme(int index);
 void ui_begin_frame(void);
 
 /**
- * ui_end_frame - Finish the GU frame, swap buffers, wait for VBlank.
+ * ui_end_frame - Finish the GU frame, wait for VBlank, then swap buffers.
  *
- * Calls sceGuFinish, sceGuSync, sceGuSwapBuffers, sceDisplayWaitVblankStart.
- * VBlank sync prevents horizontal tearing on the PSP LCD.
+ * Calls sceGuFinish, sceGuSync, sceDisplayWaitVblankStart, sceGuSwapBuffers.
+ * Waiting before the swap prevents partial-frame presentation on the PSP LCD.
  */
 void ui_end_frame(void);
 
@@ -450,7 +450,7 @@ void ui_draw_hollow_rect_rounded(int x, int y, int w, int h, int r, int t, u32 c
 
 /**
  * ui_draw_texture_rgb565 - Blit and SCALE an RGB565 texture via GU.
- * 
+ *
  * dw, dh = destination screen size
  * sw, sh = source pixels to read (fixed at 100x150 for icons)
  * tw, th = texture buffer size (must be power of 2)
@@ -460,7 +460,7 @@ void ui_draw_texture_rgb565(int x, int y, int dw, int dh,
                              int tw, int th, int focused);
 
 void ui_draw_texture_rounded_rgb565(int x, int y, int dw, int dh, int r,
-                                    void *tex_data, int sw, int sh, 
+                                    void *tex_data, int sw, int sh,
                                     int tw, int th, int focused);
 
 #ifdef __cplusplus

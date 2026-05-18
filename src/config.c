@@ -24,6 +24,7 @@
 /* Buffer size for reading config file */
 #define CONFIG_BUFFER_SIZE      2048
 #define LINE_MAX_LENGTH         256
+#define PSP_AUDIO_CONFIGURATION_MONO (((1) << 16) | ((1) << 8) | 0xCA)
 
 static ManualHostEntry g_manual_hosts[MAX_MANUAL_HOSTS];
 static int g_manual_host_count = 0;
@@ -36,22 +37,22 @@ static int g_have_last_loaded_config = 0;
 static char* trimWhitespace(char *str)
 {
     char *end;
-    
+
     /* Leading whitespace */
     while (*str == ' ' || *str == '\t' || *str == '\r' || *str == '\n') {
         str++;
     }
-    
+
     if (*str == '\0') {
         return str;
     }
-    
+
     /* Trailing whitespace */
     end = str + strlen(str) - 1;
     while (end > str && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
         end--;
     }
-    
+
     *(end + 1) = '\0';
     return str;
 }
@@ -65,10 +66,10 @@ static int parseIntValue(const char *line, int *value)
     if (!equals) {
         return -1;
     }
-    
+
     equals++;  /* Skip '=' */
     char *trimmed = trimWhitespace((char*)equals);
-    
+
     *value = atoi(trimmed);
     return 0;
 }
@@ -82,13 +83,13 @@ static int parseStringValue(const char *line, char *value, int maxLen)
     if (!equals) {
         return -1;
     }
-    
+
     equals++;  /* Skip '=' */
     char *trimmed = trimWhitespace((char*)equals);
-    
+
     strncpy(value, trimmed, maxLen - 1);
     value[maxLen - 1] = '\0';
-    
+
     return 0;
 }
 
@@ -134,35 +135,48 @@ static void rememberLoadedConfig(const PspConfig *config)
     g_have_last_loaded_config = 1;
 }
 
+static int clamp_config_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
 /*--------------------------------------------------------------------------
  * configSetDefaults - Initialize config with default values
  *--------------------------------------------------------------------------*/
 void configSetDefaults(PspConfig *config)
 {
+    /* Practical exact-aspect Performance default for PSP-1000 low-work mode. */
     /* Stream settings */
-    config->width = DEFAULT_WIDTH;           /* 368 — Quality preset (math optimum) */
-    config->height = DEFAULT_HEIGHT;         /* 208 — ~16:9, mod-16 aligned */
-    config->fps = DEFAULT_FPS;               /* 30 FPS */
-    config->bitrate = DEFAULT_BITRATE;       /* 384 kbps default */
-    config->packetSize = DEFAULT_PACKET_SIZE;
+    config->width = DEFAULT_WIDTH;           /* 300 — lowest exact PSP aspect */
+    config->height = DEFAULT_HEIGHT;         /* 170 — no black bars */
+    config->fps = DEFAULT_FPS;               /* 30 FPS practical anchor */
+    config->bitrate = DEFAULT_BITRATE;       /* 384 kbps practical anchor */
+    config->packetSize = DEFAULT_PACKET_SIZE;/* 1056-byte Performance packet anchor */
     config->streamingRemotely = 2;           /* STREAM_CFG_AUTO */
-    config->audioConfiguration = 0x0000CA02; /* Stereo */
+    config->audioConfiguration = PSP_AUDIO_CONFIGURATION_MONO; /* Mono host stream */
     config->supportedVideoFormats = 0x0001;  /* H.264 */
     config->clientRefreshRateX100 = 6000;    /* 60 Hz */
     config->colorSpace = 0;                  /* Rec. 601 */
     config->colorRange = 0;                  /* Limited */
-    config->encryptionFlags = 0xFFFFFFFF;    /* All encryption */
-    
+    config->encryptionFlags = 0;             /* No AV encryption by default */
+
     /* Clear AES key/IV */
     memset(config->remoteInputAesKey, 0, 16);
     memset(config->remoteInputAesIv, 0, 16);
-    
+
     /* PSP-specific settings */
     config->controlMode = DEFAULT_CONTROL_MODE;
-    config->resolutionIndex = 0;             /* Quality preset: 368x208 */
-    config->fpsIndex = 0;                    /* 15 FPS (index 0 in [15,20,30,60,Custom]) */
-    config->audioEnabled = 1;                /* Enabled by default */
-    config->disableEncryption = 0;           /* Encryption on by default (safe default) */
+    config->presetIndex = 2;                 /* Performance step-ladder preset */
+    config->resolutionIndex = 2;             /* 300x170 resolution row */
+    config->fpsIndex = 3;                    /* 30 FPS */
+    config->audioEnabled = 0;                /* Performance default: client-side audio drain/drop only */
+    config->disableEncryption = 1;           /* No AV encryption; RTSP/control stay compatible */
 
     /* Pairing persistence */
     memset(config->pairedHostIps, 0, sizeof(config->pairedHostIps));
@@ -186,11 +200,12 @@ int loadConfig(PspConfig *config)
     int bytesRead;
     int linePos = 0;
     int fileLoaded = 0;
-    
+    int presetIndexLoaded = 0;
+
     /* Initialize with defaults first */
     configSetDefaults(config);
     clearManualHosts();
-    
+
     /* Try to open config file */
     fd = sceIoOpen(CONFIG_FILE_PATH, PSP_O_RDONLY, 0777);
     if (fd < 0) {
@@ -201,18 +216,18 @@ int loadConfig(PspConfig *config)
         rememberLoadedConfig(config);
         return -1;
     }
-    
+
     /* Read entire file */
     bytesRead = sceIoRead(fd, buffer, CONFIG_BUFFER_SIZE - 1);
     sceIoClose(fd);
-    
+
     if (bytesRead <= 0) {
         diag_log_write("CONFIG", "File empty or unreadable.\n");
         return -1;
     }
-    
+
     buffer[bytesRead] = '\0';  /* Null terminate */
-    
+
     /* Parse line by line */
     char *bufferPtr = buffer;
     while (*bufferPtr) {
@@ -222,28 +237,28 @@ int loadConfig(PspConfig *config)
             line[linePos++] = *bufferPtr++;
         }
         line[linePos] = '\0';
-        
+
         /* Skip newline */
         if (*bufferPtr == '\n') {
             bufferPtr++;
         }
-        
+
         /* Trim whitespace */
         char *trimmed = trimWhitespace(line);
-        
+
         /* Skip empty lines and comments */
         if (trimmed[0] == '\0' || trimmed[0] == '#' || trimmed[0] == ';') {
             continue;
         }
-        
+
         /* Skip section headers [xxx] */
         if (trimmed[0] == '[') {
             continue;
         }
-        
+
         /* Parse key-value pairs */
         int value;
-        
+
         if (strncmp(trimmed, "width", 5) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
                 config->width = value;
@@ -259,12 +274,13 @@ int loadConfig(PspConfig *config)
         else if (strncmp(trimmed, "fpsIndex", 8) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
                 config->fpsIndex = value;
-                /* Rebuild actual fps from index — must match FPS_VALUES[] in settings_menu.c:
-                 * 0=15, 1=20, 2=30, 3=60, 4=Custom (keep existing fps) */
-                if (value == 0) config->fps = 15;
-                else if (value == 1) config->fps = 20;
-                else if (value == 2) config->fps = 30;
-                else if (value == 3) config->fps = 60;
+                /* Rebuild actual fps from index - must match FPS_VALUES[]:
+                 * 0=10, 1=15, 2=20, 3=30, 4=60, 5=Custom (keep existing fps) */
+                if (value == 0) config->fps = 10;
+                else if (value == 1) config->fps = 15;
+                else if (value == 2) config->fps = 20;
+                else if (value == 3) config->fps = 30;
+                else if (value == 4) config->fps = 60;
                 /* else: Custom index — leave config->fps as-is from 'fps' key */
                 fileLoaded = 1;
             }
@@ -273,10 +289,11 @@ int loadConfig(PspConfig *config)
             if (parseIntValue(trimmed, &value) == 0) {
                 config->fps = value;
                 /* Update fpsIndex for menu display */
-                if (value == 15) config->fpsIndex = 0;
-                else if (value == 20) config->fpsIndex = 1;
-                else if (value == 30) config->fpsIndex = 2;
-                else if (value == 60) config->fpsIndex = 3;
+                if (value == 10) config->fpsIndex = 0;
+                else if (value == 15) config->fpsIndex = 1;
+                else if (value == 20) config->fpsIndex = 2;
+                else if (value == 30) config->fpsIndex = 3;
+                else if (value == 60) config->fpsIndex = 4;
                 else config->fpsIndex = FPS_CUSTOM_INDEX;
                 fileLoaded = 1;
             }
@@ -291,14 +308,15 @@ int loadConfig(PspConfig *config)
             if (parseIntValue(trimmed, &value) == 0) {
                 /* Enforce 802.11b ceiling: max 4000 kbps */
                 if (value > MAX_BITRATE) value = MAX_BITRATE;
-                if (value < 32)          value = 32;
+                if (value < MIN_BITRATE) value = MIN_BITRATE;
                 config->bitrate = value;
                 fileLoaded = 1;
             }
         }
         else if (strncmp(trimmed, "packetSize", 10) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
-                config->packetSize = value;
+                config->packetSize = clamp_config_int(
+                    value, MIN_STREAM_PACKET_SIZE, MAX_STREAM_PACKET_SIZE);
                 fileLoaded = 1;
             }
         }
@@ -311,6 +329,13 @@ int loadConfig(PspConfig *config)
         else if (strncmp(trimmed, "resolutionIndex", 15) == 0) {
             if (parseIntValue(trimmed, &value) == 0) {
                 config->resolutionIndex = value;
+                fileLoaded = 1;
+            }
+        }
+        else if (strncmp(trimmed, "presetIndex", 11) == 0) {
+            if (parseIntValue(trimmed, &value) == 0) {
+                config->presetIndex = value;
+                presetIndexLoaded = 1;
                 fileLoaded = 1;
             }
         }
@@ -392,20 +417,50 @@ int loadConfig(PspConfig *config)
             }
         }
     }
-    
-    /* Clamp resolutionIndex to valid range */
-    if (config->resolutionIndex < 0 || config->resolutionIndex >= RESOLUTION_COUNT)
-        config->resolutionIndex = 0;
 
+    /* Clamp presetIndex and resolutionIndex independently. Invalid configs
+     * fall back to the low-work Performance preset/resolution. */
+    if (config->presetIndex < 0 || config->presetIndex >= RESOLUTION_COUNT)
+        config->presetIndex = 2;
+    if (config->resolutionIndex < 0 || config->resolutionIndex >= RESOLUTION_COUNT)
+        config->resolutionIndex = 2;
     /* Normalize dimensions to the selected mode so runtime launch/display
-     * paths never receive unsupported sizes from a hand-edited config. */
+     * paths never receive unsupported sizes from a hand-edited config.
+     * This does not apply step-ladder defaults; presetIndex owns those. */
     if (config->resolutionIndex == RESOLUTION_CUSTOM_INDEX) {
         stream_resolution_normalize(&config->width, &config->height);
     } else {
+        int best = config->resolutionIndex;
+        int best_diff = 999999;
+        int i;
+
+        for (i = 0; i < RESOLUTION_PRESET_COUNT; i++) {
+            int diff = (RESOLUTION_WIDTHS[i] > config->width
+                            ? RESOLUTION_WIDTHS[i] - config->width
+                            : config->width - RESOLUTION_WIDTHS[i])
+                     + (RESOLUTION_HEIGHTS[i] > config->height
+                            ? RESOLUTION_HEIGHTS[i] - config->height
+                            : config->height - RESOLUTION_HEIGHTS[i]);
+            if (diff < best_diff) {
+                best_diff = diff;
+                best = i;
+            }
+        }
+
+        config->resolutionIndex = best;
         config->width = RESOLUTION_WIDTHS[config->resolutionIndex];
         config->height = RESOLUTION_HEIGHTS[config->resolutionIndex];
     }
-    
+    if (!presetIndexLoaded) {
+        config->presetIndex = config->resolutionIndex;
+    }
+
+    config->bitrate = clamp_config_int(config->bitrate, MIN_BITRATE, MAX_BITRATE);
+    config->packetSize = clamp_config_int(config->packetSize,
+                                          MIN_STREAM_PACKET_SIZE,
+                                          MAX_STREAM_PACKET_SIZE);
+    config->audioEnabled = config->audioEnabled ? 1 : 0;
+
     rememberLoadedConfig(config);
 
     return (fileLoaded > 0) ? 0 : -1;
@@ -420,52 +475,55 @@ int saveConfig(const PspConfig *config)
     char line[LINE_MAX_LENGTH];
     int index;
     diag_log_write("CONFIG", "Saving config - Theme Index: %d\n", config->uiThemeIndex);
-    
+
     /* Create directory if it doesn't exist */
     sceIoMkdir(CONFIG_DIR_PATH, 0777);
-    
+
     /* Open file for writing (create if doesn't exist, truncate if exists) */
-    fd = sceIoOpen(CONFIG_FILE_PATH, 
-                   PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 
+    fd = sceIoOpen(CONFIG_FILE_PATH,
+                   PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
                    0777);
-    
+
     if (fd < 0) {
         return -1;
     }
-    
+
     /* Write header comment */
     writeString(fd, "; Moonlight PSP Configuration File\n");
     writeString(fd, "; This file is auto-generated. Edit with care.\n\n");
-    
+
     writeString(fd, "[stream]\n");
-    
+
     /* Write resolution */
     sprintf(line, "width = %d\n", config->width);
     writeString(fd, line);
-    
+
     sprintf(line, "height = %d\n", config->height);
     writeString(fd, line);
-    
+
     sprintf(line, "resolutionIndex = %d\n", config->resolutionIndex);
     writeString(fd, line);
-    
+
+    sprintf(line, "presetIndex = %d\n", config->presetIndex);
+    writeString(fd, line);
+
     /* Write FPS */
     sprintf(line, "fps = %d\n", config->fps);
     writeString(fd, line);
-    
+
     sprintf(line, "fpsIndex = %d\n", config->fpsIndex);
     writeString(fd, line);
-    
+
     /* Write bitrate */
     sprintf(line, "bitrate = %d\n", config->bitrate);
     writeString(fd, line);
-    
+
     /* Write packet size */
     sprintf(line, "packetSize = %d\n", config->packetSize);
     writeString(fd, line);
-    
+
     writeString(fd, "\n[controls]\n");
-    
+
     /* Write control mode */
     sprintf(line, "controlMode = %d\n", (int)config->controlMode);
     writeString(fd, line);
@@ -516,10 +574,10 @@ int saveConfig(const PspConfig *config)
     writeString(fd, line);
 
     writeString(fd, "\n");
-    
+
     /* Close file */
     sceIoClose(fd);
-    
+
     rememberLoadedConfig(config);
 
     return 0;

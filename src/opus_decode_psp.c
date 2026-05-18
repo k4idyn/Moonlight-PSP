@@ -1,7 +1,7 @@
 /*
  * opus_decode_psp.c - Opus Audio Decoder for PSP
  *
- * Multistream Opus decoder wrapper (48 kHz stereo, fixed-point Silk+CELT).
+ * Multistream Opus decoder wrapper (48 kHz mono PSP output, fixed-point Silk+CELT).
  * Receives encrypted RTP audio packets, decodes via libopus, outputs signed
  * 16-bit PCM for the PSP hardware audio channel.
  */
@@ -32,11 +32,16 @@ static unsigned char s_decoder_storage[OPUS_STATIC_DECODER_BYTES] __attribute__(
 int opus_psp_init(int sample_rate, int channels, int streams, int coupled_streams)
 {
     int err;
-    /* Standard stereo mapping: channel 0 = left, channel 1 = right */
+    /* Standard mapping: mono uses entry 0; stereo uses entries 0/1. */
     unsigned char mapping[2] = { 0, 1 };
 
     if (s_initialized) {
         opus_psp_shutdown();
+    }
+
+    if (channels < 1 || channels > 2) {
+        opus_log("[OPUS] unsupported channel count: %d\n", channels);
+        return -1;
     }
 
     s_channels = channels;

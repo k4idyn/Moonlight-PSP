@@ -41,6 +41,8 @@
 #include "client_identity.h"
 #include "rtp_fec.h"
 #include "rtp_reassembly.h"
+#include "runtime_telemetry.h"
+#include "network_me_stats.h"
 
 PSP_MODULE_INFO("PSPMoonlight", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
@@ -59,6 +61,12 @@ volatile int g_stream_status = 0;
 /* Remote input via pspsh pokew — write PSP_CTRL_ bitmask to this address */
 volatile unsigned int g_remote_buttons = 0;
 
+/* Remote analog injection for hardware automation. Values are PSP analog
+ * coordinates (0..255, center 128). Disabled during normal user control. */
+volatile unsigned int g_remote_analog_active = 0;
+volatile unsigned int g_remote_analog_lx = 128;
+volatile unsigned int g_remote_analog_ly = 128;
+
 /* Decode pause flag — pspsh pokew to pause decode threads so psplink can
  * service USB commands (scrshot etc.) without CPU starvation.
  * Set to 1 to pause, 0 to resume. Logged address at startup. */
@@ -68,15 +76,22 @@ volatile int g_decode_paused = 0;
  * Avoids needing to hold Start+Select for 500ms, which is impossible via pokew. */
 volatile unsigned int g_remote_exit_request = 0;
 
+/* Automation readiness flag — set when the first decoded frame reaches the
+ * display path.  The test harness polls this tiny word instead of repeatedly
+ * copying moonlight.log while startup video/audio are trying to stabilize. */
+volatile unsigned int g_stream_ready_flag = 0;
+
 /* External declarations */
 extern int  wifi_connect(void);
 extern void wifi_disconnect(void);
+extern void wifi_launch_disable_power_save(void);
 extern void wifi_keepalive_start(void);
 extern void wifi_keepalive_stop(void);
 extern int  network_connect_all(void);
 extern void network_set_target_host(const char *host_ip);
 extern void network_restore_paired_host(const char *paired_ip);
 extern void network_set_local_bind_ip(const char *ip);
+extern void network_connect_clear_retry_app(void);
 extern int  network_auto_bind_for_loopback(const char *target_ip);
 extern const char *network_get_paired_host(void);
 extern char g_video_server_ip[64];
@@ -107,10 +122,13 @@ extern void hud_update_stats(const HudStats *stats);
 extern void hud_render(void);
 extern int  hud_handle_input(u32 buttons);
 extern int  hud_is_visible(void);
+extern int  hud_overlay_visible(void);
 
 /* Watchdog state — file-scope so both frame-display and idle paths can access */
 static int s_watchdog_restarts = 0;
 static int s_mode_b_soft_count = 0;
+static SceSize s_stream_ram_start_free = 0;
+static SceSize s_stream_ram_start_largest = 0;
 extern void hud_shutdown(void);
 extern void abort_stream_to_menu(void);
 
@@ -128,14 +146,24 @@ static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((align
 static int s_mbedtls_heap_ready = 0;
 
 static void LOG(const char *fmt, ...) {
+#ifdef RETAIL_BUILD
+    (void)fmt;
+#else
     char buf[512]; va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
     diag_log_write("MAIN", "%s", buf);
     if (!g_gu_active) pspDebugScreenPrintf("%s", buf);
+#endif
 }
 
 static void halt_with_error(const char *step_name, int error_code) {
     SceCtrlData pad; sceGuTerm(); g_gu_active = 0; pspDebugScreenInit();
+#ifdef RETAIL_BUILD
+    (void)step_name;
+    pspDebugScreenPrintf("Moonlight error\nCode: 0x%08X\nPress any button to exit...\n",
+                         (unsigned int)error_code);
+#else
     LOG("\n=== FATAL ERROR ===\nStep : %s\nCode : 0x%08X (%d)\nPress any button to exit...\n", step_name, (unsigned int)error_code, error_code);
+#endif
     sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     while (1) { sceCtrlPeekBufferPositive(&pad, 1); if (pad.Buttons != 0) break; sceKernelDelayThread(50 * 1000); }
     sceKernelExitGame();
@@ -146,7 +174,7 @@ static void setup_callbacks(void);
 int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
-    extern void diag_log_clear(void); diag_log_clear();
+    diag_log_clear();
     if (!s_mbedtls_heap_ready) {
         mbedtls_memory_buffer_alloc_init(s_mbedtls_heap, sizeof(s_mbedtls_heap));
         s_mbedtls_heap_ready = 1;
@@ -154,8 +182,12 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     ret = scePowerSetClockFrequency(333, 333, 166);
     diag_log_write("MAIN", "[REMOTE] g_remote_buttons at 0x%08X\n", (unsigned int)&g_remote_buttons);
+    diag_log_write("MAIN", "[REMOTE] g_remote_analog_active at 0x%08X\n", (unsigned int)&g_remote_analog_active);
+    diag_log_write("MAIN", "[REMOTE] g_remote_analog_lx at 0x%08X\n", (unsigned int)&g_remote_analog_lx);
+    diag_log_write("MAIN", "[REMOTE] g_remote_analog_ly at 0x%08X\n", (unsigned int)&g_remote_analog_ly);
     diag_log_write("MAIN", "[REMOTE] g_decode_paused at 0x%08X\n", (unsigned int)&g_decode_paused);
     diag_log_write("MAIN", "[REMOTE] g_remote_exit_request at 0x%08X\n", (unsigned int)&g_remote_exit_request);
+    diag_log_write("MAIN", "[REMOTE] g_stream_ready_flag at 0x%08X\n", (unsigned int)&g_stream_ready_flag);
     diag_log_flush();  /* Force flush so automation can read addresses immediately */
     /* No-op legacy log_open removed */
     sceDisplaySetMode(0, 480, 272);
@@ -163,6 +195,7 @@ int main(int argc, char *argv[]) {
     ret = ui_manager_init();
     if (ret < 0) { LOG("[STEP 0d] ui_manager_init() failed\n"); halt_with_error("UI Manager", ret); return ret; }
     LOG("[PROTO] generation=%d, clientVersion=%d\n", MOONLIGHT_PROTOCOL_GENERATION, MOONLIGHT_CLIENT_VERSION);
+    diag_log_flush();
     ret = client_identity_ensure(NULL);
     if (ret < 0) { halt_with_error("Identity", ret); return ret; }
 
@@ -172,29 +205,37 @@ int main(int argc, char *argv[]) {
 settings_menu_entry:
     LOG("[STEP 1] Loading settings...\n");
     diag_log_write("UI", "TRANSITION settings_menu_init t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    diag_log_flush();
     settings_menu_init(&g_psp_config);
     if (g_psp_config.pairedHostCount > 0 && g_psp_config.pairedHostIps[0][0] != '\0')
         network_restore_paired_host(g_psp_config.pairedHostIps[0]);
     network_set_local_bind_ip(g_psp_config.localBindIp);
     if (settings_menu_run(&g_psp_config) < 0) LOG("[STEP 1] Menu cancelled\n");
     diag_log_write("UI", "TRANSITION settings_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    diag_log_flush();
 
     LOG("[STEP 2] Connecting Wi-Fi...\n");
     diag_log_write("UI", "TRANSITION wifi_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    diag_log_flush();
     { /* Skip netconf dialog if WiFi is already connected (back-navigation) */
         int apctl_state = 0;
         sceNetApctlGetState(&apctl_state);
         if (apctl_state != 4) {
-            if (netconf_ui_run() < 0) { halt_with_error("Wi-Fi", -1); return -1; }
-            wifi_keepalive_start();
+            ret = netconf_ui_run();
+            diag_log_write("UI", "NETCONF returned %d\n", ret);
+            if (ret < 0) { halt_with_error("Wi-Fi", -1); return -1; }
         } else {
             diag_log_write("UI", "WiFi already connected, skipping netconf\n");
         }
+        wifi_launch_disable_power_save();
+        wifi_keepalive_start();
     }
     diag_log_write("UI", "TRANSITION wifi_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    diag_log_flush();
 
 host_select_loop:
     diag_log_write("UI", "TRANSITION host_discovery_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    diag_log_flush();
     if (!skip_rescan) host_discovery_init();
     skip_rescan = 0;
     while (1) {
@@ -219,11 +260,12 @@ host_select_loop:
 
     LOG("[STEP 4] Connecting to %s...\n", selected_host_ip);
     diag_log_write("UI", "TRANSITION connect_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
+    g_stream_ready_flag = 0;
     { /* Connection with auto-retry: after cancel+relaunch the server's
-       * RTSP listener may not be ready yet.  One automatic retry with a
-       * 5-second backoff avoids dropping the user back to host select. */
+       * RTSP listener may not be ready yet.  Two automatic retries with a
+       * 5-second backoff avoid dropping the user back to host select. */
         int connect_attempts = 0;
-        const int MAX_CONNECT_ATTEMPTS = 2;
+        const int MAX_CONNECT_ATTEMPTS = 3;
         while (1) {
             ret = network_connect_all();
             connect_attempts++;
@@ -255,16 +297,34 @@ host_select_loop:
         control_stream_stop();
         audio_thread_shutdown();
         rtsp_session_close();
+        network_connect_clear_retry_app();
         skip_rescan = 1;  /* Keep cached host list — user can Square to rescan */
         goto host_select_loop;
     }
 
     extern unsigned char g_remote_input_key[16];
     stream_crypto_init(g_remote_input_key);
+    s_stream_ram_start_free = sceKernelTotalFreeMemSize();
+    s_stream_ram_start_largest = sceKernelMaxFreeMemSize();
+    diag_log_write("MAIN", "RAM stream-start free=%uK largest=%uK\n",
+                   (unsigned)(s_stream_ram_start_free / 1024),
+                   (unsigned)(s_stream_ram_start_largest / 1024));
+
     extern int g_audio_rtsp_ok;
     if (g_audio_rtsp_ok) {
+        int audio_ret;
         diag_log_write("MAIN", "Initializing audio thread...\n");
-        audio_thread_init(selected_host_ip);
+        audio_ret = audio_thread_init(selected_host_ip);
+        if (audio_ret < 0) {
+            diag_log_write("MAIN", "Audio init failed (%d); aborting audio-required stream\n",
+                           audio_ret);
+            diag_log_flush();
+            audio_thread_shutdown();
+            rtsp_session_close();
+            network_connect_clear_retry_app();
+            skip_rescan = 1;
+            goto host_select_loop;
+        }
     } else {
         diag_log_write("MAIN", "Skipping audio init (RTSP audio SETUP failed)\n");
     }
@@ -272,21 +332,22 @@ host_select_loop:
     diag_log_write("MAIN", "Initializing shared memory (~%uKB)...\n",
                    (unsigned)((sizeof(g_shared) + 1023) / 1024));
     memset(&g_shared, 0, sizeof(g_shared));
-    
+
     diag_log_write("MAIN", "Initializing network ME (D-UDP)...\n");
     diag_log_flush();
     network_me_init(&g_shared.packet_ring);
     diag_log_write("MAIN", "network_me_init done.\n");
     diag_log_flush();
-    
+
     diag_log_write("MAIN", "Initializing SW decoder (CAVLC+VFPU dual-core)...\n");
+    diag_log_flush();
     { g_cabac_detected = 0;
       g_cabac_dialog_active = 0;
     }
     ret = sw_decoder_thread_init(&g_shared.frame_ring);
     if (ret < 0) {
         diag_log_write("MAIN", "SW Decoder Init failed: %d\n", ret);
-        halt_with_error("SW Decoder Init", ret); return ret; 
+        halt_with_error("SW Decoder Init", ret); return ret;
     }
     me_running = 1;
     diag_log_write("MAIN", "Threads ready.\n");
@@ -294,11 +355,23 @@ host_select_loop:
 
     extern int g_decoder_ready;
     g_decoder_ready = 1;
-    if (control_stream_start() < 0) LOG("[STEP 5] Control stream failed\n");
+    ret = control_stream_start();
+    if (ret < 0) {
+        LOG("[STEP 5] Control stream failed (%d)\n", ret);
+        diag_log_write("MAIN", "[STEP 5] Control stream failed (%d); tearing down session before runtime loop\n", ret);
+        diag_log_flush();
+        g_decoder_ready = 0;
+        abort_stream_to_menu();
+        memset(&g_shared, 0, sizeof(g_shared));
+        skip_rescan = 1;
+        goto host_select_loop;
+    }
+
     diag_log_write("MAIN", "Control stream started. Entering main loop.\n");
     diag_log_flush();  /* Flush all handshake/setup logs to disk */
     safety_buffer_init();
     hud_init();
+    telemetry_reset();
     {
         int signal_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(g_psp_config.bitrate);
         signal_strength_init(signal_bitrate_kbps);
@@ -526,7 +599,7 @@ host_select_loop:
         if (video_started && !hud_is_visible()) input_poll_and_send();
 
         if (frame) {
-            if (!video_started) { diag_log_write("MAIN", "First video frame displayed\n"); diag_log_flush(); s_fps_last_us = sceKernelGetSystemTimeLow(); }
+            if (!video_started) { g_stream_ready_flag = 1; diag_log_write("MAIN", "First video frame displayed\n"); diag_log_flush(); s_fps_last_us = sceKernelGetSystemTimeLow(); }
             video_started = 1;
 
             /* ── Frame pacing ───────────────────────────────────────
@@ -567,54 +640,6 @@ host_select_loop:
                     }
                 }
             }
-            /* Compute display FPS every second + feed HUD stats */
-            {
-                u32 now_us = sceKernelGetSystemTimeLow();
-                u32 elapsed = now_us - s_fps_last_us;
-                if (elapsed >= 1000000) {
-                    s_display_fps = (float)s_fps_frame_count * 1000000.0f / (float)elapsed;
-                    s_fps_frame_count = 0;
-                    s_fps_last_us = now_us;
-                    /* Feed HUD with smoothed latency and FPS — only
-                     * gather expensive stats when the HUD is visible
-                     * to avoid unnecessary overhead during streaming. */
-                    if (hud_is_visible()) {
-                        HudStats hs;
-                        hs.latency_ms = s_latency_avg_ms;
-                        hs.fps = s_display_fps;
-
-                        /* Packet loss and FEC stats from RTP layer */
-                        {
-                            RtpVideoStats vs;
-                            rtp_get_video_stats(&vs);
-                            u32 total = vs.packets_received + vs.packets_failed;
-                            if (total > 0)
-                                hs.packet_loss_pct = (float)vs.packets_failed * 100.0f / (float)total;
-                            else
-                                hs.packet_loss_pct = 0.0f;
-                            if (vs.recovery_attempts > 0)
-                                hs.fec_recovery_pct = (float)vs.packets_recovered * 100.0f / (float)vs.recovery_attempts;
-                            else
-                                hs.fec_recovery_pct = 0.0f;
-                        }
-
-                        /* Battery from PSP hardware */
-                        hs.battery_pct = scePowerGetBatteryLifePercent();
-                        if (hs.battery_pct < 0) hs.battery_pct = 0;
-
-                        /* Host processing latency from Sunshine headers */
-                        hs.host_proc_ms = (int)(g_host_processing_us / 1000);
-
-                        /* Per-frame decode time from decoder thread */
-                        {
-                            extern volatile u32 g_decode_time_us;
-                            hs.decode_ms = (int)(g_decode_time_us / 1000);
-                        }
-
-                        hud_update_stats(&hs);
-                    }
-                }
-            }
             if ((s_disp_count % 300) == 0) {
                 diag_log_write("MAIN", "DISP n=%d idle=%d rdy=%u h=%u t=%u",
                                s_disp_count, s_idle_count,
@@ -641,7 +666,7 @@ host_select_loop:
                         s_credit_counter = 0;
                         if (s_watchdog_restarts > 0) {
                             s_watchdog_restarts--;
-                            diag_log_write("MAIN", "[PHASE5-WDG] credit restored (%d/5 used, fec=%u%%)",
+                            diag_log_write("MAIN", "[WDG] credit restored (%d/5 used, fec=%u%%)",
                                            s_watchdog_restarts, (unsigned)cq.fec_recovery_pct);
                         }
                         s_mode_b_soft_count = 0;
@@ -657,16 +682,9 @@ host_select_loop:
                                (unsigned)g_shared.frame_ring.head,
                                (unsigned)g_shared.frame_ring.tail);
             }
-            /* Show "Connection Lost" overlay after ~3 seconds of no frames.
-             * At ~60 iterations/sec (vblank-paced), 180 = 3 seconds. */
-            if (s_idle_count > 180) {
-                extern volatile int g_wifi_reconnecting;
-                display_frame_repeat();
-                ui_draw_text_centered(0.0f, 480.0f, 125.0f, UI_COL_TEXT,
-                                      g_wifi_reconnecting ? "WiFi Reconnecting..." : "Connection Lost");
-                ui_draw_text_centered(0.0f, 480.0f, 150.0f, UI_COL_TEXT_DIM,
-                                      "Hold Start+Select to return to menu");
-            }
+            /* Keep the last swapped frame visible during no-frame stalls.
+             * Re-blitting stale decoder memory here can upload a recycled
+             * black buffer after a pipeline reset. */
 
             /* Decode watchdog — two modes:
              * MODE A: OpenH264 infinite loop — g_decode_active_us stuck >3s
@@ -697,7 +715,7 @@ host_select_loop:
                         }
                         if (elapsed > wdg_timeout_us) {
                             /* Phase 5: Try pipeline flush before full restart */
-                            diag_log_write("MAIN", "[PHASE5-WDG] Mode A flush attempt (hung %u ms, timeout %u ms)",
+                            diag_log_write("MAIN", "[WDG] Mode A flush attempt (hung %u ms, timeout %u ms)",
                                            (unsigned)(elapsed / 1000), (unsigned)(wdg_timeout_us / 1000));
                             oh264_pipeline_flush_buffers();
                             sceKernelDelayThread(100000); /* 100ms settle */
@@ -709,7 +727,7 @@ host_select_loop:
                                     diag_log_write("MAIN", "WATCHDOG-A: decoder hung %u ms -- restart #%d",
                                                    (unsigned)(elapsed / 1000), s_watchdog_restarts);
                                     sw_decoder_thread_force_restart();
-                                    control_stream_request_idr();
+                                    control_stream_request_idr_force();
                                     s_idle_count = 0;
                                 }
                             }
@@ -722,7 +740,7 @@ host_select_loop:
                  * amplify IDR churn on borderline links. */
 
                 /* Mode B: No frames for ~5s — soft recovery (IDR burst).
-                 * Does NOT consume a restart slot.  Repeats every 5s. 
+                 * Does NOT consume a restart slot.  Repeats every 5s.
                  * After force_restart with no progress, back off to 10s
                  * to avoid flooding Sunshine when the problem is server-side. */
                 {
@@ -764,12 +782,9 @@ host_select_loop:
                             g_idr_fully_decoded = 0;
                         }
                         control_stream_request_idr();
-                        if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
-                            s_watchdog_restarts++;
-                            diag_log_write("MAIN", "WATCHDOG-B: escalating to full restart #%d after no-output callback progress",
-                                           s_watchdog_restarts);
-                            sw_decoder_thread_force_restart();
-                            control_stream_request_idr();
+                        if (s_mode_b_soft_count >= 3) {
+                            diag_log_write("MAIN", "WATCHDOG-B: live decoder still has callback progress; keeping pipeline and forcing IDR/RFI resync");
+                            control_stream_request_idr_force();
                             s_idle_count = 0;
                             s_mode_b_soft_count = 0;
                             s_force_restart_no_progress++;
@@ -793,12 +808,10 @@ host_select_loop:
 
                         /* After repeated soft recoveries with no alive progress,
                          * escalate to full restart. */
-                        if (s_mode_b_soft_count >= 3 && s_watchdog_restarts < 5) {
-                            s_watchdog_restarts++;
-                            diag_log_write("MAIN", "WATCHDOG-B: escalating to full restart #%d after %d soft failures (decoder stalled, alive=%d)",
-                                           s_watchdog_restarts, s_mode_b_soft_count, alive_now);
-                            sw_decoder_thread_force_restart();
-                            control_stream_request_idr();
+                        if (s_mode_b_soft_count >= 3) {
+                            diag_log_write("MAIN", "WATCHDOG-B: no output after %d soft recoveries (alive=%d); keeping decoder resident and forcing IDR",
+                                           s_mode_b_soft_count, alive_now);
+                            control_stream_request_idr_force();
                             s_idle_count = 0;
                             s_mode_b_soft_count = 0;
                             s_force_restart_no_progress++;
@@ -821,7 +834,7 @@ host_select_loop:
                         diag_log_write("MAIN", "WATCHDOG-C: decoder dead (ready=0), retry restart #%d",
                                        s_watchdog_restarts);
                         sw_decoder_thread_force_restart();
-                        control_stream_request_idr();
+                        control_stream_request_idr_force();
                         s_idle_count = 0;
                     }
                 }
@@ -835,8 +848,14 @@ host_select_loop:
                 if (g_ctrl_ping_heartbeat_us != 0) {
                     u32 ctrl_elapsed = sceKernelGetSystemTimeLow() - g_ctrl_ping_heartbeat_us;
                     if (ctrl_elapsed > 5000000) { /* 5s without ping */
-                        diag_log_write("MAIN", "WATCHDOG: ctrl_ping stalled %u ms",
-                                       ctrl_elapsed / 1000);
+                        static u32 s_last_ctrl_stall_log_us = 0;
+                        u32 now_us = sceKernelGetSystemTimeLow();
+                        if (s_last_ctrl_stall_log_us == 0 ||
+                            (now_us - s_last_ctrl_stall_log_us) >= 1000000) {
+                            s_last_ctrl_stall_log_us = now_us;
+                            diag_log_write("MAIN", "WATCHDOG: ctrl_ping stalled %u ms",
+                                           ctrl_elapsed / 1000);
+                        }
                     }
                 }
             }
@@ -847,6 +866,10 @@ host_select_loop:
             float progress = ((float)(sceKernelGetSystemTimeLow()/1000 - stream_wait_start) * 100.0f) / 2000.0f;
             if (progress > 99.0f) progress = 99.0f;
             ui_draw_progress_bar(40, 172, 400, 8, progress, 100.0f, NULL);
+            /* The bottom-of-loop compositor performs the single vblank-synced
+             * swap for both pre-video UI and active video frames. Swapping here
+             * too alternates the freshly drawn loading screen with a stale
+             * buffer during slow stream startup. */
             ui_end_frame_no_swap();
 
             /* Mode D: Video never started — server may be in broken encoder
@@ -863,7 +886,7 @@ host_select_loop:
                 if (wait_elapsed_ms > 20000 && s_mode_d_phase < 3) {
                     s_mode_d_phase = 3;
                     /* Phase 5: Send graceful termination before abort */
-                    diag_log_write("MAIN", "[PHASE5-WDG] Mode D graceful termination before abort");
+                    diag_log_write("MAIN", "[WDG] Mode D graceful termination before abort");
                     {
                         extern void LiStopConnection(void);
                         LiStopConnection();
@@ -883,7 +906,7 @@ host_select_loop:
                     diag_log_write("MAIN", "WATCHDOG-D: no video for %u ms — pipeline restart + IDR",
                                    (unsigned)wait_elapsed_ms);
                     sw_decoder_thread_force_restart();
-                    control_stream_request_idr();
+                    control_stream_request_idr_force();
                     sceKernelDelayThread(10000);
                     control_stream_request_idr();
                 } else if (wait_elapsed_ms > 10000 && s_mode_d_phase < 1) {
@@ -904,13 +927,195 @@ host_select_loop:
          * there's nothing new causes double-buffer flashing because
          * each surface gets drawn at different times. */
 
+        if (s_fps_last_us == 0) {
+            s_fps_last_us = sceKernelGetSystemTimeLow();
+        } else {
+            u32 now_us = sceKernelGetSystemTimeLow();
+            u32 elapsed = now_us - s_fps_last_us;
+            if (elapsed >= 1000000) {
+                int update_hud_stats = hud_is_visible();
+                int displayed_frames = s_fps_frame_count;
+                s_display_fps = (float)s_fps_frame_count * 1000000.0f / (float)elapsed;
+                s_fps_frame_count = 0;
+                s_fps_last_us = now_us;
+#ifndef RETAIL_BUILD
+                update_hud_stats = 1;
+#endif
+                if (update_hud_stats) {
+                    HudStats hs;
+                    int hud_video_payload_kbps = 0;
+                    int hud_video_fec_kbps = 0;
+                    int hud_audio_payload_kbps = 0;
+                    int hud_audio_fec_kbps = 0;
+                    memset(&hs, 0, sizeof(hs));
+                    hs.latency_ms = s_latency_avg_ms;
+                    hs.fps = s_display_fps;
+
+                    {
+                        static RtpVideoStats s_prev_vs;
+                        static int s_prev_vs_valid = 0;
+                        RtpVideoStats vs;
+                        NetworkRtcpStats rtcp;
+                        u32 d_recovered = 0;
+                        u32 d_failed = 0;
+                        u32 d_dropped = 0;
+                        u32 loss_x10 = 0;
+                        u32 fec_loss_x10 = 0;
+                        u32 frame_loss_x10 = 0;
+                        rtp_get_video_stats(&vs);
+                        network_me_get_rtcp_stats(&rtcp);
+                        if (s_prev_vs_valid) {
+                            if (vs.packets_recovered < s_prev_vs.packets_recovered ||
+                                vs.packets_failed < s_prev_vs.packets_failed ||
+                                vs.frames_dropped < s_prev_vs.frames_dropped ||
+                                vs.recovery_attempts < s_prev_vs.recovery_attempts) {
+                                s_prev_vs_valid = 0;
+                            } else {
+                                d_recovered = vs.packets_recovered - s_prev_vs.packets_recovered;
+                                d_failed = vs.packets_failed - s_prev_vs.packets_failed;
+                                d_dropped = vs.frames_dropped - s_prev_vs.frames_dropped;
+                            }
+                        }
+                        s_prev_vs = vs;
+                        s_prev_vs_valid = 1;
+
+                        if (d_recovered + d_failed > 0) {
+                            fec_loss_x10 = (d_failed * 1000) / (d_recovered + d_failed);
+                        }
+                        if ((u32)displayed_frames + d_dropped > 0) {
+                            frame_loss_x10 =
+                                (d_dropped * 1000) / ((u32)displayed_frames + d_dropped);
+                        }
+                        loss_x10 = rtcp.fraction_lost_x10;
+                        if (fec_loss_x10 > loss_x10) loss_x10 = fec_loss_x10;
+                        if (frame_loss_x10 > loss_x10) loss_x10 = frame_loss_x10;
+                        hs.packet_loss_pct = (float)loss_x10 / 10.0f;
+
+                        if (d_recovered + d_failed > 0) {
+                            hs.fec_recovery_pct =
+                                (float)((d_recovered * 100) /
+                                        (d_recovered + d_failed));
+                        } else if (d_dropped > 0) {
+                            hs.fec_recovery_pct = 0.0f;
+                        } else {
+                            hs.fec_recovery_pct = 100.0f;
+                        }
+                    }
+
+                    hs.battery_pct = scePowerGetBatteryLifePercent();
+                    if (hs.battery_pct < 0) hs.battery_pct = 0;
+                    hs.host_proc_ms = (int)(g_host_processing_us / 1000);
+
+                    {
+                        extern volatile u32 g_decode_time_us;
+                        hs.decode_ms = (int)(g_decode_time_us / 1000);
+                    }
+
+                    {
+                        u32 cpu_pct = 0, gpu_pct = 0, me_pct = 0;
+                        telemetry_sample(elapsed, &cpu_pct, &gpu_pct, &me_pct);
+                        hs.cpu_pct = (int)cpu_pct;
+                        hs.gpu_pct = (int)gpu_pct;
+                        hs.me_pct = (int)me_pct;
+                    }
+
+                    {
+                        BandwidthTelemetry bw;
+                        memset(&bw, 0, sizeof(bw));
+                        telemetry_sample_bandwidth(elapsed, &bw);
+                        hs.bw_rx_kbps = (int)(bw.video_rx_kbps + bw.audio_rx_kbps);
+                        hs.bw_usable_kbps = (int)bw.video_usable_kbps;
+                        hs.bw_audio_kbps = (int)bw.audio_rx_kbps;
+                        hs.bw_drop_kbps = (int)bw.video_drop_kbps;
+                        hs.bw_usable_pct = (int)bw.usable_rx_pct;
+                        hs.bw_video_packets_s = (int)bw.video_packets_s;
+                        hud_video_payload_kbps =
+                            (int)(bw.video_data_kbps + bw.video_fec_kbps);
+                        hud_video_fec_kbps = (int)bw.video_fec_kbps;
+                        hud_audio_payload_kbps = (int)bw.audio_rx_kbps;
+                        hud_audio_fec_kbps = (int)bw.audio_fec_kbps;
+#ifndef RETAIL_BUILD
+                        diag_log_write("BW",
+                                       "cfg=%dkbps pkt=%d res=%dx%d@%d rx=%ukbps accept=%ukbps usable=%ukbps data=%ukbps fec=%ukbps audio=%ukbps audio_data=%ukbps audio_fec=%ukbps drop=%ukbps pkts=%u/s audio_pkts=%u/s accept=%u%% usable=%u%% fec_overhead=%u%% audio_fec_overhead=%u%%\n",
+                                       g_psp_config.bitrate,
+                                       g_psp_config.packetSize,
+                                       g_psp_config.width,
+                                       g_psp_config.height,
+                                       g_psp_config.fps,
+                                       bw.video_rx_kbps,
+                                       bw.video_accept_kbps,
+                                       bw.video_usable_kbps,
+                                       bw.video_data_kbps,
+                                       bw.video_fec_kbps,
+                                       bw.audio_rx_kbps,
+                                       bw.audio_data_kbps,
+                                       bw.audio_fec_kbps,
+                                       bw.video_drop_kbps,
+                                       bw.video_packets_s,
+                                       bw.audio_packets_s,
+                                       bw.accept_pct,
+                                       bw.usable_rx_pct,
+                                       bw.fec_overhead_pct,
+                                       bw.audio_fec_overhead_pct);
+#endif
+                    }
+
+                    {
+                        SceSize free_mem = sceKernelTotalFreeMemSize();
+                        SceSize largest = sceKernelMaxFreeMemSize();
+                        SceSize baseline = s_stream_ram_start_free;
+
+                        if (baseline == 0 || free_mem > baseline) {
+                            baseline = free_mem;
+                        }
+                        hs.ram_free_kb = (int)(free_mem / 1024);
+                        hs.ram_largest_kb = (int)(largest / 1024);
+                        if (baseline > 0 && free_mem < baseline) {
+                            unsigned long long used =
+                                (unsigned long long)(baseline - free_mem) * 100ULL;
+                            hs.ram_used_pct = (int)(used / baseline);
+                            if (hs.ram_used_pct > 100) hs.ram_used_pct = 100;
+                        }
+                    }
+
+                    hud_update_stats(&hs);
+#ifndef RETAIL_BUILD
+                    diag_log_write("HUD",
+                                   "stats fps=%.1f lat=%d dec=%d loss=%.1f fec=%.1f cpu=%d gpu=%d me=%d ram=%d%% free=%dK largest=%dK bw_rx=%dkbps bw_usable=%dkbps bw_audio=%dkbps bw_drop=%dkbps bw_use=%d%% pkts=%d/s v=%d vfec=%d a=%d afec=%d\n",
+                                   hs.fps, hs.latency_ms, hs.decode_ms,
+                                   hs.packet_loss_pct, hs.fec_recovery_pct,
+                                   hs.cpu_pct, hs.gpu_pct, hs.me_pct,
+                                   hs.ram_used_pct, hs.ram_free_kb,
+                                   hs.ram_largest_kb,
+                                   hs.bw_rx_kbps, hs.bw_usable_kbps,
+                                   hs.bw_audio_kbps, hs.bw_drop_kbps,
+                                   hs.bw_usable_pct, hs.bw_video_packets_s,
+                                   hud_video_payload_kbps,
+                                   hud_video_fec_kbps,
+                                   hud_audio_payload_kbps,
+                                   hud_audio_fec_kbps);
+#endif
+                }
+            }
+        }
+
         sceCtrlPeekBufferPositive(&pad, 1);
-        pad.Buttons |= g_remote_buttons;  /* inject; cleared after input_poll_and_send */
+        unsigned int remote_buttons_snapshot = g_remote_buttons;
+        pad.Buttons |= remote_buttons_snapshot;  /* inject; cleared after input_poll_and_send */
 
         /* Remote exit request — single pokew triggers immediate stream exit */
         if (g_remote_exit_request) {
             diag_log_write("INP", "Remote exit request detected\n");
             g_remote_exit_request = 0;
+            abort_stream_to_menu();
+            memset(&g_shared, 0, sizeof(g_shared));
+            skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
+            goto host_select_loop;
+        }
+        if (!g_decode_paused &&
+            (remote_buttons_snapshot & PSP_CTRL_START) &&
+            (remote_buttons_snapshot & PSP_CTRL_SELECT)) {
+            diag_log_write("INP", "Remote Start+Select exit request detected\n");
             abort_stream_to_menu();
             memset(&g_shared, 0, sizeof(g_shared));
             skip_rescan = 1;  /* Quick relaunch: skip host re-probe */
@@ -941,8 +1146,11 @@ host_select_loop:
                 s_combo_start_us = 0;
             }
         }
+        int hud_closed_this_loop = 0;
         {
+            int hud_overlay_was_visible = hud_overlay_visible();
             int hud_ret = hud_handle_input(pad.Buttons);
+            hud_closed_this_loop = hud_overlay_was_visible && !hud_overlay_visible();
             if (hud_ret == 2) {
                 /* Pause: return to menu without quitting host session */
                 diag_log_write("MAIN", "HUD Pause selected\n");
@@ -968,10 +1176,12 @@ host_select_loop:
 
         if (frame || !video_started || decoder_is_cabac_detected()) {
             hud_render(); display_frame_finish();
-        } else if (hud_is_visible() || (video_started && s_idle_count > 180)) {
+        } else if (hud_overlay_visible()) {
             /* No new frame but HUD is open — re-blit last video frame so
              * the HUD can composite on top without double-buffer flashing. */
             display_frame_repeat(); hud_render(); display_frame_finish();
+        } else if (hud_closed_this_loop) {
+            display_frame_repeat(); display_frame_finish();
         } else {
             sceDisplayWaitVblankStart();
         }

@@ -22,6 +22,7 @@
 
 #include "netconf_ui.h"
 #include "ui_manager.h"
+#include "diag_log.h"
 
 /* Extern declarations for GE display control (from display_gpu.c) */
 extern void display_init(void);
@@ -43,41 +44,54 @@ int netconf_ui_run(void)
 {
     pspUtilityNetconfData netconf;
     int status;
+    int prev_status = -1;
     int ret;
     int net_inited = 0;
     int inet_inited = 0;
     int apctl_inited = 0;
 
+    diag_log_write("NET", "[NETCONF] start\n");
+
     ret = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
+    diag_log_write("NET", "[NETCONF] load COMMON ret=0x%08X\n", (unsigned)ret);
     if (ret < 0 && ret != (int)0x80110F01) return ret;
     ret = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
+    diag_log_write("NET", "[NETCONF] load INET ret=0x%08X\n", (unsigned)ret);
     if (ret < 0 && ret != (int)0x80110F01) return ret;
 
     /* Use a larger memory pool (128KB) and standard stack sizes (4KB).
-     * In Round 3, we make these non-fatal to avoid Permission errors if 
+     * In Round 3, we make these non-fatal to avoid Permission errors if
      * the stack was already half-initialized by another component. */
-    sceNetInit(512 * 1024, 42, 4096, 42, 4096);
-    sceNetInetInit();
-    sceNetApctlInit(0x2000, 42);
+    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
+    diag_log_write("NET", "[NETCONF] sceNetInit ret=0x%08X\n", (unsigned)ret);
+    if (ret >= 0) net_inited = 1;
+    ret = sceNetInetInit();
+    diag_log_write("NET", "[NETCONF] sceNetInetInit ret=0x%08X\n", (unsigned)ret);
+    if (ret >= 0) inet_inited = 1;
+    ret = sceNetApctlInit(0x2000, 42);
+    diag_log_write("NET", "[NETCONF] sceNetApctlInit ret=0x%08X\n", (unsigned)ret);
+    if (ret >= 0) apctl_inited = 1;
 
     /* Build the dialog parameters ---------------------------------------- */
     memset(&netconf, 0, sizeof(netconf));
     netconf.base.size        = sizeof(netconf);
     netconf.base.language    = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
     netconf.base.buttonSwap  = PSP_UTILITY_ACCEPT_CROSS;
-    
-    /* ROUND 3: In User Mode, utility thread priorities must be >= 40 
+
+    /* ROUND 3: In User Mode, utility thread priorities must be >= 40
      * on some firmware versions to avoid 0x80020193 (Illegal Permission). */
     netconf.base.graphicsThread = 40;
     netconf.base.accessThread   = 40;
     netconf.base.fontThread     = 40;
     netconf.base.soundThread    = 40;
-    
+
     /* Use the last-used AP if available (FW >= 200), fallback to CONNECTAP */
     netconf.action = PSP_NETCONF_ACTION_CONNECTAP_LASTUSED;
 
     /* Launch the network configuration utility ---------------------------- */
     ret = sceUtilityNetconfInitStart(&netconf);
+    diag_log_write("NET", "[NETCONF] sceUtilityNetconfInitStart ret=0x%08X\n",
+                   (unsigned)ret);
     if (ret < 0) {
         goto fail;
     }
@@ -85,6 +99,10 @@ int netconf_ui_run(void)
     /* Pump the dialog loop ------------------------------------------------ */
     while (1) {
         status = sceUtilityNetconfGetStatus();
+        if (status != prev_status) {
+            diag_log_write("NET", "[NETCONF] dialog status=%d\n", status);
+            prev_status = status;
+        }
         if (status == PSP_UTILITY_DIALOG_NONE) break;
 
         /* GU frame pump — PSP utility dialogs need this every iteration.
@@ -117,6 +135,8 @@ int netconf_ui_run(void)
     {
         int apctl_state = 0;
         ret = sceNetApctlGetState(&apctl_state);
+        diag_log_write("NET", "[NETCONF] post-dialog apctl ret=0x%08X state=%d\n",
+                       (unsigned)ret, apctl_state);
         if (ret < 0) {
             goto fail;
         }
@@ -136,8 +156,10 @@ int netconf_ui_run(void)
             if (ret < 0) {
                 goto fail;
             }
-            if (apctl_state == 4)
-                return 0;   /* Success — IP acquired */
+            if (apctl_state == 4) {
+                diag_log_write("NET", "[NETCONF] connected, IP acquired\n");
+                return 0;   /* Success - IP acquired */
+            }
 
             /* Draw waiting frame */
             ui_begin_frame();
@@ -158,6 +180,7 @@ int netconf_ui_run(void)
     }
 
 fail:
+    diag_log_write("NET", "[NETCONF] failed ret=0x%08X\n", (unsigned)ret);
     if (ret < 0) {
         if (apctl_inited) {
             sceNetApctlTerm();

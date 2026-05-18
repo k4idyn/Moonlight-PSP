@@ -6,10 +6,10 @@
  *
  * Layout (480x272):
  *   y=0..27   header bar     "Moonlight Settings"
- *   y=36      resolution row (panel + left/right arrows + value)
- *   y=72      fps row
- *   y=108     control mode row
- *   y=144     bitrate progress bar                                 (read-only)
+ *   y=36      preset row (panel + left/right arrows + value)
+ *   y=76      resolution row (dimensions only; Custom opens OSK)
+ *   y=116     fps row
+ *   y=156     audio/control rows scroll below
  *   y=252..271 footer hint
  */
 
@@ -26,50 +26,110 @@
 #include "osk_input.h"
 #include "stream_resolution.h"
 
+/*
+ * Release tuning rule: menu presets are conservative controls. A preset is
+ * promoted only after real PSP playback proves stream stability, audio,
+ * HUD telemetry, and input behavior together.
+ */
+
 extern volatile unsigned int g_remote_buttons;
+
+/* Preset policy:
+ *   Quality must remain native 480x272. It may trade FPS/bitrate downward,
+ *   but it is not allowed to become a lower-resolution stream.
+ *   Balanced is the best proven middle ground once logs/screenshots agree.
+ *   Performance chases the highest stable FPS the PSP can sustain; the
+ *   current practical anchor is 30fps, not a fixed ceiling.
+ *
+ *   2026-05-17 hardware evidence currently anchors:
+ *     Quality:     480x272@10fps 576kbps p1200 (native requirement)
+ *     Balanced:    360x204@20fps 480kbps p1200 (exact 30:17 candidate)
+ *     Performance: 300x170@30fps 384kbps p1056 (best packet bracket)
+ *   Bitrate/packet values remain measured defaults; exact-panel aspect is
+ *   mandatory to avoid black bars.
+ */
 
 /*--------------------------------------------------------------------------\n * Option array definitions (declared extern in settings_menu.h)
  *
- * MATHEMATICAL DERIVATION (706 samples, 14 hardware runs):
+ * Older derivation kept as historical context only. Do not use the old
+ * Quality/Balanced/Perf math below as preset policy; current preset roles are
+ * governed by real PSP hardware evidence. Native 480x272 is the Quality family.
  *   CPU decode:   385 µs per 1000 pixels (H.264 baseline, OpenH264 -O2)
  *   ME yuv2rgba:   31 µs (uncached DMA via 0x40000000)
  *   GE upscale:  2000 µs (bilinear blit 480x272)
  *   Overhead:    1000 µs (sceKernel scheduling, IRQ latency, VSync)
  *   Total/frame: 385 * (W*H/1000) + 3031 µs
  *
- *   Quality:   385*76.544 + 3031 =  32,501 µs → 33,333 µs budget (97.5% @30fps)
- *   Balanced:  385*36.864 + 3031 =  17,224 µs → 33,333 µs budget (51.7% @30fps)
- *   Perf:      385*21.504 + 3031 =  11,310 µs → 16,667 µs budget (67.9% @60fps)
+ *   Quality:   385*130.560 + 3031 =  53,296 us -> 100,000 us budget (53.3% @10fps)
+ *   Balanced:  385*73.440 + 3031 =  31,305 us ->  50,000 us budget (62.6% @20fps)
+ *   Perf:      385*51.000 + 3031 =  22,666 us ->  33,333 us budget (68.0% @30fps)
  *
  * Bitrate: 0.35 bits-per-pixel × pixels × fps / 1000 = kbps
- *   Quality:   0.35 × 76544 × 30 / 1000 =  804 kbps
- *   Balanced:  0.35 × 36864 × 30 / 1000 =  387 kbps
- *   Perf:      0.35 × 21504 × 60 / 1000 =  452 kbps
+ *   Quality:   0.35 x 130560 x 10 / 1000 =  457 kbps
+ *   Balanced:  0.35 x 73440 x 20 / 1000 =  514 kbps
+ *   Perf:      0.35 x 51000 x 30 / 1000 =  536 kbps
  *--------------------------------------------------------------------------*/
 
-/* Resolution presets — PSP-1000 hardware-tuned (mod-2)
- * Native: 480x272 for full-screen clarity; Perf: 256x144 for max fps.
+/* Resolution presets — PSP-1000 hardware-tuned exact panel aspect.
+ * Native: 480x272 quality-preset requirement; lower presets use 30:17
+ * source sizes that scale to the LCD with no black bars.
  * Custom: user-defined via OSK (defaults to 480x272). */
-static char s_custom_label[16] = "Custom";
+static char s_custom_label[16] = "480x272";
 
-int RESOLUTION_WIDTHS[3]  = { 480, 256, 480 };
-int RESOLUTION_HEIGHTS[3] = { 272, 144, 272 };
-const char * RESOLUTION_LABELS[3] = {
-    "480x272",   /* Native — PSP LCD native resolution */
-    "256x144",   /* Performance — 30fps, low latency */
+int RESOLUTION_WIDTHS[RESOLUTION_COUNT]  = { 480, 360, 300, 480 };
+int RESOLUTION_HEIGHTS[RESOLUTION_COUNT] = { 272, 204, 170, 272 };
+const char * RESOLUTION_LABELS[RESOLUTION_COUNT] = {
+    "480x272",
+    "360x204",
+    "300x170",
     s_custom_label, /* Custom — user enters WxH via OSK */
+};
+
+static const char * const PRESET_LABELS[RESOLUTION_COUNT] = {
+    "Quality",
+    "Balanced",
+    "Performance",
+    "Custom",
+};
+
+const int RESOLUTION_OPTIMAL_FPS_IDX[RESOLUTION_COUNT] = {
+    0, /* Quality: 10 FPS at native resolution */
+    2, /* Balanced: 20 FPS at 360x204 */
+    3, /* Performance: 30 FPS at 300x170 */
+    0,
+};
+
+const int RESOLUTION_OPTIMAL_BITRATE[RESOLUTION_COUNT] = {
+    576, /* Quality native bracket anchor */
+    480, /* Balanced exact-aspect candidate */
+    384, /* Performance exact-aspect candidate */
+    576,
+};
+
+const int RESOLUTION_OPTIMAL_PACKET_SIZE[RESOLUTION_COUNT] = {
+    1200,
+    1200,
+    1056,
+    1200,
+};
+
+static const int PRESET_AUDIO_ENABLED[RESOLUTION_PRESET_COUNT] = {
+    1, /* Quality: release validation includes audio */
+    1, /* Balanced: release validation includes audio */
+    0, /* Performance: spend PSP work and wire budget on video only */
 };
 
 /* FPS values that evenly divide 60Hz (no VSync judder) */
 static char s_custom_fps_label[16] = "Custom";
-const char * const FPS_OPTIONS[5] = {
+const char * const FPS_OPTIONS[6] = {
+    "10 FPS",
     "15 FPS",
     "20 FPS",
     "30 FPS",
     "60 FPS",
     s_custom_fps_label
 };
-const int FPS_VALUES[5] = { 15, 20, 30, 60, -1 };
+const int FPS_VALUES[6] = { 10, 15, 20, 30, 60, -1 };
 
 /* Forward declaration needed for fps_update_custom and resolution_update_custom */
 static MenuState g_menu_state;
@@ -119,21 +179,24 @@ const char * const THEME_OPTIONS[10] = {
 /*--------------------------------------------------------------------------
  * Menu Item Indices
  *--------------------------------------------------------------------------*/
-#define MENU_ITEM_RESOLUTION    0
-#define MENU_ITEM_FPS           1
-#define MENU_ITEM_AUDIO         2
-#define MENU_ITEM_CONTROL_MODE  3
-#define MENU_ITEM_BUTTON_MAP    4
-#define MENU_ITEM_THEME         5
-#define MENU_ITEM_BITRATE       6
-#define MENU_ITEM_COUNT         7
+#define MENU_ITEM_PRESET        0
+#define MENU_ITEM_RESOLUTION    1
+#define MENU_ITEM_FPS           2
+#define MENU_ITEM_AUDIO         3
+#define MENU_ITEM_CONTROL_MODE  4
+#define MENU_ITEM_BUTTON_MAP    5
+#define MENU_ITEM_THEME         6
+#define MENU_ITEM_BITRATE       7
+#define MENU_ITEM_PACKET_SIZE   8
+#define MENU_ITEM_COUNT         9
 
-#define BITRATE_MIN             32
+#define BITRATE_MIN             MIN_BITRATE
 
-/* Bitrate presets: multiples of 64 for clean codec alignment.
- * Increasing step sizes at higher bitrates (64→128→256→512). */
+/* Bitrate presets: low-work floor first, then measured steps upward.
+ * Keep 32 kbps steps through the 384-512 PSP-1000 limit window. */
 static const int BITRATE_PRESETS[] = {
-    64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048, 2560
+    192, 224, 256, 288, 320, 352, 384, 416, 448, 480, 512,
+    768, 1024, 1280, 1536, 2048, 2560
 };
 #define BITRATE_PRESET_COUNT  (int)(sizeof(BITRATE_PRESETS) / sizeof(BITRATE_PRESETS[0]))
 
@@ -147,6 +210,54 @@ static int bitrate_preset_index(int bitrate)
         if (diff < best_diff) { best_diff = diff; best = i; }
     }
     return best;
+}
+
+/* Packet sizes follow the bitrate ladder. 1056 is the current best observed
+ * Performance packet anchor; 1280 and the N3DS-style 1392 option are stress
+ * steps. */
+static const int PACKET_PRESETS[] = {
+    512, 640, 768, 896, 1024, 1056, 1152, 1200, 1280, 1392
+};
+#define PACKET_PRESET_COUNT  (int)(sizeof(PACKET_PRESETS) / sizeof(PACKET_PRESETS[0]))
+
+static int packet_preset_index(int packet_size)
+{
+    int i, best = 0, best_diff = 999999;
+    for (i = 0; i < PACKET_PRESET_COUNT; i++) {
+        int diff = packet_size > PACKET_PRESETS[i]
+                 ? packet_size - PACKET_PRESETS[i]
+                 : PACKET_PRESETS[i] - packet_size;
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
+
+static int clamp_index(int value, int min_value, int max_value);
+
+static void apply_step_ladder_preset(int preset_index)
+{
+    if (preset_index < 0 || preset_index >= RESOLUTION_COUNT) {
+        return;
+    }
+
+    g_menu_state.presetIndex = preset_index;
+    g_menu_state.resolutionIndex = preset_index;
+
+    if (preset_index >= RESOLUTION_PRESET_COUNT) {
+        return;
+    }
+
+    g_menu_state.fpsIndex = clamp_index(RESOLUTION_OPTIMAL_FPS_IDX[preset_index],
+                                        0, FPS_COUNT - 1);
+    if (g_menu_state.fpsIndex != FPS_CUSTOM_INDEX) {
+        g_menu_state.customFpsValue = 0;
+    }
+    g_menu_state.bitrate = clamp_index(RESOLUTION_OPTIMAL_BITRATE[preset_index],
+                                       BITRATE_MIN, MAX_BITRATE);
+    g_menu_state.packetSize = PACKET_PRESETS[packet_preset_index(
+        clamp_index(RESOLUTION_OPTIMAL_PACKET_SIZE[preset_index],
+                    MIN_STREAM_PACKET_SIZE, MAX_STREAM_PACKET_SIZE))];
+    g_menu_state.audioEnabled = PRESET_AUDIO_ENABLED[preset_index];
 }
 
 /*--------------------------------------------------------------------------
@@ -174,8 +285,9 @@ static int clamp_index(int value, int min_value, int max_value)
  *   [  Label Name              < VALUE >  ]
  * The card background is darker when not focused, brighter when focused.
  *--------------------------------------------------------------------------*/
-static void draw_setting_row(int row_idx, const char *label,
-                             const char *value, int is_selected)
+static void draw_setting_row_ex(int row_idx, const char *label,
+                                const char *value, int is_selected,
+                                int allow_arrows)
 {
     /* Focus pop: the selected row grows 2% while the focus animation lerps.
      * Cards further from the animated focus position stay at normal size. */
@@ -217,7 +329,7 @@ static void draw_setting_row(int row_idx, const char *label,
     /* Value selector: toggle items get < > arrows; action items (Button Map)
      * just highlight the label in focus colour — no left/right toggle arrows. */
     int vx = rx + item_w - VAL_W - 8;
-    if (is_selected && row_idx != MENU_ITEM_BUTTON_MAP) {
+    if (is_selected && allow_arrows) {
         float vy = (float)(ry + item_h / 2 + 4);
         float x2 = ui_draw_text_scaled((float)vx, vy, UI_COL_ACCENT, "< ", label_scale);
         x2 = ui_draw_text_scaled(x2, vy, UI_COL_TEXT_FOCUS, value, label_scale);
@@ -228,6 +340,13 @@ static void draw_setting_row(int row_idx, const char *label,
                      is_selected ? UI_COL_TEXT_FOCUS : UI_COL_TEXT_DIM,
                      value, label_scale);
     }
+}
+
+static void draw_setting_row(int row_idx, const char *label,
+                             const char *value, int is_selected)
+{
+    draw_setting_row_ex(row_idx, label, value, is_selected,
+                        row_idx != MENU_ITEM_BUTTON_MAP);
 }
 
 /*--------------------------------------------------------------------------
@@ -279,6 +398,11 @@ void settings_menu_draw(const PspConfig *config)
     ui_set_scissor(0, 30, 480, 214); /* y=30..244: fills the 2px gap below header pill */
 
     /* --- Setting rows --- */
+    draw_setting_row(MENU_ITEM_PRESET,
+                     "Preset",
+                     PRESET_LABELS[g_menu_state.presetIndex],
+                     g_menu_state.currentSelection == MENU_ITEM_PRESET);
+
     draw_setting_row(MENU_ITEM_RESOLUTION,
                      "Resolution",
                      RESOLUTION_LABELS[g_menu_state.resolutionIndex],
@@ -319,6 +443,15 @@ void settings_menu_draw(const PspConfig *config)
                          g_menu_state.currentSelection == MENU_ITEM_BITRATE);
     }
 
+    {
+        char pkt_val[16];
+        snprintf(pkt_val, sizeof(pkt_val), "%d", g_menu_state.packetSize);
+        draw_setting_row(MENU_ITEM_PACKET_SIZE,
+                         "Packet Size",
+                         pkt_val,
+                         g_menu_state.currentSelection == MENU_ITEM_PACKET_SIZE);
+    }
+
     /* Restore full-screen scissor so header and footer draw unclipped */
     ui_clear_scissor();
 
@@ -347,7 +480,7 @@ void settings_menu_init(PspConfig *config)
 {
     /* Try to load config from file, use defaults if not found */
     loadConfig(config);
-    
+
     /* Initialize menu state from loaded config */
     g_menu_state.currentSelection = 0;
 
@@ -388,6 +521,7 @@ void settings_menu_init(PspConfig *config)
         g_menu_state.resolutionIndex = best;
     }
 
+    g_menu_state.presetIndex = clamp_index(config->presetIndex, 0, RESOLUTION_COUNT - 1);
     g_menu_state.fpsIndex = clamp_index(config->fpsIndex, 0, FPS_COUNT - 1);
     if (g_menu_state.fpsIndex == FPS_CUSTOM_INDEX) {
         fps_update_custom(config->fps);
@@ -395,6 +529,8 @@ void settings_menu_init(PspConfig *config)
     g_menu_state.audioEnabled = config->audioEnabled;
     g_menu_state.controlModeIndex = clamp_index((int)config->controlMode, 0, CONTROL_MODE_COUNT - 1);
     g_menu_state.bitrate = clamp_index(config->bitrate, BITRATE_MIN, MAX_BITRATE);
+    g_menu_state.packetSize = PACKET_PRESETS[packet_preset_index(
+        clamp_index(config->packetSize, MIN_STREAM_PACKET_SIZE, MAX_STREAM_PACKET_SIZE))];
     g_menu_state.uiThemeIndex = clamp_index(config->uiThemeIndex, 0, 9);
     g_menu_state.needsRedraw = 1;
 }
@@ -404,11 +540,13 @@ void settings_menu_init(PspConfig *config)
  *--------------------------------------------------------------------------*/
 static void update_config_from_menu(PspConfig *config)
 {
-    /* Resolution: set width/height from selected preset */
+    config->presetIndex = g_menu_state.presetIndex;
+
+    /* Resolution: set width/height from the Resolution row only. */
     config->resolutionIndex = g_menu_state.resolutionIndex;
     config->width  = RESOLUTION_WIDTHS[g_menu_state.resolutionIndex];
     config->height = RESOLUTION_HEIGHTS[g_menu_state.resolutionIndex];
-    
+
     /* Update FPS — uses FPS_VALUES array for clean mapping */
     config->fpsIndex = g_menu_state.fpsIndex;
     if (config->fpsIndex == FPS_CUSTOM_INDEX) {
@@ -418,12 +556,13 @@ static void update_config_from_menu(PspConfig *config)
     }
 
     config->audioEnabled = g_menu_state.audioEnabled;
-    
+
     /* Update control mode */
     config->controlMode = (ControlMode)g_menu_state.controlModeIndex;
 
     /* Update bitrate */
     config->bitrate = g_menu_state.bitrate;
+    config->packetSize = g_menu_state.packetSize;
     config->uiThemeIndex = g_menu_state.uiThemeIndex;
 }
 
@@ -435,29 +574,29 @@ int settings_menu_run(PspConfig *config)
     SceCtrlData pad;
     SceCtrlData prev_pad;
     int result = -1;
-    
+
     /* Auto-skip DISABLED — manual navigation only via RemoteJoy */
 
     /* Initialize controller sampling */
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    
+
     /* Get initial state for BOTH pad and prev_pad to avoid garbage-button detection */
     memset(&pad, 0, sizeof(pad));
     memset(&prev_pad, 0, sizeof(prev_pad));
     sceCtrlPeekBufferPositive(&pad, 1);
     pad.Buttons |= g_remote_buttons; g_remote_buttons = 0;
     memcpy(&prev_pad, &pad, sizeof(pad));
-    
+
     /* Main menu loop */
     while (1) {
         /* Save previous state, then read current controller state */
         memcpy(&prev_pad, &pad, sizeof(pad));
         sceCtrlPeekBufferPositive(&pad, 1);
         pad.Buttons |= g_remote_buttons; g_remote_buttons = 0;
-        
+
         /* Keep settings-menu input local until stream session is active. */
-        
+
         /* Check for D-pad UP */
         if ((pad.Buttons & PSP_CTRL_UP) && !(prev_pad.Buttons & PSP_CTRL_UP)) {
             g_menu_state.currentSelection--;
@@ -466,7 +605,7 @@ int settings_menu_run(PspConfig *config)
             }
             g_menu_state.needsRedraw = 1;
         }
-        
+
         /* Check for D-pad DOWN */
         if ((pad.Buttons & PSP_CTRL_DOWN) && !(prev_pad.Buttons & PSP_CTRL_DOWN)) {
             g_menu_state.currentSelection++;
@@ -475,10 +614,17 @@ int settings_menu_run(PspConfig *config)
             }
             g_menu_state.needsRedraw = 1;
         }
-        
+
         /* Check for D-pad LEFT */
         if ((pad.Buttons & PSP_CTRL_LEFT) && !(prev_pad.Buttons & PSP_CTRL_LEFT)) {
             switch (g_menu_state.currentSelection) {
+                case MENU_ITEM_PRESET:
+                    g_menu_state.presetIndex--;
+                    if (g_menu_state.presetIndex < 0) {
+                        g_menu_state.presetIndex = RESOLUTION_COUNT - 1;
+                    }
+                    apply_step_ladder_preset(g_menu_state.presetIndex);
+                    break;
                 case MENU_ITEM_RESOLUTION:
                     g_menu_state.resolutionIndex--;
                     if (g_menu_state.resolutionIndex < 0) {
@@ -515,13 +661,27 @@ int settings_menu_run(PspConfig *config)
                         g_menu_state.bitrate = BITRATE_PRESETS[idx];
                     }
                     break;
+                case MENU_ITEM_PACKET_SIZE:
+                    {
+                        int idx = packet_preset_index(g_menu_state.packetSize);
+                        if (idx > 0) idx--;
+                        g_menu_state.packetSize = PACKET_PRESETS[idx];
+                    }
+                    break;
             }
             g_menu_state.needsRedraw = 1;
         }
-        
+
         /* Check for D-pad RIGHT */
         if ((pad.Buttons & PSP_CTRL_RIGHT) && !(prev_pad.Buttons & PSP_CTRL_RIGHT)) {
             switch (g_menu_state.currentSelection) {
+                case MENU_ITEM_PRESET:
+                    g_menu_state.presetIndex++;
+                    if (g_menu_state.presetIndex >= RESOLUTION_COUNT) {
+                        g_menu_state.presetIndex = 0;
+                    }
+                    apply_step_ladder_preset(g_menu_state.presetIndex);
+                    break;
                 case MENU_ITEM_RESOLUTION:
                     g_menu_state.resolutionIndex++;
                     if (g_menu_state.resolutionIndex >= RESOLUTION_COUNT) {
@@ -558,10 +718,17 @@ int settings_menu_run(PspConfig *config)
                         g_menu_state.bitrate = BITRATE_PRESETS[idx];
                     }
                     break;
+                case MENU_ITEM_PACKET_SIZE:
+                    {
+                        int idx = packet_preset_index(g_menu_state.packetSize);
+                        if (idx < PACKET_PRESET_COUNT - 1) idx++;
+                        g_menu_state.packetSize = PACKET_PRESETS[idx];
+                    }
+                    break;
             }
             g_menu_state.needsRedraw = 1;
         }
-        
+
         /* Check for CROSS — context-dependent:
          *   If Resolution row is focused AND set to Custom → open resolution OSK
          *   Otherwise → Save and Continue (same as Start) */
@@ -608,18 +775,18 @@ int settings_menu_run(PspConfig *config)
             result = 0;
             break;
         }
-        
+
         /* Check for TRIANGLE (Continue without saving), edge-triggered */
         if ((pad.Buttons & PSP_CTRL_TRIANGLE) && !(prev_pad.Buttons & PSP_CTRL_TRIANGLE)) {
             result = 0;
             break;
         }
-        
+
         /* Always redraw — smooth scroll and focus-pop animations need
          * every VBlank; ui_end_frame() syncs to display VBlank. */
         settings_menu_draw(config);
     }
-    
+
     return result;
 }
 
@@ -630,20 +797,20 @@ void settings_menu_apply(const PspConfig *psp_config, void *stream_config_ptr)
 {
     /* Note: We use void* to avoid including Limelight.h in the header
      * The actual type is PSTREAM_CONFIGURATION */
-    
+
     /* This function should be called with a properly initialized
      * STREAM_CONFIGURATION. We only update the fields we control. */
-    
+
     /* The caller should use LiInitializeStreamConfiguration() first,
      * then call this function to apply our settings. */
-    
+
     /* Example usage:
      *   STREAM_CONFIGURATION streamConfig;
      *   LiInitializeStreamConfiguration(&streamConfig);
      *   settings_menu_apply(&psp_config, &streamConfig);
      *   LiStartConnection(&serverInfo, &streamConfig, ...);
      */
-    
+
     /* We'll cast and update - the caller is responsible for proper initialization */
     typedef struct {
         int width;
@@ -661,9 +828,9 @@ void settings_menu_apply(const PspConfig *psp_config, void *stream_config_ptr)
         char remoteInputAesKey[16];
         char remoteInputAesIv[16];
     } StreamConfig;
-    
+
     StreamConfig *sc = (StreamConfig *)stream_config_ptr;
-    
+
     sc->width = psp_config->width;
     sc->height = psp_config->height;
     sc->fps = psp_config->fps;

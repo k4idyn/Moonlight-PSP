@@ -36,6 +36,34 @@ void control_stream_stop(void);
 int control_stream_request_idr(void);
 
 /*
+ * control_stream_request_idr_force - Reset local IDR throttle and request IDR.
+ *
+ * Use only at hard recovery boundaries such as decoder restart or RFI timeout.
+ */
+int control_stream_request_idr_force(void);
+
+/*
+ * control_stream_request_idr_startup - Request IDR while no reference exists.
+ *
+ * Startup is special: if the first SPS/IDR was missed, every P-frame is
+ * unusable and the normal playback backoff keeps the decoder black too long.
+ * This helper coalesces to 500 ms but bypasses exponential growth until the
+ * first real frame is decoded.
+ */
+int control_stream_request_idr_startup(void);
+
+/*
+ * control_stream_reset_idr_backoff - Clear local IDR request throttle state.
+ */
+void control_stream_reset_idr_backoff(void);
+
+/*
+ * g_intra_refresh_active - Non-zero only when host-side intra-refresh has
+ * been validated enough to suppress post-startup soft IDR requests.
+ */
+extern volatile int g_intra_refresh_active;
+
+/*
  * control_stream_request_rfi - Request Reference Frame Invalidation.
  *
  * Tells Sunshine frames [start_frame..end_frame] were lost so

@@ -21,11 +21,17 @@ extern volatile int g_idr_fully_decoded;
 /* Per-frame corruption flag (defined in openh264_decode.cpp) */
 extern volatile int g_current_frame_is_corrupt;
 
+/* Last decode callback produced a displayable frame (defined in sw_decoder_thread.c) */
+extern volatile int g_last_decode_output_ok;
+
 /* CABAC detection flag (defined in sw_decoder_thread.c via check_nal_for_cabac) */
 extern volatile int g_cabac_detected;
 
 /* Frame counter for loss stats (defined in control_stream.c) */
 extern volatile unsigned int g_last_good_frame;
+
+/* Frame currently entering OpenH264 (defined in sw_decoder_thread.c) */
+extern volatile unsigned int g_decode_current_frame_id;
 
 /* FEC-requested IDR flag to avoid duplicate IDR requests (defined in rtp_fec.c) */
 extern volatile int g_fec_requested_idr;

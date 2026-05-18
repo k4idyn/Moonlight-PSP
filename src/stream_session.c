@@ -44,8 +44,9 @@ void abort_stream_to_menu(void)
 
     /* 1. Signal all threads to terminate first (Shared g_running/me_running flags) */
     me_running = 0;
+    audio_thread_begin_shutdown();
     sceKernelDelayThread(100000); /* 100ms for threads to see flag */
-    
+
     /* 2. Inform the server we are leaving via Moonlightcore */
     LOG_SESSION("[STEP 1/8] Terminating Connection (LiStopConnection)...\n");
     LiStopConnection();
@@ -57,7 +58,7 @@ void abort_stream_to_menu(void)
     /* 4. Shut down networking subsystems (closes UDP/TCP sockets, joins threads) */
     LOG_SESSION("[STEP 3/8] Shutting down networking(UDP)...\n");
     network_me_shutdown();
-    
+
     LOG_SESSION("[STEP 4/8] Shutting down control stream(TCP)...\n");
     control_stream_stop();
 
@@ -71,7 +72,7 @@ void abort_stream_to_menu(void)
     network_wait_for_cancel_thread();
     LOG_SESSION("[STEP 6/8] Server abort thread joined successfully.\n");
 
-    /* 7. Shut down Software Video Decoder (ME + pipeline cleanup) 
+    /* 7. Shut down Software Video Decoder (ME + pipeline cleanup)
      * This is done LATE to ensure no network jitter or late packets. */
     LOG_SESSION("[STEP 7/8] Shutting down SW decoder (ME+pipeline)...\n");
     sw_decoder_thread_shutdown();
@@ -87,6 +88,7 @@ void abort_stream_to_menu(void)
     rtsp_session_close();
 
     LOG_SESSION("TEARDOWN COMPLETE. Returning to host discovery menu.\n");
+    diag_log_flush();
     sceKernelDelayThread(50000); /* 50ms settling delay */
 }
 
@@ -97,10 +99,10 @@ void end_stream_session(void)
 {
     LOG_SESSION("end_stream_session: PERFORMING FULL SYSTEM SHUTDOWN CLEANUP\n");
     abort_stream_to_menu();
-    
+
     /* Final hardware power down */
     scePowerSetClockFrequency(222, 222, 111);
-    
+
     LOG_SESSION("EXITING TO XMB...\n");
     sceKernelDelayThread(200000);
     sceKernelExitGame();

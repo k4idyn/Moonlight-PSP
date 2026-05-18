@@ -2,7 +2,8 @@
  * audio_thread.c - Moonlight Audio Receiver and Playback Thread
  *
  * Receives Moonlight/Sunshine RTP PCM audio on UDP port 48000 and plays
- * it back through the PSP hardware audio channel at 48000 Hz stereo.
+ * it back through the PSP SRC path at 48000 Hz. The host/decode path stays
+ * mono; only the final DMA chunk is duplicated to stereo for PSP SRC.
  *
  * Thread model:
  *   Recv Thread  → decrypt → Opus decode → PCM staging → AudioRingBuffer
@@ -38,6 +39,8 @@ extern volatile int g_cabac_dialog_active;
 #include "settings_menu.h"
 #include "config.h"
 #include "control_stream.h"
+#include "runtime_telemetry.h"
+#include "rs.h"
 
 #include <pspiofilemgr.h>
 
@@ -60,6 +63,53 @@ typedef struct {
 
 #define RTP_HDR_SIZE  sizeof(RtpHeader)
 #define RTP_PT_PCMS16 10   /* PCM 16-bit signed, network byte order */
+#define RTP_PT_AUDIO_OPUS 97
+#define RTP_PT_AUDIO_FEC  127
+
+#define AUDIO_RTP_FEC_DATA_SHARDS   4
+#define AUDIO_RTP_FEC_PARITY_SHARDS 2
+#define AUDIO_RTP_FEC_TOTAL_SHARDS  (AUDIO_RTP_FEC_DATA_SHARDS + AUDIO_RTP_FEC_PARITY_SHARDS)
+#define AUDIO_RTP_FEC_CACHE_BLOCKS  8
+#define AUDIO_RTP_FEC_PAYLOAD_MAX   AUDIO_MAX_RTP_SIZE
+#define AUDIO_PENDING_PACKETS       8
+#define AUDIO_REORDER_WINDOW_US     4000
+#define AUDIO_REORDER_MAX_DRAINS    8
+#ifndef PSP_AUDIO_PACKET_DURATION_MS
+#define PSP_AUDIO_PACKET_DURATION_MS 60
+#endif
+/* Experimental low-work PSP path. It removes RTP-level audio parity
+ * reconstruction while preserving parity accounting, but the first hardware
+ * run froze after the video socket went idle. Keep the production baseline
+ * on the proven path until a replacement passes VQ. */
+#define AUDIO_RTP_FEC_DECODE_ENABLED 1
+
+#if AUDIO_RTP_FEC_DECODE_ENABLED
+typedef struct {
+    u8  fecShardIndex;
+    u8  payloadType;
+    u16 baseSequenceNumber;
+    u32 baseTimestamp;
+    u32 ssrc;
+} __attribute__((packed)) AudioFecHeader;
+
+typedef struct {
+    int valid;
+    u16 base_seq;
+    u32 base_ts;
+    u32 ssrc;
+    u8  payload_type;
+    int block_size;
+    u8  marks[AUDIO_RTP_FEC_TOTAL_SHARDS];
+    u8  data[AUDIO_RTP_FEC_DATA_SHARDS][AUDIO_RTP_FEC_PAYLOAD_MAX];
+    u8  fec[AUDIO_RTP_FEC_PARITY_SHARDS][AUDIO_RTP_FEC_PAYLOAD_MAX];
+    u32 last_use_us;
+} AudioRtpFecBlock;
+
+typedef struct {
+    int len;
+    u8 data[AUDIO_MAX_RTP_SIZE];
+} AudioPendingPacket;
+#endif
 
 /*--------------------------------------------------------------------------
  * Module state
@@ -72,15 +122,17 @@ static volatile u32 s_audio_pkts_received = 0;
 static volatile u32 s_audio_pkts_decoded  = 0;
 static volatile u32 s_audio_plc_total     = 0;
 static volatile u32 s_audio_fec_total     = 0;
+static volatile u32 s_last_audio_data_packet_us = 0;
 
 static SceUID  s_audio_tid  = -1;
 static int     s_audio_chan = -1;         /* SRC channel active flag (0=reserved, -1=none) */
 static int     s_udp_sock   = -1;
 
 static volatile int s_running = 0;
+static volatile int s_teardown_started = 0;
 
 /* Silence frame played on underrun — keeps DMA engine from garbage output */
-static int16_t s_silence[AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS]
+static int16_t s_silence[AUDIO_CHUNK_SAMPLES * AUDIO_OUTPUT_CHANNELS]
     __attribute__((aligned(64)));
 
 static int s_udp_sock_rtcp = -1;
@@ -90,7 +142,7 @@ static unsigned short s_bound_audio_port = 0;
  * 5 ms Moonlight packets) from the PSP DMA chunk size (AUDIO_CHUNK_SAMPLES).
  * Samples are appended here after each Opus decode and drained in
  * AUDIO_CHUNK_SAMPLES-sized chunks into the ring buffer. */
-#define AUDIO_STAGE_CAPACITY  (AUDIO_MAX_FRAME_SAMPLES * 2)
+#define AUDIO_STAGE_CAPACITY  (AUDIO_MAX_FRAME_SAMPLES * 4)
 static int16_t s_pcm_stage[AUDIO_STAGE_CAPACITY * AUDIO_CHANNELS]
     __attribute__((aligned(64)));
 static int     s_pcm_stage_count = 0; /* per-channel samples currently staged */
@@ -104,6 +156,24 @@ static int     s_last_good_samples = 0;
  * Must NOT be on the stack — PSP audio DMA requires aligned addresses. */
 static int16_t s_play_buf[AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS]
     __attribute__((aligned(64)));
+static int16_t s_src_out_buf[AUDIO_CHUNK_SAMPLES * AUDIO_OUTPUT_CHANNELS]
+    __attribute__((aligned(64)));
+static u8 s_audio_fec_recover_buf[AUDIO_RTP_FEC_PAYLOAD_MAX]
+    __attribute__((aligned(64)));
+static u32 s_audio_rtp_fec_recovered = 0;
+static u32 s_audio_rtp_fec_failed = 0;
+#if AUDIO_RTP_FEC_DECODE_ENABLED
+static AudioRtpFecBlock s_audio_fec_blocks[AUDIO_RTP_FEC_CACHE_BLOCKS]
+    __attribute__((aligned(64)));
+static AudioPendingPacket s_audio_pending[AUDIO_PENDING_PACKETS]
+    __attribute__((aligned(64)));
+static int s_audio_pending_head = 0;
+static int s_audio_pending_count = 0;
+static u32 s_audio_reorder_drains = 0;
+static u32 s_audio_reorder_queued = 0;
+static u32 s_audio_reorder_drops = 0;
+static reed_solomon *s_audio_rtp_fec_rs = NULL;
+#endif
 
 
 /* Audio playback thread (drains ring at hardware rate) */
@@ -112,6 +182,14 @@ static SceUID s_play_tid = -1;
 /* Audio ping thread */
 static SceUID s_ping_tid = -1;
 static volatile int s_ping_running = 0;
+static volatile u32 s_audio_ping_seq = 0;
+
+static u32 next_audio_ping_seq(void)
+{
+    u32 next = s_audio_ping_seq + 1;
+    s_audio_ping_seq = next;
+    return next;
+}
 
 static void stop_audio_ping_thread(void)
 {
@@ -158,6 +236,8 @@ static volatile u32 s_effective_ring_depth = AUDIO_RING_SLOTS;
 
 /* Phase 5.7: Separate audio crypto failure counter (threshold 100, not 30) */
 static volatile u32 s_audio_crypto_fail_count = 0;
+static volatile int s_audio_playback_started = 0;
+static volatile int s_audio_packet_duration_ms = PSP_AUDIO_PACKET_DURATION_MS;
 
 /* SYNC-001: RTP timestamp-driven drift control state.
  * We track source timeline from RTP timestamps and occasionally apply
@@ -165,9 +245,31 @@ static volatile u32 s_audio_crypto_fail_count = 0;
 #define AUDIO_DRIFT_TARGET_CHUNKS              8
 #define AUDIO_DRIFT_CORRECTION_PERIOD_CHUNKS   128
 #define AUDIO_DRIFT_THRESHOLD_SAMPLES          (AUDIO_CHUNK_SAMPLES * 5)
+#define AUDIO_PLC_LOW_WATER_CHUNKS             3
+#define AUDIO_TIME_PLC_THRESHOLD_US            80000
+#define AUDIO_PREBUFFER_TARGET_CHUNKS          80
+#define AUDIO_EMPTY_HOLD_MAX_CHUNKS            12
+#define AUDIO_SOURCE_IDLE_US                   750000
+#define AUDIO_TIME_PLC_MAX_CONSEC_FRAMES       6
+#define AUDIO_RTP_DRIFT_CORRECTION             0
+#define AUDIO_TIME_STRETCH_CONCEALMENT         0
 static volatile u32 s_rtp_anchor_ts = 0;
 static volatile int s_rtp_anchor_valid = 0;
 static volatile u32 s_rtp_elapsed_samples = 0;
+
+static int audio_socket_rcvbuf_target(void)
+{
+    int duration_ms = s_audio_packet_duration_ms;
+
+    if (duration_ms >= 40) {
+        return 48 * 1024;
+    }
+    if (duration_ms >= 20) {
+        return 64 * 1024;
+    }
+    return 128 * 1024;
+}
+
 static volatile u32 s_played_samples_total = 0;
 static volatile u32 s_drift_drop_events = 0;
 static volatile u32 s_drift_hold_events = 0;
@@ -201,6 +303,496 @@ static void audio_sync_reset_state(void)
     s_drift_hold_events = 0;
 }
 
+#if AUDIO_RTP_FEC_DECODE_ENABLED
+static u16 audio_fec_base_seq(u16 seq)
+{
+    return (u16)(seq & ~(AUDIO_RTP_FEC_DATA_SHARDS - 1));
+}
+
+static void audio_rtp_fec_reset(void)
+{
+    memset(s_audio_fec_blocks, 0, sizeof(s_audio_fec_blocks));
+    memset(s_audio_pending, 0, sizeof(s_audio_pending));
+    s_audio_rtp_fec_recovered = 0;
+    s_audio_rtp_fec_failed = 0;
+    s_audio_pending_head = 0;
+    s_audio_pending_count = 0;
+    s_audio_reorder_drains = 0;
+    s_audio_reorder_queued = 0;
+    s_audio_reorder_drops = 0;
+}
+
+static AudioRtpFecBlock *audio_rtp_fec_get_block(u16 base_seq,
+                                                 u32 base_ts,
+                                                 u32 ssrc,
+                                                 u8 payload_type,
+                                                 int block_size)
+{
+    int i;
+    int pick = -1;
+    u32 oldest = 0;
+
+    if (block_size <= 0 || block_size > AUDIO_RTP_FEC_PAYLOAD_MAX) {
+        return NULL;
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_CACHE_BLOCKS; i++) {
+        AudioRtpFecBlock *b = &s_audio_fec_blocks[i];
+        if (b->valid && b->base_seq == base_seq) {
+            if (b->block_size != block_size ||
+                b->payload_type != payload_type ||
+                b->ssrc != ssrc) {
+                b->valid = 0;
+                break;
+            }
+            b->last_use_us = sceKernelGetSystemTimeLow();
+            return b;
+        }
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_CACHE_BLOCKS; i++) {
+        AudioRtpFecBlock *b = &s_audio_fec_blocks[i];
+        if (!b->valid) {
+            pick = i;
+            break;
+        }
+        if (pick < 0 || (u32)(b->last_use_us - oldest) > 0x80000000u) {
+            pick = i;
+            oldest = b->last_use_us;
+        }
+    }
+
+    if (pick < 0) {
+        return NULL;
+    }
+
+    {
+        AudioRtpFecBlock *b = &s_audio_fec_blocks[pick];
+        b->valid = 1;
+        b->base_seq = base_seq;
+        b->base_ts = base_ts;
+        b->ssrc = ssrc;
+        b->payload_type = payload_type;
+        b->block_size = block_size;
+        b->last_use_us = sceKernelGetSystemTimeLow();
+        memset(b->marks, 1, sizeof(b->marks));
+        return b;
+    }
+}
+
+static void audio_rtp_fec_cache_data(const RtpHeader *hdr,
+                                     const u8 *payload,
+                                     int payload_len)
+{
+    u16 seq = ntohs(hdr->seq);
+    u32 ts = ntohl(hdr->timestamp);
+    u32 ssrc = ntohl(hdr->ssrc);
+    u16 base = audio_fec_base_seq(seq);
+    int pos = (int)(u16)(seq - base);
+    int step_ms = s_audio_packet_duration_ms;
+    int step_samples;
+    u32 base_ts;
+    AudioRtpFecBlock *b;
+
+    if (pos < 0 || pos >= AUDIO_RTP_FEC_DATA_SHARDS) {
+        return;
+    }
+    if (step_ms < 5 || step_ms > 60) {
+        step_ms = 10;
+    }
+    step_samples = (AUDIO_SAMPLE_RATE * step_ms) / 1000;
+    if (step_samples <= 0) {
+        return;
+    }
+    base_ts = ts - (u32)(pos * step_samples);
+    b = audio_rtp_fec_get_block(base, base_ts, ssrc, RTP_PT_AUDIO_OPUS,
+                                payload_len);
+    if (!b || !b->marks[pos]) {
+        return;
+    }
+    memcpy(b->data[pos], payload, (size_t)payload_len);
+    b->marks[pos] = 0;
+}
+
+static void audio_rtp_fec_cache_parity(const u8 *payload, int payload_len)
+{
+    const AudioFecHeader *fh;
+    u16 base_seq;
+    u32 base_ts;
+    u32 ssrc;
+    int shard;
+    int fec_len;
+    AudioRtpFecBlock *b;
+
+    if (payload_len < (int)sizeof(AudioFecHeader)) {
+        return;
+    }
+
+    fh = (const AudioFecHeader *)payload;
+    shard = (int)fh->fecShardIndex;
+    if (shard < 0 || shard >= AUDIO_RTP_FEC_PARITY_SHARDS ||
+        fh->payloadType != RTP_PT_AUDIO_OPUS) {
+        return;
+    }
+
+    base_seq = ntohs(fh->baseSequenceNumber);
+    if ((base_seq & (AUDIO_RTP_FEC_DATA_SHARDS - 1)) != 0) {
+        return;
+    }
+    base_ts = ntohl(fh->baseTimestamp);
+    ssrc = ntohl(fh->ssrc);
+    fec_len = payload_len - (int)sizeof(AudioFecHeader);
+
+    b = audio_rtp_fec_get_block(base_seq, base_ts, ssrc,
+                                fh->payloadType, fec_len);
+    if (!b || !b->marks[AUDIO_RTP_FEC_DATA_SHARDS + shard]) {
+        return;
+    }
+
+    memcpy(b->fec[shard], payload + sizeof(AudioFecHeader), (size_t)fec_len);
+    b->marks[AUDIO_RTP_FEC_DATA_SHARDS + shard] = 0;
+}
+
+static int audio_rtp_fec_complete(AudioRtpFecBlock *b)
+{
+    unsigned char *shards[AUDIO_RTP_FEC_TOTAL_SHARDS];
+    unsigned char marks[AUDIO_RTP_FEC_TOTAL_SHARDS];
+    int i;
+    int available = 0;
+    int missing_data = 0;
+    reed_solomon *rs;
+    int ret;
+
+    if (!b || !b->valid) {
+        return -1;
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_TOTAL_SHARDS; i++) {
+        marks[i] = b->marks[i];
+        if (!marks[i]) available++;
+        if (i < AUDIO_RTP_FEC_DATA_SHARDS && marks[i]) missing_data++;
+    }
+    if (missing_data == 0) {
+        return 0;
+    }
+    if (available < AUDIO_RTP_FEC_DATA_SHARDS) {
+        return -1;
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_DATA_SHARDS; i++) {
+        shards[i] = b->data[i];
+    }
+    for (i = 0; i < AUDIO_RTP_FEC_PARITY_SHARDS; i++) {
+        shards[AUDIO_RTP_FEC_DATA_SHARDS + i] = b->fec[i];
+    }
+
+    reed_solomon_global_lock();
+    if (!s_audio_rtp_fec_rs ||
+        s_audio_rtp_fec_rs->data_shards != AUDIO_RTP_FEC_DATA_SHARDS ||
+        s_audio_rtp_fec_rs->parity_shards != AUDIO_RTP_FEC_PARITY_SHARDS ||
+        !s_audio_rtp_fec_rs->m ||
+        !s_audio_rtp_fec_rs->parity) {
+        s_audio_rtp_fec_rs = reed_solomon_new(AUDIO_RTP_FEC_DATA_SHARDS,
+                                              AUDIO_RTP_FEC_PARITY_SHARDS);
+    }
+    rs = s_audio_rtp_fec_rs;
+    if (rs) {
+        static const unsigned char audio_parity[] =
+            { 0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c };
+        memcpy(rs->parity, audio_parity, sizeof(audio_parity));
+        ret = reed_solomon_reconstruct(rs, shards, marks,
+                                       AUDIO_RTP_FEC_TOTAL_SHARDS,
+                                       b->block_size);
+    } else {
+        ret = -1;
+    }
+    reed_solomon_global_unlock();
+
+    if (ret != 0) {
+        s_audio_rtp_fec_failed++;
+        return -1;
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_DATA_SHARDS; i++) {
+        if (b->marks[i]) {
+            b->marks[i] = 0;
+            s_audio_rtp_fec_recovered++;
+        }
+    }
+    return 0;
+}
+
+static int audio_rtp_fec_recover_payload(u16 seq, u8 *out_payload,
+                                         int *out_len)
+{
+    u16 base = audio_fec_base_seq(seq);
+    int pos = (int)(u16)(seq - base);
+    int i;
+    int saw_block = 0;
+
+    if (!out_payload || !out_len ||
+        pos < 0 || pos >= AUDIO_RTP_FEC_DATA_SHARDS) {
+        return -1;
+    }
+
+    for (i = 0; i < AUDIO_RTP_FEC_CACHE_BLOCKS; i++) {
+        AudioRtpFecBlock *b = &s_audio_fec_blocks[i];
+        if (!b->valid || b->base_seq != base) {
+            continue;
+        }
+        saw_block = 1;
+        if (audio_rtp_fec_complete(b) != 0 || b->marks[pos]) {
+            static u32 s_audio_rtp_fec_miss_log_count = 0;
+            s_audio_rtp_fec_miss_log_count++;
+            if (s_audio_rtp_fec_miss_log_count <= 8 ||
+                (s_audio_rtp_fec_miss_log_count % 100) == 0) {
+                int available = 0;
+                int missing_data = 0;
+                int mi;
+                for (mi = 0; mi < AUDIO_RTP_FEC_TOTAL_SHARDS; mi++) {
+                    if (!b->marks[mi]) {
+                        available++;
+                    } else if (mi < AUDIO_RTP_FEC_DATA_SHARDS) {
+                        missing_data++;
+                    }
+                }
+                audio_log("[AUDIO RTP-FEC] miss seq=%u base=%u pos=%d avail=%d missing_data=%d block=%d total=%u failed=%u\n",
+                          (unsigned)seq, (unsigned)base, pos, available,
+                          missing_data, b->block_size,
+                          (unsigned)s_audio_rtp_fec_recovered,
+                          (unsigned)s_audio_rtp_fec_failed);
+            }
+            return -1;
+        }
+        memcpy(out_payload, b->data[pos], (size_t)b->block_size);
+        *out_len = b->block_size;
+        return 0;
+    }
+
+    if (!saw_block) {
+        static u32 s_audio_rtp_fec_noblock_log_count = 0;
+        s_audio_rtp_fec_noblock_log_count++;
+        if (s_audio_rtp_fec_noblock_log_count <= 8 ||
+            (s_audio_rtp_fec_noblock_log_count % 100) == 0) {
+            audio_log("[AUDIO RTP-FEC] no block for seq=%u base=%u pos=%d total=%u failed=%u\n",
+                      (unsigned)seq, (unsigned)base, pos,
+                      (unsigned)s_audio_rtp_fec_recovered,
+                      (unsigned)s_audio_rtp_fec_failed);
+        }
+    }
+    return -1;
+}
+
+static int audio_pending_push(const u8 *data, int len)
+{
+    int tail;
+
+    if (!data || len <= 0 || len > AUDIO_MAX_RTP_SIZE) {
+        return -1;
+    }
+    if (s_audio_pending_count >= AUDIO_PENDING_PACKETS) {
+        s_audio_reorder_drops++;
+        return -1;
+    }
+
+    tail = (s_audio_pending_head + s_audio_pending_count) % AUDIO_PENDING_PACKETS;
+    memcpy(s_audio_pending[tail].data, data, (size_t)len);
+    s_audio_pending[tail].len = len;
+    s_audio_pending_count++;
+    s_audio_reorder_queued++;
+    return 0;
+}
+
+static int audio_pending_pop(u8 *out, int *out_len)
+{
+    int len;
+
+    if (!out || !out_len || s_audio_pending_count <= 0) {
+        return 0;
+    }
+
+    len = s_audio_pending[s_audio_pending_head].len;
+    if (len <= 0 || len > AUDIO_MAX_RTP_SIZE) {
+        s_audio_pending_head = (s_audio_pending_head + 1) % AUDIO_PENDING_PACKETS;
+        s_audio_pending_count--;
+        return 0;
+    }
+
+    memcpy(out, s_audio_pending[s_audio_pending_head].data, (size_t)len);
+    *out_len = len;
+    s_audio_pending[s_audio_pending_head].len = 0;
+    s_audio_pending_head = (s_audio_pending_head + 1) % AUDIO_PENDING_PACKETS;
+    s_audio_pending_count--;
+    return 1;
+}
+
+static int audio_rtp_payload_offset(const u8 *packet, int *packet_len)
+{
+    const RtpHeader *hdr;
+    int data_offset = (int)RTP_HDR_SIZE;
+    u8 cc;
+
+    if (!packet || !packet_len || *packet_len <= (int)RTP_HDR_SIZE) {
+        return -1;
+    }
+
+    hdr = (const RtpHeader *)packet;
+    if (((hdr->version_p_x_cc >> 6) & 0x03) != 2) {
+        return -1;
+    }
+
+    cc = hdr->version_p_x_cc & 0x0F;
+    data_offset += cc * 4;
+    if (data_offset > *packet_len) {
+        return -1;
+    }
+
+    if (hdr->version_p_x_cc & 0x10) {
+        if (*packet_len >= data_offset + 4) {
+            u16 ext_words = (u16)((packet[data_offset + 2] << 8) |
+                                  packet[data_offset + 3]);
+            data_offset += 4 + ext_words * 4;
+        } else {
+            return -1;
+        }
+    }
+    if (data_offset >= *packet_len) {
+        return -1;
+    }
+
+    if (hdr->version_p_x_cc & 0x20) {
+        u8 pad_len = packet[*packet_len - 1];
+        if (pad_len > 0 && (int)pad_len <= (*packet_len - data_offset)) {
+            *packet_len -= pad_len;
+        }
+    }
+    if (data_offset >= *packet_len) {
+        return -1;
+    }
+    return data_offset;
+}
+
+static int audio_reorder_drain_for_fec(int *post_audio_fec_seen)
+{
+    u8 late_buf[AUDIO_MAX_RTP_SIZE];
+    int drained = 0;
+    u32 start_us = sceKernelGetSystemTimeLow();
+
+    while (drained < AUDIO_REORDER_MAX_DRAINS) {
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        int received;
+        int packet_len;
+        int data_offset;
+        u8 pt;
+        const RtpHeader *hdr;
+
+        memset(&from_addr, 0, sizeof(from_addr));
+        from_addr.sin_len = (uint8_t)sizeof(from_addr);
+        received = sceNetInetRecvfrom(s_udp_sock, late_buf, sizeof(late_buf),
+                                      MSG_DONTWAIT,
+                                      (struct sockaddr *)&from_addr,
+                                      &from_len);
+        if (received <= 0) {
+            u32 now_us = sceKernelGetSystemTimeLow();
+            if ((u32)(now_us - start_us) >= AUDIO_REORDER_WINDOW_US) {
+                break;
+            }
+            sceKernelDelayThread(500);
+            continue;
+        }
+
+        s_audio_pkts_received++;
+        telemetry_accum_audio_rx((u32)received);
+        packet_len = received;
+        data_offset = audio_rtp_payload_offset(late_buf, &packet_len);
+        if (data_offset < 0) {
+            continue;
+        }
+
+        hdr = (const RtpHeader *)late_buf;
+        pt = hdr->marker_pt & 0x7F;
+        if (pt == RTP_PT_AUDIO_FEC) {
+            telemetry_accum_audio_fec((u32)received);
+            audio_rtp_fec_cache_parity(late_buf + data_offset,
+                                       packet_len - data_offset);
+            if (post_audio_fec_seen) {
+                (*post_audio_fec_seen)++;
+            }
+            drained++;
+        } else if (pt == RTP_PT_AUDIO_OPUS) {
+            s_last_audio_data_packet_us = sceKernelGetSystemTimeLow();
+            telemetry_accum_audio_data((u32)received);
+            audio_rtp_fec_cache_data(hdr, late_buf + data_offset,
+                                     packet_len - data_offset);
+            if (audio_pending_push(late_buf, received) != 0) {
+                break;
+            }
+            drained++;
+        } else {
+            if (post_audio_fec_seen) {
+                (*post_audio_fec_seen)++;
+            }
+            drained++;
+        }
+    }
+
+    if (drained > 0) {
+        s_audio_reorder_drains += (u32)drained;
+        if (s_audio_reorder_drains <= 16 ||
+            (s_audio_reorder_drains % 128) == 0) {
+            audio_log("[AUDIO REORDER] drained=%d queued=%u drops=%u pending=%d\n",
+                      drained, (unsigned)s_audio_reorder_queued,
+                      (unsigned)s_audio_reorder_drops, s_audio_pending_count);
+        }
+    }
+    return drained;
+}
+#else
+static void audio_rtp_fec_reset(void)
+{
+}
+
+static void audio_rtp_fec_cache_data(const RtpHeader *hdr,
+                                     const u8 *payload,
+                                     int payload_len)
+{
+    (void)hdr;
+    (void)payload;
+    (void)payload_len;
+}
+
+static void audio_rtp_fec_cache_parity(const u8 *payload, int payload_len)
+{
+    (void)payload;
+    (void)payload_len;
+}
+
+static int audio_rtp_fec_recover_payload(u16 seq, u8 *out_payload,
+                                         int *out_len)
+{
+    (void)seq;
+    (void)out_payload;
+    (void)out_len;
+    return -1;
+}
+
+static int audio_pending_pop(u8 *out, int *out_len)
+{
+    (void)out;
+    (void)out_len;
+    return 0;
+}
+
+static int audio_reorder_drain_for_fec(int *post_audio_fec_seen)
+{
+    if (post_audio_fec_seen) {
+        *post_audio_fec_seen = 0;
+    }
+    return 0;
+}
+#endif
+
 static int ring_full(void)
 {
     return ((s_ring.head - s_ring.tail) >= s_effective_ring_depth);
@@ -211,7 +803,7 @@ static int ring_empty(void)
     return (s_ring.head == s_ring.tail);
 }
 
-/* 
+/*
  * ring_push_pcm - copy exactly AUDIO_CHUNK_SAMPLES×2 int16 from src into
  * the next free slot and advance head.  Returns 0 on success, -1 if full.
  */
@@ -246,12 +838,57 @@ static int ring_pop_pcm(int16_t *dst)
     return 0;
 }
 
+static int audio_flush_stage_to_ring(void)
+{
+    while (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES) {
+        int remaining;
+        if (ring_push_pcm(s_pcm_stage) < 0) {
+            return -1;
+        }
+        remaining = s_pcm_stage_count - AUDIO_CHUNK_SAMPLES;
+        if (remaining > 0) {
+            memmove(s_pcm_stage,
+                    s_pcm_stage + AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS,
+                    remaining * AUDIO_CHANNELS * sizeof(int16_t));
+        }
+        s_pcm_stage_count = remaining;
+    }
+    return 0;
+}
+
+static int audio_stage_append_and_flush(const int16_t *src, int samples)
+{
+    int waits = 0;
+
+    if (samples <= 0 || samples > AUDIO_STAGE_CAPACITY) {
+        return -1;
+    }
+
+    while (s_pcm_stage_count + samples > AUDIO_STAGE_CAPACITY) {
+        if (audio_flush_stage_to_ring() == 0 &&
+            s_pcm_stage_count + samples <= AUDIO_STAGE_CAPACITY) {
+            break;
+        }
+        if (++waits > 24) {
+            return -2;
+        }
+        sceKernelDelayThread(1000);
+    }
+
+    memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
+           src,
+           samples * AUDIO_CHANNELS * sizeof(int16_t));
+    s_pcm_stage_count += samples;
+
+    return audio_flush_stage_to_ring() == 0 ? 0 : 1;
+}
+
 /*--------------------------------------------------------------------------
  * Phase 4: Simple audio time-stretch via linear interpolation.
  *
  * Stretches input samples by factor out_samples/in_samples (e.g. 1.3x).
  * Integer-only linear interpolation between adjacent samples.
- * Stereo: L/R channels interleaved, stretched independently.
+ * Channels are interleaved and stretched independently.
  *--------------------------------------------------------------------------*/
 static void audio_time_stretch(const int16_t *in, int in_samples,
                                int16_t *out, int out_samples)
@@ -277,6 +914,43 @@ static void audio_time_stretch(const int16_t *in, int in_samples,
     }
 }
 
+void audio_thread_set_packet_duration_ms(int duration_ms)
+{
+    if (duration_ms < 5) {
+        duration_ms = 5;
+    } else if (duration_ms > 60) {
+        duration_ms = 60;
+    }
+    s_audio_packet_duration_ms = duration_ms;
+    audio_log("[AUDIO] packet duration set to %dms\n", duration_ms);
+}
+
+static void audio_copy_faded_hold(int16_t *dst, const int16_t *src, int hold_index)
+{
+    int i;
+    int scale = 256 - (hold_index * 24);
+    int total = AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS;
+
+    if (scale < 128) {
+        scale = 128;
+    }
+
+    for (i = 0; i < total; i++) {
+        dst[i] = (int16_t)((src[i] * scale) >> 8);
+    }
+}
+
+static void audio_src_output_chunk(const int16_t *pcm)
+{
+    int i;
+    for (i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
+        int16_t sample = pcm[i];
+        s_src_out_buf[i * 2 + 0] = sample;
+        s_src_out_buf[i * 2 + 1] = sample;
+    }
+    sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_src_out_buf);
+}
+
 /*--------------------------------------------------------------------------
  * Audio Playback Thread
  *
@@ -294,6 +968,9 @@ static int audio_play_thread_func(SceSize args, void *argp)
 {
     int play_count = 0;
     int underrun_count = 0;
+    int empty_hold_count = 0;
+    int consecutive_empty_holds = 0;
+    int source_idle_silence_count = 0;
     int16_t last_play_chunk[AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS]
         __attribute__((aligned(64)));
     int have_last_play_chunk = 0;
@@ -303,20 +980,20 @@ static int audio_play_thread_func(SceSize args, void *argp)
 
     audio_log("[AUDIO PLAY] started, SRC chan active\n");
 
-    /* Pre-buffer: wait until ring has ≥8 chunks (~85ms at 512/48kHz)
+    /* Pre-buffer: wait until the ring has a PSP-1000 WiFi jitter cushion
      * before starting playback.  This absorbs WiFi jitter bursts on
      * 802.11b and prevents the play thread from draining silence while
-     * recv is still filling.  Increased from 4 to 8 for better jitter
-     * absorption (802.11b can have 50-100ms jitter spikes). */
+     * recv is still filling. */
     {
         int prebuf_wait = 0;
-        while (s_running && (s_ring.head - s_ring.tail) < 8) {
+        const u32 prebuf_target = AUDIO_PREBUFFER_TARGET_CHUNKS;
+        while (s_running && (s_ring.head - s_ring.tail) < prebuf_target) {
             sceKernelDelayThread(2000); /* 2ms check */
             prebuf_wait++;
-            if (prebuf_wait > 500) break; /* 1s max wait — start anyway */
         }
         audio_log("[AUDIO PLAY] pre-buffered %u slots after %d waits\n",
                   (unsigned)(s_ring.head - s_ring.tail), prebuf_wait);
+        s_audio_playback_started = 1;
     }
 
     while (s_running) {
@@ -340,7 +1017,7 @@ static int audio_play_thread_func(SceSize args, void *argp)
             audio_sync_unlock();
         }
 
-        if (sync_valid) {
+        if (sync_valid && AUDIO_RTP_DRIFT_CORRECTION) {
             drift_tick++;
             if ((drift_tick % AUDIO_DRIFT_CORRECTION_PERIOD_CHUNKS) == 0) {
                 int queued_chunks = (int)(s_ring.head - s_ring.tail);
@@ -360,7 +1037,8 @@ static int audio_play_thread_func(SceSize args, void *argp)
                         }
                     }
                 } else if (drift_error < -AUDIO_DRIFT_THRESHOLD_SAMPLES &&
-                           have_last_play_chunk) {
+                           have_last_play_chunk &&
+                           queued_chunks <= AUDIO_PLC_LOW_WATER_CHUNKS) {
                     drift_hold = 1;
                     drift_hold_count++;
                     s_drift_hold_events = (u32)drift_hold_count;
@@ -374,7 +1052,7 @@ static int audio_play_thread_func(SceSize args, void *argp)
 
         if (drift_hold) {
             memcpy(s_play_buf, last_play_chunk, sizeof(last_play_chunk));
-            sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_play_buf);
+            audio_src_output_chunk(s_play_buf);
             s_stats.frames_played++;
             play_count++;
             if (audio_sync_lock() == 0) {
@@ -384,12 +1062,44 @@ static int audio_play_thread_func(SceSize args, void *argp)
             continue;
         }
 
+        u32 last_data_us = s_last_audio_data_packet_us;
+        u32 now_us = sceKernelGetSystemTimeLow();
+        int source_idle = (last_data_us != 0 &&
+                           (u32)(now_us - last_data_us) >= AUDIO_SOURCE_IDLE_US);
+
         if (ring_pop_pcm(s_play_buf) == 0) {
-            sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_play_buf);
+            audio_src_output_chunk(s_play_buf);
             memcpy(last_play_chunk, s_play_buf, sizeof(last_play_chunk));
             have_last_play_chunk = 1;
             s_stats.frames_played++;
             play_count++;
+            consecutive_empty_holds = 0;
+        } else if (!source_idle &&
+                   have_last_play_chunk &&
+                   consecutive_empty_holds < AUDIO_EMPTY_HOLD_MAX_CHUNKS) {
+            audio_copy_faded_hold(s_play_buf, last_play_chunk,
+                                  consecutive_empty_holds);
+            audio_src_output_chunk(s_play_buf);
+            s_stats.frames_played++;
+            play_count++;
+            empty_hold_count++;
+            consecutive_empty_holds++;
+            if (empty_hold_count <= 5 || (empty_hold_count % 100) == 0) {
+                audio_log("[AUDIO PLAY] empty-hold #%d consec=%d queued=%u\n",
+                          empty_hold_count, consecutive_empty_holds,
+                          (unsigned)(s_ring.head - s_ring.tail));
+            }
+        } else if (source_idle) {
+            sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_silence);
+            source_idle_silence_count++;
+            consecutive_empty_holds = 0;
+            if (source_idle_silence_count <= 5 ||
+                (source_idle_silence_count % 1000) == 0) {
+                audio_log("[AUDIO PLAY] source-idle silence #%d queued=%u idle=%uus\n",
+                          source_idle_silence_count,
+                          (unsigned)(s_ring.head - s_ring.tail),
+                          (unsigned)(now_us - last_data_us));
+            }
         } else {
             /* Ring empty — play silence via DMA to maintain continuous audio
              * output.  This avoids clicks from DMA restarts and keeps the
@@ -397,6 +1107,7 @@ static int audio_play_thread_func(SceSize args, void *argp)
             sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, s_silence);
             s_stats.underruns++;
             underrun_count++;
+            consecutive_empty_holds++;
         }
 
         if (audio_sync_lock() == 0) {
@@ -405,11 +1116,11 @@ static int audio_play_thread_func(SceSize args, void *argp)
         }
 
         if (play_count > 0 && (play_count == 1 || play_count == 50 || play_count == 500 || (play_count % 2000) == 0)) {
-            audio_log("[AUDIO PLAY] played=%d underruns=%d\n",
-                      play_count, underrun_count);
+            audio_log("[AUDIO PLAY] played=%d holds=%d underruns=%d\n",
+                      play_count, empty_hold_count, underrun_count);
         } else if (play_count == 0 && (underrun_count == 1 || underrun_count == 200 || (underrun_count % 5000) == 0)) {
-            audio_log("[AUDIO PLAY] played=%d underruns=%d\n",
-                      play_count, underrun_count);
+            audio_log("[AUDIO PLAY] played=%d holds=%d underruns=%d\n",
+                      play_count, empty_hold_count, underrun_count);
         }
     }
 
@@ -432,7 +1143,6 @@ static int audio_ping_thread_func(SceSize args, void *argp)
     struct sockaddr_in dst;
     AudioSsPing pkt;
     char legacy_ping[] = { 0x50, 0x49, 0x4E, 0x47 };
-    uint32_t seq = 0;
 
     memset(&dst, 0, sizeof(dst));
     dst.sin_len    = (unsigned char)sizeof(dst);
@@ -445,7 +1155,7 @@ static int audio_ping_thread_func(SceSize args, void *argp)
 
     while (s_ping_running) {
         int sent;
-        seq++;
+        uint32_t seq = next_audio_ping_seq();
 
         if (g_audio_ping_payload[0] != '\0') {
             memcpy(pkt.payload, g_audio_ping_payload, 16);
@@ -462,9 +1172,11 @@ static int audio_ping_thread_func(SceSize args, void *argp)
 
         /* Diagnose persistent audio sendto failures */
         if (sent < 0 && (seq <= 5 || (seq % 20) == 0)) {
+#ifndef RETAIL_BUILD
             int err = sceNetInetGetErrno();
             audio_log("[AUDIO PING] sendto errno=%d sock=%d port=%d ip=%s seq=%u\n",
                       err, s_udp_sock, g_audio_server_port, g_video_server_ip, seq);
+#endif
         }
 
         sceKernelDelayThread(500000); /* 500 ms */
@@ -547,16 +1259,32 @@ int audio_thread_reserve_client_port(unsigned short *out_port)
         sceNetInetSetsockopt(s_udp_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         sceNetInetSetsockopt(s_udp_sock_rtcp, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-        /* Enlarge receive buffer to absorb packet bursts while Opus decodes.
-         * Opus CELT decode takes ~10 ms on PSP; at 50 pkt/s that's ~1 pkt
-         * queued per decode.  64 KB ≈ 50 packets of 1292 bytes. */
+        /* Size the audio socket for the negotiated packet cadence. The 60 ms
+         * PSP baseline has a low packet rate and should not reserve the same
+         * kernel network buffer as video. */
         {
-            int rcvbuf = 64 * 1024;
+            int requested_rcvbuf = audio_socket_rcvbuf_target();
+            int rcvbuf = requested_rcvbuf;
             if (sceNetInetSetsockopt(s_udp_sock, SOL_SOCKET, SO_RCVBUF,
                                      &rcvbuf, sizeof(rcvbuf)) < 0) {
                 rcvbuf = 32 * 1024;
-                sceNetInetSetsockopt(s_udp_sock, SOL_SOCKET, SO_RCVBUF,
-                                     &rcvbuf, sizeof(rcvbuf));
+                if (sceNetInetSetsockopt(s_udp_sock, SOL_SOCKET, SO_RCVBUF,
+                                         &rcvbuf, sizeof(rcvbuf)) < 0) {
+                    rcvbuf = 16 * 1024;
+                    sceNetInetSetsockopt(s_udp_sock, SOL_SOCKET, SO_RCVBUF,
+                                         &rcvbuf, sizeof(rcvbuf));
+                }
+            }
+            {
+                int actual_rcvbuf = 0;
+                socklen_t actual_len = sizeof(actual_rcvbuf);
+                if (sceNetInetGetsockopt(s_udp_sock, SOL_SOCKET, SO_RCVBUF,
+                                         &actual_rcvbuf, &actual_len) == 0) {
+                    audio_log("[AUDIO] SO_RCVBUF target=%dKB actual=%dKB packetDuration=%dms\n",
+                              requested_rcvbuf / 1024,
+                              actual_rcvbuf / 1024,
+                              s_audio_packet_duration_ms);
+                }
             }
         }
 
@@ -662,7 +1390,7 @@ int audio_thread_send_ping_burst(void)
         int sent;
         if (g_audio_ping_payload[0] != '\0') {
             memcpy(pkt.payload, g_audio_ping_payload, 16);
-            pkt.seq_be = htonl((uint32_t)i);
+            pkt.seq_be = htonl(next_audio_ping_seq());
             sent = (int)sceNetInetSendto(s_udp_sock, &pkt, sizeof(pkt), 0,
                                          (struct sockaddr *)&dst, sizeof(dst));
         } else {
@@ -699,11 +1427,15 @@ static int audio_thread_func(SceSize args, void *argp)
     int plc_count = 0;
     int fec_recover_count = 0; /* in-band FEC recoveries */
 
-    /* Sequence tracking for PLC gap detection.
-     * Audio PT=97 and FEC PT=127 share the same RTP sequence space, so
-     * we track the last-seen audio-only sequence to detect true audio gaps.*/
+    /* Audio data and audio FEC share one RTP sequence space. Use RTP
+     * timestamps for gap recovery so missing parity packets cannot create
+     * false audio PLC/FEC work. */
     unsigned short last_audio_seq = 0;
     int have_last_audio_seq = 0;
+    u32 last_audio_rtp_ts = 0;
+    int have_last_audio_rtp = 0;
+    int last_audio_frame_samples = 0;
+    int audio_gap_diag_count = 0;
 
     audio_log("[AUDIO] thread started, sock=%d src_active=%d port=%d\n",
               s_udp_sock, (s_audio_chan >= 0 ? 1 : 0), (int)s_bound_audio_port);
@@ -718,7 +1450,6 @@ static int audio_thread_func(SceSize args, void *argp)
     struct sockaddr_in ping_dst;
     AudioSsPing ping_pkt;
     char legacy_ping[] = { 0x50, 0x49, 0x4E, 0x47 };
-    uint32_t ping_seq = 0;
     u32 last_ping_us = sceKernelGetSystemTimeLow();
 
     memset(&ping_dst, 0, sizeof(ping_dst));
@@ -731,7 +1462,7 @@ static int audio_thread_func(SceSize args, void *argp)
      * the socket.  Send one immediate ping first so there's no gap. */
     stop_audio_ping_thread();
     {
-        ping_seq++;
+        uint32_t ping_seq = next_audio_ping_seq();
         int ps;
         if (g_audio_ping_payload[0] != '\0') {
             memcpy(ping_pkt.payload, g_audio_ping_payload, 16);
@@ -772,9 +1503,16 @@ static int audio_thread_func(SceSize args, void *argp)
     int consec_plc = 0;        /* consecutive PLC frames (for volume ducking) */
     int fade_in_frames = 0;    /* post-PLC fade-in counter (0 = no fade) */
     int fec_pending = 0;       /* set when gap detected; FEC decode after decrypt */
+    int fec_between_audio = 0; /* RTP FEC/parity slots seen since last audio data */
 
     while (s_running) {
         loop_count++;
+
+        if (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES &&
+            audio_flush_stage_to_ring() < 0) {
+            sceKernelDelayThread(1000);
+            continue;
+        }
 
         /* While CABAC dialog is on-screen, pause audio processing.
          * Keep pinging so the server doesn't drop us, but don't decode
@@ -784,13 +1522,15 @@ static int audio_thread_func(SceSize args, void *argp)
             continue;
         }
 
-        /* --- Inline ping: 100 ms until first audio data, then 500 ms --- */
+        /* --- Inline ping: 100 ms until first audio data, then steady keepalive. --- */
         {
             u32 now_us = sceKernelGetSystemTimeLow();
             u32 elapsed = now_us - last_ping_us;
-            u32 ping_interval = got_first_packet ? 500000 : 100000;
+            u32 ping_interval = got_first_packet
+                ? ((s_audio_packet_duration_ms >= 40) ? 1000000 : 500000)
+                : 100000;
             if (elapsed >= ping_interval) {
-                ping_seq++;
+                uint32_t ping_seq = next_audio_ping_seq();
                 int ps;
                 if (g_audio_ping_payload[0] != '\0') {
                     memcpy(ping_pkt.payload, g_audio_ping_payload, 16);
@@ -804,9 +1544,11 @@ static int audio_thread_func(SceSize args, void *argp)
                 if (ping_seq <= 3 || (ping_seq % 20) == 0)
                     audio_log("[AUDIO PING-INLINE] #%u sent=%d\n", ping_seq, ps);
                 if (ps < 0 && (ping_seq <= 5 || (ping_seq % 20) == 0)) {
+#ifndef RETAIL_BUILD
                     int err = sceNetInetGetErrno();
                     audio_log("[AUDIO PING-INLINE] errno=%d sock=%d seq=%u\n",
                               err, s_udp_sock, ping_seq);
+#endif
                 }
                 last_ping_us = now_us;
             }
@@ -819,14 +1561,18 @@ static int audio_thread_func(SceSize args, void *argp)
          *  - Non-blocking recvfrom(MSG_DONTWAIT) receives data without
          *    holding any lock, and since pings are now inline in this same
          *    thread, there is no concurrent socket access at all. */
-        from_len = sizeof(from_addr);
-        memset(&from_addr, 0, sizeof(from_addr));
-        from_addr.sin_len = (uint8_t)sizeof(from_addr);
+        int received;
+        int from_pending = audio_pending_pop(pkt_buf, &received);
+        if (!from_pending) {
+            from_len = sizeof(from_addr);
+            memset(&from_addr, 0, sizeof(from_addr));
+            from_addr.sin_len = (uint8_t)sizeof(from_addr);
 
-        int received = sceNetInetRecvfrom(s_udp_sock, pkt_buf, sizeof(pkt_buf),
+            received = sceNetInetRecvfrom(s_udp_sock, pkt_buf, sizeof(pkt_buf),
                                           MSG_DONTWAIT,
                                           (struct sockaddr *)&from_addr,
                                           &from_len);
+        }
         if (received <= 0) {
             recv_err_count++;
             if (!g_psp_config.audioEnabled) {
@@ -834,15 +1580,23 @@ static int audio_thread_func(SceSize args, void *argp)
                     audio_log("[AUDIO] drain idle count=%d loop=%d\n",
                               recv_err_count, loop_count);
                 }
-            } else if (recv_err_count == 1 || recv_err_count == 50 || (recv_err_count % 500) == 0) {
-                int err = sceNetInetGetErrno();
-                audio_log("[AUDIO] recv no-data err=%d count=%d loop=%d\n",
-                          err, recv_err_count, loop_count);
+            } else {
+                int no_data_log_interval =
+                    (got_first_packet && s_audio_packet_duration_ms >= 40) ? 2000 : 500;
+                if (recv_err_count == 1 || recv_err_count == 50 ||
+                    (recv_err_count % no_data_log_interval) == 0) {
+#ifndef RETAIL_BUILD
+                    int err = sceNetInetGetErrno();
+                    audio_log("[AUDIO] recv no-data err=%d count=%d loop=%d\n",
+                              err, recv_err_count, loop_count);
+#endif
+                }
             }
 
             /* --- Time-based PLC injection ---
-             * When no audio packet arrives within a dynamic threshold,
-             * inject an Opus PLC frame into the ring buffer.
+             * Emergency low-water concealment only. RTP sequence recovery
+             * handles real packet loss when packets resume; injecting PLC
+             * while the ring is healthy creates drift and repeated audio.
              *
              * Adaptive threshold based on connection quality:
              *   EXCELLENT/GOOD: 35ms (tighter — detect loss faster)
@@ -851,9 +1605,14 @@ static int audio_thread_func(SceSize args, void *argp)
              *
              * Only inject if we've already received at least one audio frame
              * (have_last_audio_seq) and the ring isn't full. */
-            if (have_last_audio_seq && last_audio_recv_us != 0 && !ring_full()) {
+            /* Low-work 40/60 ms audio runs with continuousAudio=0; a quiet
+             * host may intentionally send no audio, so avoid synthetic PLC. */
+            if (s_audio_packet_duration_ms < 40 &&
+                s_audio_playback_started &&
+                have_last_audio_seq && last_audio_recv_us != 0 && !ring_full()) {
                 u32 now_plc = sceKernelGetSystemTimeLow();
                 u32 gap_us = now_plc - last_audio_recv_us;
+                u32 queued_chunks = s_ring.head - s_ring.tail;
 
                 /* Dynamic PLC threshold */
                 u32 plc_threshold_us;
@@ -865,18 +1624,23 @@ static int audio_thread_func(SceSize args, void *argp)
                         plc_threshold_us = 45000;  /* 45ms */
                     else
                         plc_threshold_us = 60000;  /* 60ms */
-
-                    /* Phase 5.4: Adjust effective ring depth based on quality */
+                    if (plc_threshold_us < AUDIO_TIME_PLC_THRESHOLD_US)
+                        plc_threshold_us = AUDIO_TIME_PLC_THRESHOLD_US;
                     {
-                        u32 new_depth;
-                        if (cq.quality <= CONN_QUALITY_GOOD)
-                            new_depth = 32;
-                        else if (cq.quality == CONN_QUALITY_FAIR)
-                            new_depth = 48;
-                        else
-                            new_depth = AUDIO_RING_SLOTS; /* 64 */
+                        u32 packet_us = (u32)s_audio_packet_duration_ms * 1000u;
+                        u32 jitter_floor_us = packet_us * 3u;
+                        if (packet_us >= 5000u && packet_us <= 60000u &&
+                            plc_threshold_us < jitter_floor_us) {
+                            plc_threshold_us = jitter_floor_us;
+                        }
+                    }
+
+                    /* Keep full depth on PSP-1000 WiFi. Shrinking the ring to
+                     * 32/48 slots caused underruns during recoverable bursts. */
+                    {
+                        u32 new_depth = AUDIO_RING_SLOTS;
                         if (new_depth != s_effective_ring_depth) {
-                            audio_log("[PHASE5-ARING] depth adjusted: %u slots (quality=%d)\n",
+                            audio_log("[AUDIO RING] depth adjusted: %u slots (quality=%d)\n",
                                       (unsigned)new_depth, (int)cq.quality);
                             s_effective_ring_depth = new_depth;
                         }
@@ -895,14 +1659,18 @@ static int audio_thread_func(SceSize args, void *argp)
                     }
                 }
 
-                if (gap_us >= plc_threshold_us) {
+                if (queued_chunks <= AUDIO_PLC_LOW_WATER_CHUNKS &&
+                    consec_plc < AUDIO_TIME_PLC_MAX_CONSEC_FRAMES &&
+                    gap_us >= plc_threshold_us) {
                     int plc_sz = opus_psp_last_frame_size();
                     int plc_samples;
 
                     /* Phase 4: Time-stretch for short gaps (<100ms).
                      * Stretches last good audio by 1.3x using linear
                      * interpolation. Sounds more natural than Opus PLC. */
-                    if (consec_plc < TSTRETCH_MAX_PLC && s_last_good_samples > 0) {
+                    if (AUDIO_TIME_STRETCH_CONCEALMENT &&
+                        consec_plc < TSTRETCH_MAX_PLC &&
+                        s_last_good_samples > 0) {
                         int stretch_out = (s_last_good_samples * 13) / 10;
                         if (stretch_out > AUDIO_MAX_FRAME_SAMPLES)
                             stretch_out = AUDIO_MAX_FRAME_SAMPLES;
@@ -913,9 +1681,7 @@ static int audio_thread_func(SceSize args, void *argp)
                             static u32 s_tstretch_count = 0;
                             s_tstretch_count++;
                             if (s_tstretch_count <= 5 || (s_tstretch_count % 200) == 0) {
-                                pspDebugScreenPrintf("[PHASE4-TSTR] stretch %d->%d\n",
-                                                    s_last_good_samples, stretch_out);
-                                audio_log("[PHASE4-TSTR] stretch: %d -> %d samples (consec=%d) [#%u]\n",
+                                audio_log("[AUDIO TSTR] stretch: %d -> %d samples (consec=%d) [#%u]\n",
                                           s_last_good_samples, stretch_out, consec_plc, s_tstretch_count);
                             }
                         }
@@ -943,43 +1709,47 @@ static int audio_thread_func(SceSize args, void *argp)
                             }
                         }
 
-                        if (s_pcm_stage_count + plc_samples <= AUDIO_STAGE_CAPACITY) {
-                            memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
-                                   pcm_decode_buf,
-                                   plc_samples * AUDIO_CHANNELS * sizeof(int16_t));
-                            s_pcm_stage_count += plc_samples;
-                            while (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES) {
-                                if (ring_push_pcm(s_pcm_stage) < 0) break;
-                                int rem = s_pcm_stage_count - AUDIO_CHUNK_SAMPLES;
-                                if (rem > 0) {
-                                    memmove(s_pcm_stage,
-                                            s_pcm_stage + AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS,
-                                            rem * AUDIO_CHANNELS * sizeof(int16_t));
-                                }
-                                s_pcm_stage_count = rem;
-                            }
-                        }
+                        (void)audio_stage_append_and_flush(pcm_decode_buf, plc_samples);
                         /* Advance the timestamp so we inject one PLC per
                          * frame interval, not one per EAGAIN poll. */
-                        last_audio_recv_us = now_plc;
+                        {
+                            u32 frame_us = (u32)(((u64)plc_samples * 1000000ULL) /
+                                                 AUDIO_SAMPLE_RATE);
+                            if (frame_us < 5000 || frame_us > 70000) {
+                                frame_us = 10000;
+                            }
+                            if (frame_us >= gap_us) {
+                                last_audio_recv_us = now_plc;
+                            } else {
+                                last_audio_recv_us += frame_us;
+                            }
+                        }
                         if (time_plc_logged < 10 || (time_plc_count % 200) == 0) {
-                            audio_log("[AUDIO] time-PLC #%d gap=%uus samples=%d\n",
-                                      time_plc_count, gap_us, plc_samples);
+                            audio_log("[AUDIO] time-PLC #%d gap=%uus samples=%d queued=%u\n",
+                                      time_plc_count, gap_us, plc_samples,
+                                      (unsigned)queued_chunks);
                             time_plc_logged++;
                         }
                     }
                 }
             }
 
-            /* Adaptive backoff: ramp from 500µs → 1ms → 2ms as consecutive
-             * empty polls increase.  At 50 pkt/s (20ms cadence), 500µs poll
-             * catches packets quickly.  Cap at 2ms to keep audio latency low
-             * while still yielding CPU for video decode. */
+            /* Adaptive backoff. Keep startup and short-packet presets quick,
+             * but once 40-60ms audio packets are flowing, stop polling the
+             * PSP network stack like a 20ms stream. */
             {
                 int delay_us;
                 consecutive_empty++;
                 if (!g_psp_config.audioEnabled) {
                     delay_us = 5000;      /* drain-only mode: prioritize video */
+                } else if (got_first_packet && s_audio_packet_duration_ms >= 40) {
+                    if (consecutive_empty < 3) {
+                        delay_us = 1000;
+                    } else if (consecutive_empty < 10) {
+                        delay_us = 2000;
+                    } else {
+                        delay_us = 4000;
+                    }
                 } else if (consecutive_empty < 5) {
                     delay_us = 500;       /* 500µs — data likely imminent */
                 } else if (consecutive_empty < 20) {
@@ -993,12 +1763,21 @@ static int audio_thread_func(SceSize args, void *argp)
         }
         recv_count++;
         consecutive_empty = 0;  /* reset adaptive backoff on successful recv */
-        s_audio_pkts_received++;  /* Phase 3.5: audio stats */
+        if (!from_pending) {
+            s_audio_pkts_received++;  /* Phase 3.5: audio stats */
+            telemetry_accum_audio_rx((u32)received);
+        }
         /* Start fade-in ramp when transitioning from PLC to real audio.
          * Ramp over 3 frames (60ms) to smooth the transition and
          * prevent audible click artifacts at the PLC→real boundary. */
         if (consec_plc > 0) {
-            audio_log("[AUDIO PLC] recovery after %d consecutive PLC frames\n", consec_plc);
+            static u32 s_plc_recovery_log_count = 0;
+            s_plc_recovery_log_count++;
+            if (s_plc_recovery_log_count <= 10 ||
+                (s_plc_recovery_log_count % 100) == 0) {
+                audio_log("[AUDIO PLC] recovery after %d consecutive PLC frames [#%u]\n",
+                          consec_plc, s_plc_recovery_log_count);
+            }
             fade_in_frames = 3;
         }
         consec_plc = 0;         /* reset PLC volume ducking on real data */
@@ -1008,7 +1787,7 @@ static int audio_thread_func(SceSize args, void *argp)
                       received, recv_err_count);
             got_first_packet = 1;  /* switch to 500 ms ping cadence */
         }
-        
+
         if (!g_psp_config.audioEnabled) {
             /* Audio disabled: just drop the payload after receiving it */
             continue;
@@ -1055,6 +1834,7 @@ static int audio_thread_func(SceSize args, void *argp)
         }
 
         /* Log RTP payload type for diagnostics (first 10 packets) */
+#ifndef RETAIL_BUILD
         {
             static int pt_log_count = 0;
             u8 pt = hdr->marker_pt & 0x7F;
@@ -1066,16 +1846,29 @@ static int audio_thread_func(SceSize args, void *argp)
                 pt_log_count++;
             }
         }
+#endif
 
-        /* Skip FEC/parity packets (PT=127).  Only decode audio data
-         * packets (PT=97).  RTP-level FEC recovery is not implemented;
-         * we use Opus in-band FEC instead (embedded in each audio packet).
-         * Count FEC packets between audio packets for accurate gap
-         * detection — audio and FEC share the same RTP sequence space. */
+        /* Skip FEC/parity packets (PT=127). Only decode audio data
+         * packets (PT=97), while caching RTP-level audio FEC for later
+         * gap repair. Count FEC packets between audio packets for accurate
+         * gap detection because audio and FEC share the same sequence space. */
         {
-            static int fec_between_audio = 0;
             u8 pt = hdr->marker_pt & 0x7F;
-            if (pt != 97) {
+            if (pt == RTP_PT_AUDIO_OPUS) {
+                s_last_audio_data_packet_us = sceKernelGetSystemTimeLow();
+                if (!from_pending) {
+                    telemetry_accum_audio_data((u32)received);
+                    audio_rtp_fec_cache_data(hdr, pkt_buf + data_offset,
+                                             received - data_offset);
+                }
+            } else if (pt == RTP_PT_AUDIO_FEC) {
+                if (!from_pending) {
+                    telemetry_accum_audio_fec((u32)received);
+                    audio_rtp_fec_cache_parity(pkt_buf + data_offset,
+                                               received - data_offset);
+                }
+            }
+            if (pt != RTP_PT_AUDIO_OPUS) {
                 fec_between_audio++;
                 continue;
             }
@@ -1094,30 +1887,158 @@ static int audio_thread_func(SceSize args, void *argp)
                     }
                     audio_sync_unlock();
                 }
-            }
 
-            /* --- PLC/FEC gap recovery for lost audio frames ---
-             * Compute the RTP seq gap between consecutive audio packets
-             * and subtract FEC packets seen in between to get the true
-             * number of missing audio frames.
-             *
-             * Opus in-band FEC: the CURRENT packet embeds a low-bitrate
-             * copy of the PREVIOUS frame.  For the last lost frame in a
-             * gap, we use FEC recovery (better quality than PLC).  For
-             * earlier lost frames we use standard PLC (NULL decode). 
-             *
-             * Gap of N lost frames:
-             *   frames 1..N-1 → PLC (opus_psp_decode with NULL)  
-             *   frame  N      → FEC (opus_psp_decode_fec with current pkt)
-             *   then current  → normal decode (opus_psp_decode)
-             */
-            unsigned short seq = ntohs(hdr->seq);
-            if (have_last_audio_seq) {
+                /* --- PLC/FEC gap recovery for lost audio frames ---
+                 * Audio RTP sequence gaps include audio FEC parity packets.
+                 * Sunshine's low-rate audio path may also advance timestamps
+                 * across those parity slots, so received FEC packets must be
+                 * subtracted before declaring media loss.
+                 *
+                 * Opus in-band FEC: the CURRENT packet embeds a low-bitrate
+                 * copy of the PREVIOUS frame.  For the last lost frame in a
+                 * gap, we use FEC recovery (better quality than PLC).  For
+                 * earlier lost frames we use standard PLC (NULL decode).
+                 */
+                unsigned short seq = ntohs(hdr->seq);
+                int post_audio_fec_seen = 0;
+                if (have_last_audio_seq && have_last_audio_rtp) {
                 int total_gap = (int)(unsigned short)(seq - last_audio_seq) - 1;
-                int audio_gap = total_gap - fec_between_audio;
+                int media_gap = total_gap - fec_between_audio;
+                u32 ts_delta = (u32)(rtp_ts - last_audio_rtp_ts);
+                int expected_ts = s_audio_packet_duration_ms;
+                int expected_samples = last_audio_frame_samples;
+                int audio_gap = 0;
+                if (media_gap < 0) {
+                    media_gap = 0;
+                }
+                if (expected_ts < 5 || expected_ts > 60) {
+                    expected_ts = 10;
+                }
+                if (expected_samples < 120 || expected_samples > AUDIO_MAX_FRAME_SAMPLES) {
+                    expected_samples = opus_psp_last_frame_size();
+                }
+                if (expected_samples < 120 || expected_samples > AUDIO_MAX_FRAME_SAMPLES) {
+                    expected_samples = (AUDIO_SAMPLE_RATE * expected_ts) / 1000;
+                }
+
+                /* Sunshine may advance audio RTP timestamps across FEC parity
+                 * slots too. Use timestamps only as an upper bound, then clamp
+                 * to RTP sequence slots not already explained by received FEC
+                 * packets so parity does not become fake PLC work. RTP audio
+                 * timestamps are in the 48 kHz sample clock, not milliseconds. */
+                if (expected_samples > 0 &&
+                    ts_delta > (u32)(expected_samples + expected_samples / 2)) {
+                    int frames_elapsed = (int)((ts_delta + (u32)(expected_samples / 2)) /
+                                               (u32)expected_samples);
+                    audio_gap = frames_elapsed - 1;
+                }
+                if (audio_gap > media_gap) {
+                    audio_gap = media_gap;
+                }
+                if (!s_teardown_started && audio_gap > 0 && media_gap > 0) {
+                    int recovered_prefix = 0;
+                    int g;
+                    u16 missing_seq_start = (u16)(seq - (u16)media_gap);
+
+                    /* RTP-level audio FEC often arrives immediately after the
+                     * data shard that exposes the gap. Drain a tiny bounded
+                     * window before declaring loss so we recover from parity
+                     * already in flight without adding steady-state latency. */
+                    if (audio_gap <= AUDIO_RTP_FEC_PARITY_SHARDS) {
+                        (void)audio_reorder_drain_for_fec(&post_audio_fec_seen);
+                    }
+
+                    for (g = 0; g < audio_gap && g < media_gap; g++) {
+                        u16 missing_seq = (u16)(missing_seq_start + g);
+                        int rec_len = 0;
+                        int rec_opus_len;
+                        int rec_samples;
+
+                        if (audio_rtp_fec_recover_payload(missing_seq,
+                                                          s_audio_fec_recover_buf,
+                                                          &rec_len) != 0) {
+                            break;
+                        }
+
+                        rec_opus_len = rec_len;
+                        if (g_audio_encryption_enabled) {
+                            if ((rec_opus_len & 0x0F) != 0 ||
+                                stream_crypto_decrypt_audio(s_audio_fec_recover_buf,
+                                                            rec_opus_len,
+                                                            missing_seq,
+                                                            g_av_ri_key_id) != 0) {
+                                break;
+                            }
+                            if (rec_opus_len > 0) {
+                                unsigned char pad_val =
+                                    s_audio_fec_recover_buf[rec_opus_len - 1];
+                                if (pad_val >= 1 && pad_val <= 16 &&
+                                    pad_val <= rec_opus_len) {
+                                    rec_opus_len -= (int)pad_val;
+                                }
+                            }
+                        }
+                        if (rec_opus_len <= 0) {
+                            break;
+                        }
+
+                        rec_samples = opus_psp_decode(s_audio_fec_recover_buf,
+                                                      rec_opus_len,
+                                                      pcm_decode_buf,
+                                                      AUDIO_MAX_FRAME_SAMPLES);
+                        if (rec_samples <= 0) {
+                            break;
+                        }
+
+                        memcpy(s_last_good_pcm, pcm_decode_buf,
+                               rec_samples * AUDIO_CHANNELS *
+                               (int)sizeof(int16_t));
+                        s_last_good_samples = rec_samples;
+                        last_audio_frame_samples = rec_samples;
+                        if (audio_stage_append_and_flush(pcm_decode_buf,
+                                                         rec_samples) < -1) {
+                            s_stats.frames_dropped++;
+                            break;
+                        }
+                        recovered_prefix++;
+                        fec_recover_count++;
+                        s_audio_fec_total++;
+                        s_audio_pkts_decoded++;
+                    }
+
+                    if (recovered_prefix > 0) {
+                        static u32 s_audio_rtp_fec_log_count = 0;
+                        s_audio_rtp_fec_log_count++;
+                        if (s_audio_rtp_fec_log_count <= 8 ||
+                            (s_audio_rtp_fec_log_count % 100) == 0) {
+                            audio_log("[AUDIO RTP-FEC] recovered=%d remaining_gap=%d seq=%u total=%u failed=%u\n",
+                                      recovered_prefix,
+                                      audio_gap - recovered_prefix,
+                                      (unsigned)missing_seq_start,
+                                      (unsigned)s_audio_rtp_fec_recovered,
+                                      (unsigned)s_audio_rtp_fec_failed);
+                        }
+                        audio_gap -= recovered_prefix;
+                        if (audio_gap < 0) {
+                            audio_gap = 0;
+                        }
+                    }
+                }
+                if (!s_teardown_started &&
+                    audio_gap > 0 &&
+                    (audio_gap_diag_count < 8 || (audio_gap_diag_count % 100) == 0)) {
+#ifndef RETAIL_BUILD
+                    const char *gap_tag =
+                        (audio_gap == 1) ? "[AUDIO FEC-PENDING]" : "[AUDIO GAP]";
+                    audio_log("%s ts_delta=%u expected_ts=%dms expected_samples=%d gap=%d seq_gap=%d media_gap=%d fec_seen=%d\n",
+                              gap_tag, ts_delta, expected_ts, expected_samples,
+                              audio_gap, total_gap, media_gap, fec_between_audio);
+#endif
+                    audio_gap_diag_count++;
+                }
                 /* Limit to 10 consecutive frames (200 ms) — beyond that
                  * Opus PLC/FEC quality degrades to silence anyway. */
-                if (audio_gap > 0 && audio_gap <= 10) {
+                if (!s_teardown_started && audio_gap > 0 && audio_gap <= 10) {
                     int g;
                     /* Frames 1..N-1: standard PLC */
                     for (g = 0; g < audio_gap - 1; g++) {
@@ -1127,22 +2048,7 @@ static int audio_thread_func(SceSize args, void *argp)
                         if (plc_samples > 0) {
                             plc_count++;
                             s_audio_plc_total++;
-                            if (s_pcm_stage_count + plc_samples <= AUDIO_STAGE_CAPACITY) {
-                                memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
-                                       pcm_decode_buf,
-                                       plc_samples * AUDIO_CHANNELS * sizeof(int16_t));
-                                s_pcm_stage_count += plc_samples;
-                                while (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES) {
-                                    if (ring_push_pcm(s_pcm_stage) < 0) break;
-                                    int rem = s_pcm_stage_count - AUDIO_CHUNK_SAMPLES;
-                                    if (rem > 0) {
-                                        memmove(s_pcm_stage,
-                                                s_pcm_stage + AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS,
-                                                rem * AUDIO_CHANNELS * sizeof(int16_t));
-                                    }
-                                    s_pcm_stage_count = rem;
-                                }
-                            }
+                            (void)audio_stage_append_and_flush(pcm_decode_buf, plc_samples);
                         }
                     }
                     /* Last lost frame (N): FEC recovery from current pkt.
@@ -1152,11 +2058,14 @@ static int audio_thread_func(SceSize args, void *argp)
                      * below, using a flag. */
                     fec_pending = 1;
                 }
+                }
+                last_audio_seq = seq;
+                have_last_audio_seq = 1;
+                last_audio_rtp_ts = rtp_ts;
+                have_last_audio_rtp = 1;
+                fec_between_audio = post_audio_fec_seen;
+                last_audio_recv_us = sceKernelGetSystemTimeLow();
             }
-            last_audio_seq = seq;
-            have_last_audio_seq = 1;
-            fec_between_audio = 0;
-            last_audio_recv_us = sceKernelGetSystemTimeLow();
         }
 
         unsigned char *enc_data = pkt_buf + data_offset;
@@ -1216,11 +2125,11 @@ static int audio_thread_func(SceSize args, void *argp)
                 s_audio_crypto_fail_count++;
                 if (s_audio_crypto_fail_count <= 5 ||
                     (s_audio_crypto_fail_count % 50) == 0) {
-                    audio_log("[PHASE5-ACRYPTO] audio decrypt fail #%u (threshold=%u)\n",
+                    audio_log("[AUDIO CRYPTO] audio decrypt fail #%u (threshold=%u)\n",
                               (unsigned)s_audio_crypto_fail_count, 100u);
                 }
                 if (s_audio_crypto_fail_count >= 100) {
-                    audio_log("[PHASE5-ACRYPTO] WARNING: 100 consecutive audio decrypt failures\n");
+                    audio_log("[AUDIO CRYPTO] WARNING: 100 consecutive audio decrypt failures\n");
                     s_audio_crypto_fail_count = 0;
                 }
                 /* Decryption failed: inject PLC to fill the gap smoothly */
@@ -1294,25 +2203,21 @@ static int audio_thread_func(SceSize args, void *argp)
             if (fec_samples > 0) {
                 fec_recover_count++;
                 s_audio_fec_total++;
-                if (s_pcm_stage_count + fec_samples <= AUDIO_STAGE_CAPACITY) {
-                    memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
-                           pcm_decode_buf,
-                           fec_samples * AUDIO_CHANNELS * sizeof(int16_t));
-                    s_pcm_stage_count += fec_samples;
-                    while (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES) {
-                        if (ring_push_pcm(s_pcm_stage) < 0) break;
-                        int rem = s_pcm_stage_count - AUDIO_CHUNK_SAMPLES;
-                        if (rem > 0) {
-                            memmove(s_pcm_stage,
-                                    s_pcm_stage + AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS,
-                                    rem * AUDIO_CHANNELS * sizeof(int16_t));
-                        }
-                        s_pcm_stage_count = rem;
-                    }
-                }
+                (void)audio_stage_append_and_flush(pcm_decode_buf, fec_samples);
                 if (fec_recover_count <= 5 || (fec_recover_count % 200) == 0) {
                     audio_log("[AUDIO] FEC recover #%d samples=%d\n",
                               fec_recover_count, fec_samples);
+                }
+            } else {
+                int plc_samples = opus_psp_decode(NULL, 0,
+                                                  pcm_decode_buf,
+                                                  AUDIO_MAX_FRAME_SAMPLES);
+                audio_log("[AUDIO] Unable to recover audio with FEC (ret=%d); PLC samples=%d\n",
+                          fec_samples, plc_samples);
+                if (plc_samples > 0) {
+                    plc_count++;
+                    s_audio_plc_total++;
+                    (void)audio_stage_append_and_flush(pcm_decode_buf, plc_samples);
                 }
             }
             fec_pending = 0;
@@ -1356,6 +2261,9 @@ check_decoded:
         }
         decode_ok_count++;
         s_audio_pkts_decoded++;
+        if (decoded_samples > 0 && decoded_samples <= AUDIO_MAX_FRAME_SAMPLES) {
+            last_audio_frame_samples = decoded_samples;
+        }
         if (decode_ok_count == 1 || decode_ok_count == 10 || (decode_ok_count % 500) == 0) {
             audio_log("[AUDIO] decode ok=%d samples=%d recv=%d drop=%d enc=%d plc=%d tplc=%d fec=%d\n",
                       decode_ok_count, decoded_samples, recv_count,
@@ -1387,33 +2295,8 @@ check_decoded:
          * complete AUDIO_CHUNK_SAMPLES chunks into the ring buffer.
          * This decouples the Opus frame size (e.g. 240 for 5 ms @ 48 kHz)
          * from the PSP DMA chunk size (AUDIO_CHUNK_SAMPLES = 512). */
-        if (s_pcm_stage_count + decoded_samples > AUDIO_STAGE_CAPACITY) {
-            /* Accumulator overflow — reset to avoid stale data */
-            s_pcm_stage_count = 0;
-        }
-        memcpy(s_pcm_stage + s_pcm_stage_count * AUDIO_CHANNELS,
-               pcm_decode_buf,
-               decoded_samples * AUDIO_CHANNELS * sizeof(int16_t));
-        s_pcm_stage_count += decoded_samples;
-
-        while (s_pcm_stage_count >= AUDIO_CHUNK_SAMPLES) {
-            if (ring_push_pcm(s_pcm_stage) < 0) {
-                /* Ring full — brief yield to let play thread drain */
-                sceKernelDelayThread(1000);  /* 1ms — short yield, play priority now equal */
-                if (ring_push_pcm(s_pcm_stage) < 0) {
-                    s_stats.frames_dropped++;
-                    /* Drop remainder of this batch to avoid cascading stalls */
-                    s_pcm_stage_count = 0;
-                    break;
-                }
-            }
-            int remaining = s_pcm_stage_count - AUDIO_CHUNK_SAMPLES;
-            if (remaining > 0) {
-                memmove(s_pcm_stage,
-                        s_pcm_stage + AUDIO_CHUNK_SAMPLES * AUDIO_CHANNELS,
-                        remaining * AUDIO_CHANNELS * sizeof(int16_t));
-            }
-            s_pcm_stage_count = remaining;
+        if (audio_stage_append_and_flush(pcm_decode_buf, decoded_samples) < -1) {
+            s_stats.frames_dropped++;
         }
     }
 
@@ -1431,11 +2314,15 @@ int audio_thread_init(const char *host_ip)
         return 0;   /* already started */
     }
 
+    s_teardown_started = 0;
     memset(&s_ring,    0, sizeof(s_ring));
     memset(&s_stats,   0, sizeof(s_stats));
     memset(s_silence,  0, sizeof(s_silence));
     memset(s_pcm_stage, 0, sizeof(s_pcm_stage));
     s_pcm_stage_count = 0;
+    s_audio_playback_started = 0;
+    s_last_audio_data_packet_us = 0;
+    audio_rtp_fec_reset();
 
     if (s_audio_sync_sem < 0) {
         s_audio_sync_sem = sceKernelCreateSema("audio_sync_sem", 0, 1, 1, NULL);
@@ -1454,13 +2341,16 @@ int audio_thread_init(const char *host_ip)
 
     if (g_psp_config.audioEnabled) {
         diag_log_write("AUD", "initializing opus...\n");
-        if (opus_psp_init(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, 1, 1) < 0) {
+        if (opus_psp_init(AUDIO_SAMPLE_RATE,
+                          AUDIO_STREAM_CHANNELS,
+                          AUDIO_STREAMS,
+                          AUDIO_STREAM_COUPLED_STREAMS) < 0) {
             diag_log_write("AUD", "Opus decoder init failed\n");
             return -1;
         }
     }
 
-    /* The audio UDP sockets should already be pre-bound by network_connect.c. 
+    /* The audio UDP sockets should already be pre-bound by network_connect.c.
      * If they aren't for some reason, try to bind them now. */
     if (s_udp_sock < 0) {
         if (audio_thread_reserve_client_port(NULL) < 0) {
@@ -1489,19 +2379,27 @@ int audio_thread_init(const char *host_ip)
          * which pitch-shifts 48 kHz Opus audio down ~8% ("deep voice"). */
         int src_ret = sceAudioSRCChReserve(AUDIO_CHUNK_SAMPLES,
                                             AUDIO_SAMPLE_RATE,
-                                            AUDIO_CHANNELS);
+                                            AUDIO_OUTPUT_CHANNELS);
         if (src_ret < 0) {
-            /* Keep ping thread running so Sunshine can stream video even if
-             * audio playback can't be initialized under PPSSPP. */
-            audio_log("[AUDIO] sceAudioSRCChReserve failed (%d). Keeping audio pings alive.\n",
+            audio_log("[AUDIO] SRC reserve failed once (%d); releasing stale SRC and retrying\n",
+                      src_ret);
+            sceAudioSRCChRelease();
+            sceKernelDelayThread(20 * 1000);
+            src_ret = sceAudioSRCChReserve(AUDIO_CHUNK_SAMPLES,
+                                           AUDIO_SAMPLE_RATE,
+                                           AUDIO_OUTPUT_CHANNELS);
+        }
+        if (src_ret < 0) {
+            audio_log("[AUDIO] sceAudioSRCChReserve failed after retry (%d)\n",
                       src_ret);
             opus_psp_shutdown();
             return -2;
         }
         s_audio_chan = 0;  /* Mark SRC channel as active */
 
-        audio_log("[AUDIO] SRC channel reserved: freq=%d samples=%d channels=%d\n",
-                  AUDIO_SAMPLE_RATE, AUDIO_CHUNK_SAMPLES, AUDIO_CHANNELS);
+        audio_log("[AUDIO] SRC channel reserved: freq=%d samples=%d streamCh=%d outputCh=%d\n",
+                  AUDIO_SAMPLE_RATE, AUDIO_CHUNK_SAMPLES,
+                  AUDIO_CHANNELS, AUDIO_OUTPUT_CHANNELS);
     }
 
     s_running = 1;
@@ -1516,7 +2414,7 @@ int audio_thread_init(const char *host_ip)
         s_audio_tid = sceKernelCreateThread(
             "audio_recv",
             audio_thread_func,
-            recv_prio,       /* audio on: above video; audio off: below video */
+            recv_prio,
             recv_stack,      /* Opus needs 64 KB; drain-only needs little stack */
             PSP_THREAD_ATTR_USER, NULL);
     }
@@ -1570,8 +2468,7 @@ int audio_thread_init(const char *host_ip)
         s_play_tid = sceKernelCreateThread(
             "audio_play",
             audio_play_thread_func,
-            0x1A,               /* priority: same as audio_recv — must not be
-                                 * starved by video decoder (0x1C) */
+            0x1A,
             8 * 1024,           /* 8 KB stack — sceAudioOutputBlocking DMA needs headroom */
             PSP_THREAD_ATTR_USER, NULL);
 
@@ -1590,8 +2487,10 @@ int audio_thread_init(const char *host_ip)
 
 void audio_thread_shutdown(void)
 {
+    s_teardown_started = 1;
     s_running = 0;
     s_ping_running = 0;
+    s_audio_playback_started = 0;
 
     /* Stop audio ping thread first */
     stop_audio_ping_thread();
@@ -1643,6 +2542,13 @@ void audio_thread_shutdown(void)
 
     /* Shut down Opus decoder */
     if (g_psp_config.audioEnabled) opus_psp_shutdown();
+}
+
+void audio_thread_begin_shutdown(void)
+{
+    s_teardown_started = 1;
+    s_running = 0;
+    s_ping_running = 0;
 }
 
 int audio_thread_is_running(void)

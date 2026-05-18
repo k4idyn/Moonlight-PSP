@@ -32,6 +32,7 @@
 #include "diag_log.h"
 #include "shared.h"
 #include "decode_flags.h"
+#include "rtp_reassembly.h"
 #include "signal_strength.h"
 #include "sw_decode_pipeline.h"
 
@@ -45,9 +46,9 @@ extern int           g_remote_input_key_valid;
 /* me_running flag from main.c */
 extern volatile int me_running;
 
-/* When intra-refresh is active, IDR frames are massive (65KB+) and can't
- * survive lossy 802.11b WiFi.  This flag suppresses IDR requests so
- * the server only sends small intra-refresh P-frames (~1KB each). */
+/* Experimental recovery mode: only suppress soft IDR requests when we have
+ * proven host-side intra-refresh is actually repainting the stream.  Baseline
+ * PSP validation keeps this disabled so watchdog recovery can force IDR. */
 volatile int g_intra_refresh_active = 0;
 
 /* ── Connection Quality Monitoring state ─────────────────────────── */
@@ -61,11 +62,27 @@ static u32 s_quality_prev_time_us       = 0;
 
 /* Phase 5.9: Quality-based BW report scaling (100=normal, 50=halve) */
 static int s_quality_bw_scale_pct = 100;
+static u64 s_last_idr_tick = 0;
+static int s_idr_count = 0;
+static u32 s_idr_backoff_us = 500000;
+static int s_idr_prev_decoded = 0;
+static unsigned int s_intra_idr_suppressed = 0;
+static volatile int s_server_hello_seen = 0;
 
 /* Forward declaration (defined after control_stream_abort) */
 static void update_connection_quality(u32 estimated_bw_bps);
 
 #define ctrl_log(fmt, ...) diag_log_write("CTRL", fmt, ##__VA_ARGS__)
+
+void control_stream_reset_idr_backoff(void)
+{
+    s_last_idr_tick = 0;
+    s_idr_count = 0;
+    s_idr_backoff_us = 500000;
+    s_idr_prev_decoded = 0;
+    s_intra_idr_suppressed = 0;
+    ctrl_log("[IDR BACKOFF] reset\n");
+}
 
 /* ── ENet protocol constants ─────────────────────────────────────── */
 #define ENET_PEERID_NONE       0x0FFF
@@ -153,7 +170,7 @@ static int ctrl_sendto_with_diag(const void *buf,
                                  const char *tag,
                                  unsigned int *fail_count)
 {
-    int tx = (int)sceNetInetSendto(ctrl_socket, buf, len, 0,
+    int tx = (int)sceNetInetSendto(ctrl_socket, buf, len, MSG_DONTWAIT,
                                    (const struct sockaddr *)dst, sizeof(*dst));
 
     if (!fail_count) {
@@ -194,6 +211,7 @@ static unsigned short reliable_seq_per_ch[CTRL_CHANNEL_COUNT]; /* zeroed at init
 static unsigned int   next_ctrl_enc_seq = 0; /* sequence for control encryption */
 static int            ctrl_crypto_ready = 0;
 static mbedtls_gcm_context ctrl_gcm_ctx;
+static unsigned int   s_ping_tx_failures = 0;
 
 /* connectID we generate — must match VERIFY_CONNECT echo */
 static unsigned int  my_connect_id = 0;
@@ -274,12 +292,16 @@ static void rtt_update(u32 rtt_sample_us)
 }
 
 /* ── Bandwidth estimation ──────────────────────────────────────────
- * Track received video bytes and report throughput to the server via
- * ENet BANDWIDTH_LIMIT.  This closes the "no bandwidth estimation"
- * gap vs. ENet's built-in bandwidth tracking. */
+ * Track received media bytes and report throughput as an ENet peer bandwidth
+ * hint. This is measured separately from the RTSP bitrate budget because
+ * Sunshine may not immediately map ENet bandwidth commands to RTP video. */
 static u32 s_bw_last_bytes = 0;
 static u32 s_bw_last_time_us = 0;
 static u32 s_estimated_bw_bps = 0;  /* estimated incoming bandwidth (bytes/sec) */
+
+#define BW_REPORT_INTERVAL_TICKS 10  /* 10 x 100 ms = 1 second */
+#define BW_REPORT_EWMA_OLD_WEIGHT 3
+#define BW_REPORT_EWMA_NEW_WEIGHT 1
 
 /* Server-provided throttle and bandwidth parameters */
 static u32 s_server_incoming_bw = 0;
@@ -315,14 +337,18 @@ static void retx_ack(unsigned char channel, unsigned short seq)
     for (i = 0; i < RETX_SLOTS; i++) {
         retx_entry_t *e = &retx_ring[i];
         if (e->active && !e->acked && e->channel == channel && e->seq == seq) {
+            u32 rtt = now - e->send_time_us;
             e->acked = 1;
             /* Karn's algorithm: only measure RTT from non-retransmitted
              * packets — ACK for a retransmit is ambiguous (could be for
              * the original or the retransmit). */
             if (e->retries == 0) {
-                u32 rtt = now - e->send_time_us;
                 if (rtt > 0 && rtt < 5000000) /* sanity: < 5s */
                     rtt_update(rtt);
+            }
+            if (channel == 0xFF) {
+                ctrl_log("[CTRL BW] ack seq=%u rtt=%uus retries=%u\n",
+                         (unsigned)seq, (unsigned)rtt, (unsigned)e->retries);
             }
             return;
         }
@@ -351,15 +377,17 @@ static int retx_scan(int sock, const struct sockaddr_in *dst)
 
         /* Retransmit */
         {
-            int tx = (int)sceNetInetSendto(sock, e->data, e->len, 0,
+            int tx = (int)sceNetInetSendto(sock, e->data, e->len, MSG_DONTWAIT,
                                            (const struct sockaddr *)dst, sizeof(*dst));
             if (tx < 0) {
+#ifndef RETAIL_BUILD
                 int err = sceNetInetGetErrno();
                 if (e->retries < 3 || (e->retries % 8) == 0) {
                     ctrl_log("[CTRL RETX] send failed seq=%u ch=%u try=%u errno=%d\n",
                              (unsigned)e->seq, (unsigned)e->channel,
                              (unsigned)e->retries + 1, err);
                 }
+#endif
             } else {
                 retransmitted++;
             }
@@ -489,15 +517,10 @@ static int build_connect_packet(unsigned char *buf, int buflen)
 }
 
 /* ── Build ACK for a received reliable command ───────────────────── */
-static int build_ack_packet(unsigned char *buf, int buflen,
-                            unsigned short peer_id_word,
-                            unsigned char channel_id,
-                            unsigned short rel_seq,
-                            unsigned short recv_time)
+static int build_ack_header(unsigned char *buf, int buflen)
 {
     unsigned char *p = buf;
-    (void)peer_id_word;
-    if (buflen < 12) return -1; /* 4 header + 8 ACK command */
+    if (buflen < 4) return -1;
 
     /* Protocol header: PeerID + SessionID + SENT_TIME flag.
      * Reverting +1 logic: Sunshine expects the raw session_bits from VERIFY. */
@@ -505,6 +528,18 @@ static int build_ack_packet(unsigned char *buf, int buflen,
                      ((unsigned short)(session_bits & 0x03) << 12) |
                      ENET_FLAG_SENT_TIME);
     p = put_be16(p, 0);
+
+    return (int)(p - buf);
+}
+
+static int append_ack_command(unsigned char *buf, int buflen, int offset,
+                              unsigned char channel_id,
+                              unsigned short rel_seq,
+                              unsigned short recv_time)
+{
+    unsigned char *p;
+    if (offset < 4 || buflen - offset < 8) return -1;
+    p = buf + offset;
 
     /* ACK command header (4 bytes: cmd, channel, sequence) */
     *p++ = ENET_CMD_ACK;   /* 1 */
@@ -515,7 +550,22 @@ static int build_ack_packet(unsigned char *buf, int buflen,
     p = put_be16(p, rel_seq);
     p = put_be16(p, recv_time);
 
-    return (int)(p - buf); /* 12 bytes total */
+    return (int)(p - buf);
+}
+
+static int build_ack_packet(unsigned char *buf, int buflen,
+                            unsigned short peer_id_word,
+                            unsigned char channel_id,
+                            unsigned short rel_seq,
+                            unsigned short recv_time)
+{
+    int ack_len;
+    (void)peer_id_word;
+
+    ack_len = build_ack_header(buf, buflen);
+    if (ack_len < 0) return -1;
+    return append_ack_command(buf, buflen, ack_len,
+                              channel_id, rel_seq, recv_time);
 }
 
 /* ── Build a reliable message on a specified ENet channel ─────────── */
@@ -592,32 +642,6 @@ static int build_unsequenced_raw(unsigned char *buf, int buflen,
         memcpy(p, raw_payload, raw_len);
         p += raw_len;
     }
-
-    return (int)(p - buf);
-}
-
-/* ── Build ENet BANDWIDTH_LIMIT command ───────────────────────────────
- * Reports our estimated bandwidth to the server so Sunshine can
- * adjust encoding bitrate.  ENet protocol-level command (not encrypted). */
-static int build_bandwidth_limit(unsigned char *buf, int buflen,
-                                  unsigned int incoming_bw,
-                                  unsigned int outgoing_bw)
-{
-    unsigned char *p = buf;
-    if (buflen < 16) return -1; /* 4 header + 12 command */
-
-    /* ENet Protocol Header */
-    p = put_be16(p, (server_peer_id & 0x0FFF) |
-                     ((unsigned short)(session_bits & 0x03) << 12) |
-                     ENET_FLAG_SENT_TIME);
-    p = put_be16(p, 0); /* sentTime */
-
-    /* BANDWIDTH_LIMIT command (12 bytes): no ACK flag */
-    *p++ = ENET_CMD_BANDWIDTH_LIMIT; /* 10 */
-    *p++ = 0xFF;                      /* channelID = 0xFF */
-    p = put_be16(p, 0);              /* reliableSequenceNumber = 0 */
-    p = put_be32(p, incoming_bw);     /* incomingBandwidth (bytes/sec) */
-    p = put_be32(p, outgoing_bw);     /* outgoingBandwidth (bytes/sec) */
 
     return (int)(p - buf);
 }
@@ -939,21 +963,17 @@ static int ctrl_recv_thread(SceSize args, void *argp)
         socklen_t src_len = sizeof(src);
         int ret;
 
-        /* Blocking recvfrom with SO_RCVTIMEO (2 s, set in control_stream_start).
-         *
-         * sceNetInetSelect() returns 0 immediately on PSP (both PPSSPP and
-         * real hardware), which prevents recvfrom from ever being called.
-         * The control handshake proves blocking recv with SO_RCVTIMEO works.
-         * On timeout, recvfrom returns -1 with EAGAIN, letting us check
-         * me_running each iteration for clean exit on Home press. */
+        /* Nonblocking recv avoids holding the PSP socket lock while ctrl_ping
+         * and recovery paths send on the same UDP socket. */
         ret = (int)sceNetInetRecvfrom(ctrl_socket,
                                           recv_buf,
                                           sizeof(recv_buf),
-                                          0,
+                                          MSG_DONTWAIT,
                                           (struct sockaddr *)&src,
                                           &src_len);
 
         if (ret <= 0 || ret < 4) {
+            sceKernelDelayThread(2000);
             continue;
         }
 
@@ -1007,7 +1027,7 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                 if (need_ack) {
                     int ack_len = build_ack_packet(ack_buf,
                                                    sizeof(ack_buf),
-                                                   peer_header, 
+                                                   peer_header,
                                                    channel_id,
                                                    rel_seq,
                                                    recv_sent_time);
@@ -1015,7 +1035,7 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                         /* FIXED: Use server_addr instead of src — PSP recvfrom
                          * does not reliably populate sin_port, so ACKs were
                          * going to port 0 (nowhere) and Sunshine timed us out. */
-                        int ack_tx = (int)sceNetInetSendto(ctrl_socket, ack_buf, ack_len, 0,
+                        int ack_tx = (int)sceNetInetSendto(ctrl_socket, ack_buf, ack_len, MSG_DONTWAIT,
                                          (struct sockaddr *)&server_addr, sizeof(server_addr));
                         /* Log ACK failures and DISCONNECT ACKs only */
                         if (ack_tx < 0) {
@@ -1060,6 +1080,7 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                 /* ── DISCONNECT (4): 8 bytes — server is disconnecting us ── */
                 if (cmd_num == ENET_CMD_DISCONNECT) {
                     if (p + 8 > end) break;
+#ifndef RETAIL_BUILD
                     {
                         unsigned int disc_data = (p + 8 <= end) ?
                             (((unsigned int)p[4] << 24) | ((unsigned int)p[5] << 16) |
@@ -1069,6 +1090,7 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                         ctrl_log("[CTRL RX] Raw disconnect bytes: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                                  p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
                     }
+#endif
                     /* Don't kill the session immediately.  Sunshine may
                      * disconnect because the IDR decode took longer than
                      * its 10-second frame-ACK timeout.  The decode thread
@@ -1140,7 +1162,7 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                                      * Without the app-level echo, Sunshine retransmits
                                      * hello indefinitely then disconnects after 5s. */
                                     int tx = (int)sceNetInetSendto(
-                                                ctrl_socket, reply_buf, reply_len, 0,
+                                                ctrl_socket, reply_buf, reply_len, MSG_DONTWAIT,
                                                 (const struct sockaddr *)&server_addr,
                                                 sizeof(server_addr));
                                     /* Store in retransmit buffer for gap recovery */
@@ -1156,6 +1178,14 @@ static int ctrl_recv_thread(SceSize args, void *argp)
                                     } else {
                                         ctrl_log("[CTRL RX] 0x010E server-hello: echoed %d bytes tx=%d\n",
                                                  echo_len, tx);
+                                    }
+                                    if (!s_server_hello_seen) {
+                                        s_server_hello_seen = 1;
+                                        if (!g_idr_fully_decoded && g_last_good_frame == 0) {
+                                            ctrl_log("[CTRL RX] server-hello ready; forcing startup IDR\n");
+                                            control_stream_reset_idr_backoff();
+                                            control_stream_request_idr_startup();
+                                        }
                                     }
                                 } else {
                                     ctrl_log("[CTRL RX] 0x010E server-hello: reply build failed\n");
@@ -1320,8 +1350,8 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             unsigned short pkt_seq = 0;
             /* Single-fire + retransmit: rely on the retransmit buffer to fill
              * gaps from packet loss, rather than triple-firing every ping. */
-            tx = (int)sceNetInetSendto(ctrl_socket, pkt, pkt_len, 0,
-                             (struct sockaddr *)&dst, sizeof(dst));
+            tx = ctrl_sendto_with_diag(pkt, pkt_len, &dst,
+                                       "ctrl_ping", &s_ping_tx_failures);
             /* Store in retransmit buffer for gap recovery */
             if (tx > 0) {
                 pkt_get_channel_seq(pkt, pkt_len, &pkt_ch, &pkt_seq);
@@ -1341,86 +1371,12 @@ static int ctrl_ping_thread(SceSize args, void *argp)
         }
         count++;
 
-        /* ── Per-frame FEC status (0x5502) piggyback ───────────────
-         * Sunshine tracks client health via per-frame FEC status updates.
-         * The decode thread sends one when FEC submits a frame, but during
-         * long IDR decodes (11s on 333 MHz PSP) the decode thread blocks
-         * and no status updates reach the server.  By piggybacking a
-         * status update on every keepalive ping, Sunshine sees frame
-         * progress even while the IDR is still being decoded.  This
-         * prevents the 10-second "no frame ACK" disconnect.
-         *
-         * CRITICAL: Use the cached values from rtp_fec.c (g_fec_last_*)
-         * instead of zeros.  Sending highestReceivedSequenceNumber=0
-         * confuses Sunshine's flow control — the server interprets it as
-         * "client received no packets" and eventually stops sending video.
-         *
-         * STALL RECOVERY: When lgf is frozen (no new frames decoded),
-         * advance the piggybacked frame_index by 1 each second.  This
-         * prevents the server's pending-frame counter from growing past
-         * its threshold and permanently stopping video.  The server sees
-         * "client is slowly catching up" and keeps its send window open.
-         * Real frames resume once the IDR arrives and decoding restarts.
-         *
-         * Send every 5th ping (2/sec) to keep Sunshine's send window
-         * open during decode stalls. Was 1/sec but server's pending-frame
-         * counter outpaced our acks. */
-        if (ctrl_crypto_ready && (count % 5) == 0) {
-            extern volatile u16 g_fec_last_highest_seq;
-            extern volatile u16 g_fec_last_next_contig_seq;
-            extern volatile u16 g_fec_last_data_pkts;
-            extern volatile u16 g_fec_last_parity_pkts;
-            extern volatile u16 g_fec_last_recv_data;
-            extern volatile u16 g_fec_last_recv_parity;
-            extern volatile u16 g_fec_last_missing_before_highest;
-            extern volatile u8  g_fec_last_fec_pct;
-
-            /* Stall recovery: advance frame_index when lgf is frozen.
-             * This keeps the server's send window open.
-             * s_stall_advance resets to 0 when lgf changes.
-             *
-             * Advance rate: +60/sec (2x framerate) to give the server
-             * extra headroom in its pending-frame window.  At 1x (30/sec)
-             * the gap grew during decode stalls and killed the stream.
-             * Cap at 7200 (120s worth at 60/sec) to prevent overflow. */
-            static unsigned int s_piggy_last_lgf = 0;
-            static unsigned int s_stall_advance = 0;
-            unsigned int piggy_frame;
-
-            if (g_last_good_frame != s_piggy_last_lgf) {
-                /* lgf advanced — reset stall advance */
-                s_piggy_last_lgf = g_last_good_frame;
-                s_stall_advance = 0;
-            } else {
-                /* lgf frozen — advance by 30 each half-second (60/sec)
-                 * to outpace the server's frame counter (~30fps) and keep
-                 * Sunshine's send window comfortably open during stalls. */
-                s_stall_advance = 0;
-            }
-            piggy_frame = g_last_good_frame;
-
-            if (piggy_frame > 0 && g_fec_last_data_pkts > 0) {
-                control_stream_send_fec_status(
-                    piggy_frame,
-                    g_fec_last_highest_seq,      /* real highestReceivedSequenceNumber */
-                    g_fec_last_next_contig_seq,  /* real nextContiguousSequenceNumber */
-                    g_fec_last_missing_before_highest,
-                    g_fec_last_data_pkts,
-                    g_fec_last_parity_pkts,
-                    g_fec_last_recv_data,
-                    g_fec_last_recv_parity,
-                    g_fec_last_fec_pct,
-                    0,      /* multiFecBlockIndex */
-                    1       /* multiFecBlockCount */
-                );
-            }
-        }
-
-        /* ── Bandwidth estimation: compute throughput over 5s window ───
-         * Reports incoming bandwidth to the server via ENet BANDWIDTH_LIMIT
-         * so Sunshine can adjust encoding bitrate.  This closes the
-         * "no bandwidth estimation" gap vs. ENet's built-in tracking. */
-        if (count > 0 && (count % 50) == 0 && ctrl_socket >= 0) {
+        /* Bandwidth estimation: sample the real one-second media budget.
+         * Hardware runs proved adaptive ENet BANDWIDTH_LIMIT hints can starve
+         * Sunshine's RTP media path when the reported value falls below the
+         * video+audio+FEC floor. Keep this path as telemetry only; RTSP and
+         * Sunshine stream settings own encoder bitrate. */
+        if (count > 0 && (count % BW_REPORT_INTERVAL_TICKS) == 0 && ctrl_socket >= 0) {
             extern volatile u32 g_fec_total_bytes_received;
             u32 now_bw = sceKernelGetSystemTimeLow();
             u32 bytes_now = g_fec_total_bytes_received;
@@ -1429,20 +1385,25 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                 u32 dt_us = now_bw - s_bw_last_time_us;
                 u32 dbytes = bytes_now - s_bw_last_bytes;
                 if (dt_us > 100000) { /* at least 100ms elapsed */
-                    s_estimated_bw_bps = (u32)((u64)dbytes * 1000000ULL / (u64)dt_us);
+                    u32 instant_bw_bps = (u32)((u64)dbytes * 1000000ULL / (u64)dt_us);
+                    if (s_estimated_bw_bps == 0) {
+                        s_estimated_bw_bps = instant_bw_bps;
+                    } else {
+                        s_estimated_bw_bps =
+                            (s_estimated_bw_bps * BW_REPORT_EWMA_OLD_WEIGHT +
+                             instant_bw_bps * BW_REPORT_EWMA_NEW_WEIGHT) /
+                            (BW_REPORT_EWMA_OLD_WEIGHT + BW_REPORT_EWMA_NEW_WEIGHT);
+                    }
 
-                    /* Send BANDWIDTH_LIMIT to server.
-                     * Apply bandwidth report scaling (BW_REPORT_SCALE_PCT):
-                     *   100 = report exact measured bandwidth (default)
-                     *   120 = inflate 20% → server sends higher quality
-                     *    80 = deflate 20% → smaller frames, faster decode
-                     * Inflation risks WiFi congestion; deflation reduces quality
-                     * but lowers latency.  Tuned for 802.11b headroom. */
+                    /* Compute adaptive telemetry only. The PSP must not send
+                     * ENet BANDWIDTH_LIMIT here; the host already advertises
+                     * unlimited peer bandwidth and encoder bitrate belongs to
+                     * the RTSP/Sunshine stream settings path. */
                     {
-                        unsigned char bw_buf[20];
                         u32 reported_bw = s_estimated_bw_bps;
                         int sig_br_kbps = signal_strength_get_bitrate();
-                        u32 min_reported_bw = 30000; /* 240 kbps floor in bytes/sec */
+                        int floor_kbps = ADAPT_STREAM_FLOOR_KBPS;
+                        u32 min_reported_bw = (u32)ADAPT_STREAM_FLOOR_KBPS * 125U;
 #define BW_REPORT_SCALE_PCT 100  /* report the real PSP transport budget */
                         reported_bw = (u32)((u64)reported_bw * BW_REPORT_SCALE_PCT / 100);
                         /* Phase 5.9: Apply quality-based BW scaling */
@@ -1450,37 +1411,31 @@ static int ctrl_ping_thread(SceSize args, void *argp)
                         /* Cap by adaptive signal-strength controller target. */
                         if (sig_br_kbps > 0) {
                             u32 sig_cap_bps = (u32)sig_br_kbps * 125U;
+                            floor_kbps = signal_strength_get_adaptive_floor_kbps(sig_br_kbps);
+                            min_reported_bw = (u32)floor_kbps * 125U;
                             if (reported_bw > sig_cap_bps) {
                                 reported_bw = sig_cap_bps;
-                            }
-                            if (min_reported_bw > sig_cap_bps) {
-                                min_reported_bw = sig_cap_bps;
                             }
                         }
 
                         /* Avoid collapse-to-zero feedback loops during stalls.
                          * If we report near-zero BW, Sunshine can keep sending
-                         * tiny bursts forever and never recover decoder cadence. */
+                         * tiny bursts forever and never recover decoder cadence.
+                         * Hold a small PSP recovery floor, not the full adaptive
+                         * cap, so loss recovery can actually reduce encoder work. */
                         if (reported_bw < min_reported_bw) {
                             reported_bw = min_reported_bw;
                         }
-                        int bw_len = build_bandwidth_limit(bw_buf, sizeof(bw_buf),
-                                                           reported_bw, 0);
-                        if (bw_len > 0) {
-                            int bw_tx = (int)sceNetInetSendto(ctrl_socket, bw_buf, bw_len, 0,
-                                                              (struct sockaddr *)&dst, sizeof(dst));
-                            if (bw_tx < 0 && (count <= 10 || (count % 300) == 0)) {
-                                ctrl_log("[CTRL BW] send failed errno=%d\n", sceNetInetGetErrno());
-                            }
-                        }
 
-                        if (count <= 10 || (count % 300) == 0) {
-                            ctrl_log("[CTRL BW] raw=%ukbps scaled=%ukbps (x%d%% qscale=%d%% sig_cap=%dkbps) rto=%uus\n",
+                        if (count <= 10 || (count % 50) == 0 || reported_bw < s_estimated_bw_bps) {
+                            ctrl_log("[CTRL BW] inst=%ukbps ewma=%ukbps telemetry=%ukbps (x%d%% qscale=%d%% sig_cap=%dkbps floor=%dkbps) rto=%uus enet_hint=off\n",
+                                     instant_bw_bps * 8 / 1000,
                                      s_estimated_bw_bps * 8 / 1000,
                                      reported_bw * 8 / 1000,
                                      BW_REPORT_SCALE_PCT,
                                      s_quality_bw_scale_pct,
                                      sig_br_kbps,
+                                     floor_kbps,
                                      s_rto_us);
                         }
                     }
@@ -1493,11 +1448,13 @@ static int ctrl_ping_thread(SceSize args, void *argp)
             update_connection_quality(s_estimated_bw_bps);
         }
 
-        if (count % 50 == 0) { /* 50 × 100ms = 5 seconds */
-            if (!g_idr_fully_decoded) {
-                /* Startup-only assist: request IDR while stream is still
-                 * bootstrapping. Once frames are flowing, avoid forced IDR
-                 * churn that can create large keyframe bursts on weak WiFi. */
+        if (!g_idr_fully_decoded) {
+            if (g_last_good_frame == 0 && (count % 5) == 0) {
+                if ((count % 10) == 0) {
+                    ctrl_log("[CTRL PING] startup IDR assist fast (lgf=0)\n");
+                }
+                control_stream_request_idr_startup();
+            } else if (count % 50 == 0) { /* 50 x 100ms = 5 seconds */
                 if (g_last_good_frame < 120) {
                     ctrl_log("[CTRL PING] startup IDR assist (lgf=%u)\n", g_last_good_frame);
                     control_stream_request_idr();
@@ -1591,7 +1548,7 @@ int control_stream_send_fec_status(unsigned int frame_index,
                                    unsigned char  multi_fec_cnt)
 {
     unsigned char pkt[192];
-    unsigned char payload[23];  /* SS_FRAME_FEC_STATUS is 23 bytes, all BE */
+    unsigned char payload[23];  /* SS_FRAME_FEC_STATUS is 21 bytes, all BE */
     int pkt_len;
     static unsigned int s_fec_tx_failures = 0;
 
@@ -1673,22 +1630,25 @@ int control_stream_send_input(const unsigned char *payload, int payload_len,
  * ══════════════════════════════════════════════════════════════════ */
 int control_stream_request_idr(void)
 {
-    /* With intra-refresh active, suppress IDR requests.  IDR keyframes are
-     * 65KB+ (63 packets) and WiFi drops 20-50%.  Intra-refresh P-frames
-     * are ~1KB (1-2 packets), easily recovered by FEC, and progressively
-     * repaint the picture within ~10 frames.  Requesting IDR here creates
-     * a vicious cycle: corrupt IDR → request another → corrupt again. */
-    if (g_intra_refresh_active) {
+    int startup_wait = (!g_idr_fully_decoded && g_last_good_frame == 0);
+    int strict_idr_wait = rtp_reassembly_waiting_for_idr();
+
+    /* Only suppress soft IDRs after host intra-refresh has been proven in
+     * runtime evidence.  False positives leave PSP stuck on a frozen frame
+     * because watchdog recovery cannot trigger a fresh reference. */
+    if (g_intra_refresh_active && !startup_wait && !strict_idr_wait) {
+        if (s_intra_idr_suppressed < 5 ||
+            (s_intra_idr_suppressed % 60U) == 0) {
+            ctrl_log("[CTRL] IDR request suppressed; intra-refresh active (count=%u)\n",
+                     s_intra_idr_suppressed + 1U);
+        }
+        s_intra_idr_suppressed++;
         return 0;
     }
 
-    /* NOTE: We intentionally do NOT suppress IDR requests when
-     * g_idr_fully_decoded is set.  moonlight-common-c sends IDR requests
-     * freely whenever recovery is needed.  Our old guard here silently
-     * ate all IDR requests after the first successful decode, making
-     * watchdog recovery impossible (server only sends P-frames without
-     * an IDR request).  The rate limiter below (2/sec) is sufficient
-     * to prevent flooding. */
+    /* Outside proven intra-refresh mode, do not suppress IDR requests just because
+     * g_idr_fully_decoded is set.  The old guard ate all post-startup IDR
+     * requests and made watchdog recovery impossible. */
 
     extern void rtp_reassembly_flush_partial_frame(void);
 
@@ -1707,28 +1667,33 @@ int control_stream_request_idr(void)
      * Starts at 500ms, doubles on consecutive requests up to 2s max.
      * On successful IDR decode, gently relaxes (halves) instead of a hard
      * reset to avoid bursty request loops on borderline WiFi.
-     * First 2 requests bypass throttle for rapid initial recovery. */
+     * Only the first request bypasses throttle; later callers coalesce while
+     * a keyframe request is already in flight. */
     {
-        static u64 s_last_idr_tick = 0;
-        static int s_idr_count = 0;
-        static u32 s_idr_backoff_us = 500000; /* start at 500ms */
-        static int s_idr_prev_decoded = 0;
         u64 now;
         sceRtcGetCurrentTick(&now);
 
         /* Relax backoff when an IDR decode succeeds */
         if (g_idr_fully_decoded && !s_idr_prev_decoded) {
+#ifndef RETAIL_BUILD
             u32 prev_backoff = s_idr_backoff_us;
+#endif
             if (s_idr_backoff_us > 500000)
                 s_idr_backoff_us /= 2;
             if (s_idr_backoff_us < 500000)
                 s_idr_backoff_us = 500000;
+#ifndef RETAIL_BUILD
             ctrl_log("[IDR BACKOFF] relax %ums -> %ums (IDR decoded ok, count=%d)\n",
                      prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
+#endif
         }
         s_idr_prev_decoded = g_idr_fully_decoded;
 
-        if (s_idr_count >= 2 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < s_idr_backoff_us) {
+        if (startup_wait && s_idr_backoff_us > 500000) {
+            s_idr_backoff_us = 500000;
+        }
+
+        if (s_idr_count >= 1 && s_last_idr_tick != 0 && (now - s_last_idr_tick) < s_idr_backoff_us) {
             ctrl_log("[IDR BACKOFF] throttled (backoff=%ums count=%d)\n",
                      s_idr_backoff_us / 1000, s_idr_count);
             return 0; /* throttled — recent IDR already in flight */
@@ -1736,14 +1701,21 @@ int control_stream_request_idr(void)
         s_last_idr_tick = now;
         s_idr_count++;
 
-        /* Exponential backoff: double interval after each send, cap at 2s. */
-        if (s_idr_count >= 2) {
+        /* Normal playback uses exponential backoff. Startup holds a fixed
+         * 500 ms cadence because no incoming P-frame is usable before the
+         * first SPS/IDR sync point.
+         */
+        if (!startup_wait && s_idr_count >= 2) {
+#ifndef RETAIL_BUILD
             u32 prev_backoff = s_idr_backoff_us;
+#endif
             s_idr_backoff_us *= 2;
             if (s_idr_backoff_us > 2000000)
                 s_idr_backoff_us = 2000000;
+#ifndef RETAIL_BUILD
             ctrl_log("[IDR BACKOFF] %ums -> %ums (count=%d)\n",
                      prev_backoff / 1000, s_idr_backoff_us / 1000, s_idr_count);
+#endif
         }
     }
 
@@ -1773,6 +1745,46 @@ int control_stream_request_idr(void)
     return (ret_urgent > 0) ? 0 : -3;
 }
 
+int control_stream_request_idr_force(void)
+{
+    u64 now;
+    int startup_wait = (!g_idr_fully_decoded && g_last_good_frame == 0);
+
+    sceRtcGetCurrentTick(&now);
+    if (!startup_wait) {
+        if (s_last_idr_tick != 0 && (now - s_last_idr_tick) < 2000000) {
+            ctrl_log("[IDR BACKOFF] force coalesced post-startup (last=%ums ago count=%d)\n",
+                     (u32)((now - s_last_idr_tick) / 1000), s_idr_count);
+            return 0;
+        }
+        if (s_idr_backoff_us < 2000000) {
+            s_idr_backoff_us = 2000000;
+        }
+        return control_stream_request_idr();
+    }
+
+    if (s_last_idr_tick != 0 && (now - s_last_idr_tick) < 500000) {
+        ctrl_log("[IDR BACKOFF] force coalesced (last=%ums ago count=%d)\n",
+                 (u32)((now - s_last_idr_tick) / 1000), s_idr_count);
+        return 0;
+    }
+
+    /* Hard recovery still sends immediately when no keyframe request is in
+     * flight, but it must not emit duplicate same-frame requests. */
+    s_idr_count = 0;
+    s_idr_backoff_us = 500000;
+    return control_stream_request_idr();
+}
+
+int control_stream_request_idr_startup(void)
+{
+    if (g_idr_fully_decoded || g_last_good_frame != 0) {
+        return 0;
+    }
+
+    return control_stream_request_idr_force();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * Request Reference Frame Invalidation (RFI)
  *
@@ -1797,6 +1809,10 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
         return -1;
     }
 
+    /* Rate-limit RFI aggressively on PSP-1000 WiFi.  Do not discard the
+     * skipped range: merge it and let the ping thread flush one bounded
+     * RFI request after the interval, matching common-c's queue/merge shape
+     * without adding another PSP worker thread. */
     /* Rate-limit RFI aggressively on PSP-1000 WiFi.  Dropped P-frames are
      * already concealed locally; RFI is useful, but frequent urgent sends
      * can create recovery bursts that cost more packets than they save. */
@@ -1804,7 +1820,7 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
         static u64 s_last_rfi_tick = 0;
         u64 now;
         sceRtcGetCurrentTick(&now);
-        if (s_last_rfi_tick != 0 && (now - s_last_rfi_tick) < 1000000) {
+        if (s_last_rfi_tick != 0 && (now - s_last_rfi_tick) < 500000) {
             return 0;
         }
         s_last_rfi_tick = now;
@@ -1832,6 +1848,12 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
 
     ret_urgent = ctrl_sendto_with_diag(send_buf, pkt_len, &g_server_addr,
                                        "rfi_req", &s_rfi_tx_failures);
+    if (ret_urgent > 0) {
+        unsigned char rch = 0;
+        unsigned short rseq = 0;
+        pkt_get_channel_seq(send_buf, pkt_len, &rch, &rseq);
+        retx_store(send_buf, pkt_len, rch, rseq);
+    }
 
     ctrl_log("[CTRL] RFI request (0x0301) frames %u-%u urgent=%d\n",
              start_frame, end_frame, ret_urgent);
@@ -1850,6 +1872,8 @@ int control_stream_start(void)
     static int pkt_len, ret, attempt;
     static unsigned short recv_sent_time;
     static struct timeval tv;
+    static struct sockaddr_in recv_src;
+    static int have_recv_src;
 
     recv_sent_time = 0;
 
@@ -1865,6 +1889,7 @@ int control_stream_start(void)
      * Prevents stale frame IDs from causing initial video to be dropped. */
     g_last_good_frame = 0;
     g_received_disconnect = 0;
+    s_server_hello_seen = 0;
 
     if (!g_remote_input_key_valid) {
         ctrl_log("[CTRL] missing remote input key (launch rikey)\n");
@@ -1930,7 +1955,7 @@ int control_stream_start(void)
         sceNetInetSetsockopt(ctrl_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         sceNetInetSetsockopt(ctrl_socket, SOL_SOCKET, 0x1002 /* SO_RCVBUF */, &rcvbuf, sizeof(rcvbuf));
         sceNetInetSetsockopt(ctrl_socket, SOL_SOCKET, 0x1001 /* SO_SNDBUF */, &sndbuf, sizeof(sndbuf));
-        
+
         memset(&my_bind, 0, sizeof(my_bind));
         my_bind.sin_len    = (unsigned char)sizeof(my_bind);
         my_bind.sin_family = AF_INET;
@@ -1940,9 +1965,23 @@ int control_stream_start(void)
             my_bind.sin_addr.s_addr = htonl(INADDR_ANY);
         }
         my_bind.sin_port   = htons(57999);
-        if (sceNetInetBind(ctrl_socket, (struct sockaddr *)&my_bind, sizeof(my_bind)) != 0) {
-            ctrl_log("[CTRL] bind() to 57999 failed\n");
+        int bind_ret = sceNetInetBind(ctrl_socket, (struct sockaddr *)&my_bind, sizeof(my_bind));
+        if (bind_ret != 0) {
+            ctrl_log("[CTRL] bind() to 57999 failed errno=%d\n", sceNetInetGetErrno());
             /* non-fatal, OS will assign an ephemeral port, but IP might be wrong on loopback */
+        }
+        {
+            struct sockaddr_in local_addr;
+            socklen_t local_len = sizeof(local_addr);
+            memset(&local_addr, 0, sizeof(local_addr));
+            if (sceNetInetGetsockname(ctrl_socket, (struct sockaddr *)&local_addr, &local_len) == 0) {
+                ctrl_log("[CTRL] local UDP %s:%u advertised=57999 bind_ret=%d\n",
+                         inet_ntoa(local_addr.sin_addr),
+                         (unsigned)ntohs(local_addr.sin_port),
+                         bind_ret);
+            } else {
+                ctrl_log("[CTRL] getsockname failed after bind errno=%d\n", sceNetInetGetErrno());
+            }
         }
     }
 
@@ -1960,7 +1999,15 @@ int control_stream_start(void)
 
     /* ── Step 1: Send ENet CONNECT, wait for VERIFY_CONNECT ─────── */
     pkt_len = build_connect_packet(send_buf, sizeof(send_buf));
-    ctrl_log("[CTRL] CONNECT pkt=%d bytes, connectID=%u\n", pkt_len, my_connect_id);
+    if (pkt_len >= 52) {
+        ctrl_log("[CTRL] CONNECT pkt=%d bytes, connectID=%u connectData=%u data_be=%02X%02X%02X%02X\n",
+                 pkt_len, my_connect_id, g_control_connect_data,
+                 send_buf[pkt_len - 4], send_buf[pkt_len - 3],
+                 send_buf[pkt_len - 2], send_buf[pkt_len - 1]);
+    } else {
+        ctrl_log("[CTRL] CONNECT build failed pkt=%d connectData=%u\n",
+                 pkt_len, g_control_connect_data);
+    }
 
     for (attempt = 0; attempt < 5; attempt++) {
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
@@ -1978,18 +2025,31 @@ int control_stream_start(void)
         {
             int poll_loops;
             ret = -1;
+            have_recv_src = 0;
+            memset(&recv_src, 0, sizeof(recv_src));
             for (poll_loops = 0; poll_loops < 200; poll_loops++) {
                 struct sockaddr_in src;
                 socklen_t src_len = sizeof(src);
                 int r = (int)sceNetInetRecvfrom(ctrl_socket, recv_buf,
                             sizeof(recv_buf), MSG_DONTWAIT,
                             (struct sockaddr *)&src, &src_len);
-                if (r > 0) { ret = r; break; }
+                if (r > 0) {
+                    ret = r;
+                    recv_src = src;
+                    have_recv_src = 1;
+                    break;
+                }
                 sceKernelDelayThread(10000); /* 10ms × 200 = 2s max */
             }
         }
         if (ret > 0) {
-            ctrl_log("[CTRL] recv %d bytes\n", ret);
+            if (have_recv_src) {
+                ctrl_log("[CTRL] recv %d bytes from %s:%u\n",
+                         ret, inet_ntoa(recv_src.sin_addr),
+                         (unsigned)ntohs(recv_src.sin_port));
+            } else {
+                ctrl_log("[CTRL] recv %d bytes\n", ret);
+            }
             if (parse_verify_connect(recv_buf, ret, &recv_sent_time) == 0)
                 break;
         } else {
@@ -2027,7 +2087,7 @@ int control_stream_start(void)
 
     sceKernelDelayThread(50000); /* 50 ms settle */
 
-    /* ── Step 3: Send START_A (type 0x0305, payload 00 00) ──────── */
+    /* ── Step 3: Send START_A/initial-IDR (type 0x0302, payload 00 00) ─ */
     {
         unsigned char sa_payload[] = { 0x00, 0x00 };
         /* Reset all per-channel reliable sequences for start of stream */
@@ -2038,7 +2098,7 @@ int control_stream_start(void)
         }
         retx_clear(); /* Reset retransmit buffer after seq reset */
         pkt_len = build_encrypted_control_msg(send_buf, sizeof(send_buf),
-                                              CTRL_TYPE_START_A, sa_payload, 2, CTRL_CHANNEL_URGENT);
+                                              CTRL_TYPE_START_A, sa_payload, 2, CTRL_CHANNEL_GENERIC);
         if (pkt_len <= 0) {
             ctrl_log("[CTRL] START_A build failed\n");
             sceNetInetClose(ctrl_socket);
@@ -2053,10 +2113,16 @@ int control_stream_start(void)
         }
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
+        if (ret > 0) {
+            unsigned char rch = 0;
+            unsigned short rseq = 0;
+            pkt_get_channel_seq(send_buf, pkt_len, &rch, &rseq);
+            retx_store(send_buf, pkt_len, rch, rseq);
+        }
         if (ret < 0) {
             ctrl_log("[CTRL] START_A sent=%d errno=%d\n", ret, sceNetInetGetErrno());
         } else {
-            ctrl_log("[CTRL] START_A sent=%d\n", ret);
+            ctrl_log("[CTRL] START_A sent=%d ch=0\n", ret);
         }
     }
 
@@ -2081,10 +2147,16 @@ int control_stream_start(void)
         }
         ret = (int)sceNetInetSendto(ctrl_socket, send_buf, pkt_len, 0,
                                     (struct sockaddr *)&dst, sizeof(dst));
+        if (ret > 0) {
+            unsigned char rch = 0;
+            unsigned short rseq = 0;
+            pkt_get_channel_seq(send_buf, pkt_len, &rch, &rseq);
+            retx_store(send_buf, pkt_len, rch, rseq);
+        }
         if (ret < 0) {
             ctrl_log("[CTRL] START_B sent=%d errno=%d\n", ret, sceNetInetGetErrno());
         } else {
-            ctrl_log("[CTRL] START_B sent=%d\n", ret);
+            ctrl_log("[CTRL] START_B sent=%d ch=0\n", ret);
         }
     }
 
@@ -2189,6 +2261,7 @@ int control_stream_start(void)
 void control_stream_abort(void)
 {
     ctrl_running = 0;
+    g_intra_refresh_active = 0;
     if (ctrl_socket >= 0) {
         sceNetInetClose(ctrl_socket);
         ctrl_socket = -1;
@@ -2204,7 +2277,7 @@ ConnQualityState control_stream_get_quality(void)
     return s_conn_quality;
 }
 
-/* Called from the ping thread every 5 seconds to recompute quality.
+/* Called from the ping thread every second to recompute quality.
  * Uses FEC counters, frame rate, and bandwidth estimate. */
 static void update_connection_quality(u32 estimated_bw_bps)
 {
@@ -2214,7 +2287,7 @@ static void update_connection_quality(u32 estimated_bw_bps)
     extern volatile u32 g_fec_recovery_attempts;
 
     u32 now_us = sceKernelGetSystemTimeLow();
-    u32 dt_us = (s_quality_prev_time_us != 0) ? (now_us - s_quality_prev_time_us) : 5000000;
+    u32 dt_us = (s_quality_prev_time_us != 0) ? (now_us - s_quality_prev_time_us) : 1000000;
     if (dt_us == 0) dt_us = 1;
 
     /* Delta FEC stats since last update */
@@ -2247,6 +2320,8 @@ static void update_connection_quality(u32 estimated_bw_bps)
     sw_decoder_get_stats(&decoded_now, &dropped_now);
     u32 d_frames = decoded_now - s_quality_prev_decoded;
     u32 fps = (d_frames * 1000000) / dt_us;
+    int transport_idle = 0;
+    int startup_idle = 0;
     {
         u32 total_frame_events = d_frames + d_dropped;
         if (total_frame_events > 0) {
@@ -2267,11 +2342,35 @@ static void update_connection_quality(u32 estimated_bw_bps)
         }
     }
 
+    /* A no-traffic window after playback starts is not "perfect" just because
+     * there were no failed FEC attempts. Before the first decoded frame, keep
+     * the baseline cap stable instead of feeding a startup idle window back as
+     * packet loss. */
+    if (estimated_bw_bps < 4096 &&
+        d_frames == 0 &&
+        d_dropped == 0 &&
+        total_fec_pkts == 0 &&
+        d_attempts == 0) {
+        if (decoded_now == 0) {
+            startup_idle = 1;
+            loss_rate_x10 = 0;
+            recovery_pct = 100;
+        } else {
+            transport_idle = 1;
+            loss_rate_x10 = 1000;
+            recovery_pct = 0;
+        }
+    }
+
     /* Classify transport quality from transport signals only.
      * Decoder FPS is reported separately, but it must not drive bitrate
      * collapse when the network path is healthy. */
     ConnQuality q;
-    if (loss_rate_x10 < 10 && recovery_pct >= 99) {
+    if (startup_idle) {
+        q = CONN_QUALITY_FAIR;       /* do not collapse BW before first frame */
+    } else if (transport_idle) {
+        q = CONN_QUALITY_CRITICAL;   /* no video/audio packets in this window */
+    } else if (loss_rate_x10 < 10 && recovery_pct >= 99) {
         q = CONN_QUALITY_EXCELLENT;  /* <1.0% loss, near-perfect recovery */
     } else if (loss_rate_x10 < 30 && recovery_pct >= 97) {
         q = CONN_QUALITY_GOOD;       /* <3.0% loss */
@@ -2297,7 +2396,9 @@ static void update_connection_quality(u32 estimated_bw_bps)
         static ConnQuality s_pending_quality = CONN_QUALITY_FAIR;
         static int s_consecutive_at_pending = 0;
         static ConnQuality s_committed_quality = CONN_QUALITY_FAIR;
+#ifndef RETAIL_BUILD
         static const char * const q_names[] = { "EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL" };
+#endif
 
         if (q == s_pending_quality) {
             s_consecutive_at_pending++;
@@ -2309,14 +2410,16 @@ static void update_connection_quality(u32 estimated_bw_bps)
         {
             int required_consecutive = 3;
             if (q > s_committed_quality) {
-                if (d_dropped > 0)
+                if (transport_idle || d_dropped >= 2)
                     required_consecutive = 1;
                 else
-                    required_consecutive = (q >= CONN_QUALITY_CRITICAL) ? 1 : 2;
+                    required_consecutive = 2;
             }
             if (s_consecutive_at_pending >= required_consecutive && q != s_committed_quality) {
-            ctrl_log("[PHASE5-QUALITY] transition: %s -> %s (consecutive=%d)\n",
+#ifndef RETAIL_BUILD
+            ctrl_log("[QUALITY] committed: %s -> %s (consecutive=%d)\n",
                      q_names[s_committed_quality], q_names[q], s_consecutive_at_pending);
+#endif
 
             /* Phase 5.9: Scale BW reports on quality transitions.
              * POOR/CRITICAL → halve reported BW to make server reduce encoding.
@@ -2336,6 +2439,7 @@ static void update_connection_quality(u32 estimated_bw_bps)
     }
 
     /* Log raw quality state transitions (pre-hysteresis for diagnostics) */
+#ifndef RETAIL_BUILD
     {
         static ConnQuality s_prev_q = CONN_QUALITY_FAIR;
         static const char * const q_names[] = { "EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL" };
@@ -2347,16 +2451,17 @@ static void update_connection_quality(u32 estimated_bw_bps)
             s_prev_q = q;
         }
     }
+#endif
 
-    /* Periodic quality stats every 30s (6 updates at 5s interval) */
+    /* Periodic quality stats every 30s (30 updates at 1s interval) */
     {
         static u32 s_quality_log_count = 0;
         s_quality_log_count++;
-        if (s_quality_log_count % 6 == 0) {
-            ctrl_log("[QUALITY] q=%d loss=%u.%u%% fec=%u%% fps=%u bw=%ukbps d_rec=%u d_fail=%u d_drop=%u\n",
+        if (s_quality_log_count % 30 == 0) {
+            ctrl_log("[QUALITY] q=%d loss=%u.%u%% fec=%u%% fps=%u bw=%ukbps d_rec=%u d_fail=%u d_drop=%u idle=%d\n",
                      (int)q, loss_rate_x10 / 10, loss_rate_x10 % 10,
                      recovery_pct, fps, estimated_bw_bps / 125,
-                     d_recovered, d_failed, d_dropped);
+                     d_recovered, d_failed, d_dropped, transport_idle);
         }
     }
 
@@ -2384,6 +2489,7 @@ void control_stream_stop(void)
     SceUInt timeout = 2000000; /* 2 seconds */
 
     ctrl_running = 0;
+    g_intra_refresh_active = 0;
 
     /* ── Graceful ENet DISCONNECT with linger ──────────────────────
      * Send a proper ENet DISCONNECT command before closing the socket.

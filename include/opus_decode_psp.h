@@ -1,4 +1,4 @@
-/* opus_decode_psp.h - Opus multistream decoder interface (48 kHz stereo, fixed-point) */
+/* opus_decode_psp.h - Opus decoder interface (48 kHz mono PSP output, fixed-point) */
 #ifndef OPUS_DECODE_PSP_H
 #define OPUS_DECODE_PSP_H
 
@@ -8,11 +8,11 @@
 extern "C" {
 #endif
 
-/* Initialize Opus multistream decoder for Moonlight stereo audio.
+/* Initialize Opus decoder for Moonlight audio.
  * sample_rate: 48000
- * channels: 2
+ * channels: 1 for the low-work PSP decode/output path
  * streams: 1
- * coupled_streams: 1
+ * coupled_streams: 0 for mono
  * Returns 0 on success, -1 on failure */
 int opus_psp_init(int sample_rate, int channels, int streams, int coupled_streams);
 

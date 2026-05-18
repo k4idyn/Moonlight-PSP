@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <string.h>
 
+#define DIAG_LOG_IMPLEMENTATION
 #include "diag_log.h"
 
 /* ---------- debug/retail toggle ---------- */
@@ -26,8 +27,15 @@ int g_debug_logging = 1;  /* debug: logs on by default */
 
 void diag_log_set_debug(int enable)
 {
+#ifdef RETAIL_BUILD
+    (void)enable;
+    g_debug_logging = 0;
+#else
     g_debug_logging = enable ? 1 : 0;
+#endif
 }
+
+#ifndef RETAIL_BUILD
 
 /* ---------- paths ---------- */
 #define LOG_PATH_MS    "ms0:/moonlight.log"
@@ -95,10 +103,17 @@ static void flush_locked(void)
     s_last_flush_us = sceKernelGetSystemTimeLow();
 }
 
+#endif /* !RETAIL_BUILD */
+
 /* ---------- public API ---------- */
 
 void diag_log_write(const char *tag, const char *fmt, ...)
 {
+#ifdef RETAIL_BUILD
+    (void)tag;
+    (void)fmt;
+    return;
+#else
     va_list ap;
     char   line[LOG_LINE_MAX];
     int    len;
@@ -156,18 +171,26 @@ void diag_log_write(const char *tag, const char *fmt, ...)
     }
 
     sceKernelSignalSema(s_sem, 1);
+#endif
 }
 
 void diag_log_flush(void)
 {
+#ifdef RETAIL_BUILD
+    return;
+#else
     ensure_init();
     if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
     flush_locked();
     sceKernelSignalSema(s_sem, 1);
+#endif
 }
 
 void diag_log_clear(void)
 {
+#ifdef RETAIL_BUILD
+    return;
+#else
     ensure_init();
     if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
 
@@ -186,4 +209,5 @@ void diag_log_clear(void)
 #endif
 
     sceKernelSignalSema(s_sem, 1);
+#endif
 }

@@ -23,7 +23,7 @@ NVENC is NVIDIA's hardware video encoder built into GeForce GTX 600+ and Quadro/
 | P6 | Slow | Very good | Near-maximum quality |
 | P7 | Slowest | Best | Maximum quality, highest latency |
 
-**PSP recommendation:** `1` (P1). At 368×208, the quality differences between presets are invisible. P1 gives the lowest encoding latency.
+**PSP recommendation:** `1` (P1). At the v1.2 PSP preset sizes, the quality differences between presets are invisible. P1 gives the lowest encoding latency.
 
 ---
 
@@ -39,7 +39,7 @@ NVENC is NVIDIA's hardware video encoder built into GeForce GTX 600+ and Quadro/
 | `quarter_res` | Quick pre-pass at 1/4 resolution — good balance |
 | `full_res` | Full pre-pass at full resolution — best bitrate accuracy, slower |
 
-**PSP recommendation:** `quarter_res` or `disabled`. The two-pass mode helps the encoder distribute bits more evenly across the frame, but at 368×208 the difference is minimal.
+**PSP recommendation:** `quarter_res` or `disabled`. The two-pass mode helps the encoder distribute bits more evenly across the frame, but at the v1.2 PSP preset sizes the difference is minimal.
 
 ---
 
@@ -139,7 +139,7 @@ nvenc_latency_over_power = enabled
 nvenc_h264_cavlc = enabled
 nvenc_opengl_vulkan_on_dxgi = enabled
 qp = 28
-fec_percentage = 20
+fec_percentage = 35
 ```
 
 ## Notes

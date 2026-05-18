@@ -64,6 +64,42 @@ static int g_signal_log_counter = 0;
 static SignalState g_signal_state = { 0 };
 static int g_initialized = 0;
 
+int signal_strength_get_adaptive_floor_kbps(int base_bitrate_kbps)
+{
+    int floor;
+
+    if (base_bitrate_kbps <= 0)
+        return BITRATE_MIN_KBPS;
+
+    /* Do not pin PSP-1000 low-res presets to the configured target. Hardware
+     * logs showed 384 kbps runs collapsing to zero media while the control
+     * stream still advertised a 288-320 kbps floor. Let the host back off far
+     * enough for RTSP/RFI recovery to send small IDR frames, then earn bitrate
+     * back through the slow-recovery path. */
+    if (base_bitrate_kbps <= 256)
+        floor = 96;
+    else if (base_bitrate_kbps <= 320)
+        floor = 128;
+    else if (base_bitrate_kbps <= 384)
+        floor = 160;
+    else if (base_bitrate_kbps <= 512)
+        floor = 192;
+    else {
+        floor = (base_bitrate_kbps * 2) / 5;
+        if (floor < 224)
+            floor = 224;
+    }
+
+    if (floor < ADAPT_STREAM_FLOOR_KBPS)
+        floor = ADAPT_STREAM_FLOOR_KBPS;
+    if (floor > base_bitrate_kbps)
+        floor = base_bitrate_kbps;
+    if (floor < BITRATE_MIN_KBPS)
+        floor = BITRATE_MIN_KBPS;
+
+    return floor;
+}
+
 /*============================================================================
  * Helper: Convert RSSI to Percentage
  *============================================================================*/
@@ -143,7 +179,10 @@ void signal_strength_init(int base_bitrate_kbps)
 
     /* Phase 4: Adaptive bitrate controller init */
     g_signal_state.adapt_consecutive_drops = 0;
+    g_signal_state.adapt_drop_events = 0;
     g_signal_state.adapt_last_green_time = 0;
+    g_signal_state.adapt_cooldown_until = 0;
+    g_signal_state.adapt_cooldown_cap = base_bitrate_kbps;
     g_signal_state.adapt_in_recovery = 0;
     g_signal_state.adapt_prev_bitrate = base_bitrate_kbps;
     g_signal_state.rssi_history_idx = 0;
@@ -166,6 +205,8 @@ int signal_strength_update(void)
     int cq_score = 50;
     int fec_score = 50;
     int error, derivative, pid_output, delta_kbps;
+    ConnQualityState cq_snapshot = { CONN_QUALITY_FAIR, 0, 100, 0, 0, 0 };
+    int cq_valid = 0;
 
     if (!g_initialized)
         return g_signal_state.current_bitrate;
@@ -235,10 +276,7 @@ int signal_strength_update(void)
                 else
                     g_signal_state.current_trend = SIGNAL_TREND_STABLE;
                 if (g_signal_state.current_trend != prev_trend) {
-                    pspDebugScreenPrintf("[PHASE4-WIFI] trend: %s\n",
-                        g_signal_state.current_trend == SIGNAL_TREND_IMPROVING ? "IMPROVING" :
-                        g_signal_state.current_trend == SIGNAL_TREND_DEGRADING ? "DEGRADING" : "STABLE");
-                    diag_log_write("SIG", "[PHASE4-WIFI] trend: %s (recent=%d older=%d jitter=%u)\n",
+                    diag_log_write("SIG", "[WIFI] trend: %s (recent=%d older=%d jitter=%u)\n",
                         g_signal_state.current_trend == SIGNAL_TREND_IMPROVING ? "IMPROVING" :
                         g_signal_state.current_trend == SIGNAL_TREND_DEGRADING ? "DEGRADING" : "STABLE",
                         recent_avg, older_avg, avg_jitter);
@@ -249,6 +287,8 @@ int signal_strength_update(void)
 
     {
         ConnQualityState cq = control_stream_get_quality();
+        cq_snapshot = cq;
+        cq_valid = 1;
 
         /* Map ConnQuality enum to 0-100 scale */
         switch (cq.quality) {
@@ -344,7 +384,8 @@ int signal_strength_update(void)
      * dynamic ceiling, dead-zone to prevent oscillation. */
     {
         int adapt_ceiling;
-        int adapt_floor = BITRATE_MIN_KBPS;
+        int adapt_floor = signal_strength_get_adaptive_floor_kbps(g_signal_state.base_bitrate);
+        int had_drop_events = g_signal_state.adapt_drop_events;
 
         /* Dynamic ceiling: min(4000, signal_quality * 50) */
         adapt_ceiling = composite_quality * ADAPT_CEILING_QUALITY_MULT;
@@ -353,14 +394,12 @@ int signal_strength_update(void)
         if (adapt_ceiling < adapt_floor)
             adapt_ceiling = adapt_floor;
 
-        /* Fast-drop: 3+ consecutive unrecoverable → halve bitrate */
+        /* Fast-drop: 3+ consecutive unrecoverable -> halve bitrate */
         if (g_signal_state.adapt_consecutive_drops >= ADAPT_FAST_DROP_THRESHOLD) {
             int halved = g_signal_state.current_bitrate / 2;
             if (halved < adapt_floor) halved = adapt_floor;
             if (halved < g_signal_state.current_bitrate) {
-                pspDebugScreenPrintf("[PHASE4-ADAPT] fast-drop: %d->%d kbps\n",
-                                    g_signal_state.current_bitrate, halved);
-                diag_log_write("SIG", "[PHASE4-ADAPT] fast-drop: %d -> %d kbps (drops=%d)\n",
+                diag_log_write("SIG", "[ADAPT] fast-drop: %d -> %d kbps (drops=%d)\n",
                                g_signal_state.current_bitrate, halved,
                                g_signal_state.adapt_consecutive_drops);
                 g_signal_state.current_bitrate = halved;
@@ -368,57 +407,99 @@ int signal_strength_update(void)
             g_signal_state.adapt_consecutive_drops = 0;
             g_signal_state.adapt_in_recovery = 0;
             g_signal_state.adapt_last_green_time = 0;
+            g_signal_state.adapt_cooldown_until = current_time + ADAPT_DROP_COOLDOWN_US;
+            g_signal_state.adapt_cooldown_cap = g_signal_state.current_bitrate;
         }
 
-        /* Slow-recover: +25kbps/s when all signals green for 5s */
-        if (composite_quality >= SIGNAL_GOOD &&
+        /* Real PSP Wi-Fi can lose isolated frames inside an otherwise moving
+         * stream. Do not throttle the encoder for a single recovered RFI/FEC
+         * event; require a burst before lowering the cap. */
+        if (g_signal_state.adapt_drop_events > 0) {
+            int events = g_signal_state.adapt_drop_events;
+            if (events >= 2) {
+                int reduction = g_signal_state.current_bitrate / (events >= 3 ? 4 : 8);
+                if (reduction < 32) reduction = 32;
+                g_signal_state.current_bitrate -= reduction;
+                if (g_signal_state.current_bitrate < adapt_floor)
+                    g_signal_state.current_bitrate = adapt_floor;
+                diag_log_write("SIG", "[ADAPT] drop-window: -%d kbps events=%d -> %d kbps\n",
+                               reduction, events, g_signal_state.current_bitrate);
+                g_signal_state.adapt_last_green_time = 0;
+                g_signal_state.adapt_in_recovery = 0;
+                g_signal_state.adapt_cooldown_until = current_time + ADAPT_DROP_COOLDOWN_US;
+                g_signal_state.adapt_cooldown_cap = g_signal_state.current_bitrate;
+            } else {
+                diag_log_write("SIG", "[ADAPT] isolated drop-window ignored events=%d bitrate=%d kbps\n",
+                               events, g_signal_state.current_bitrate);
+            }
+            g_signal_state.adapt_drop_events = 0;
+        }
+
+        if (g_signal_state.adapt_cooldown_until != 0 &&
+            (s32)(current_time - g_signal_state.adapt_cooldown_until) < 0) {
+            if (g_signal_state.current_bitrate > g_signal_state.adapt_cooldown_cap) {
+                g_signal_state.current_bitrate = g_signal_state.adapt_cooldown_cap;
+            }
+            g_signal_state.adapt_last_green_time = 0;
+        } else if (g_signal_state.adapt_cooldown_until != 0) {
+            g_signal_state.adapt_cooldown_until = 0;
+        }
+
+        /* Slow-recover after a clean post-drop cooldown and green holdoff. */
+        if (g_signal_state.adapt_cooldown_until == 0 &&
+            composite_quality >= SIGNAL_GOOD &&
             g_signal_state.adapt_consecutive_drops == 0) {
             if (g_signal_state.adapt_last_green_time == 0)
                 g_signal_state.adapt_last_green_time = current_time;
             if ((current_time - g_signal_state.adapt_last_green_time)
                 >= ADAPT_GREEN_HOLDOFF_US) {
+#ifndef RETAIL_BUILD
                 int old_br = g_signal_state.current_bitrate;
+#endif
                 g_signal_state.current_bitrate += ADAPT_SLOW_RECOVER_KBPS;
+                if (g_signal_state.current_bitrate > adapt_ceiling)
+                    g_signal_state.current_bitrate = adapt_ceiling;
+                if (g_signal_state.current_bitrate > g_signal_state.base_bitrate)
+                    g_signal_state.current_bitrate = g_signal_state.base_bitrate;
                 if (!g_signal_state.adapt_in_recovery) {
-                    pspDebugScreenPrintf("[PHASE4-ADAPT] slow-recover start\n");
-                    diag_log_write("SIG", "[PHASE4-ADAPT] slow-recover: %d -> %d kbps\n",
+#ifndef RETAIL_BUILD
+                    diag_log_write("SIG", "[ADAPT] slow-recover: %d -> %d kbps\n",
                                    old_br, g_signal_state.current_bitrate);
+#endif
                     g_signal_state.adapt_in_recovery = 1;
                 }
             }
         } else {
             g_signal_state.adapt_last_green_time = 0;
             if (g_signal_state.adapt_in_recovery) {
-                diag_log_write("SIG", "[PHASE4-ADAPT] recovery paused (q=%d drops=%d)\n",
+                diag_log_write("SIG", "[ADAPT] recovery paused (q=%d drops=%d)\n",
                                composite_quality, g_signal_state.adapt_consecutive_drops);
                 g_signal_state.adapt_in_recovery = 0;
             }
         }
 
-        /* IDR avoidance: proactive reduction when quality trending down */
-        if (g_signal_state.current_trend == SIGNAL_TREND_DEGRADING) {
+        /* IDR avoidance: proactive reduction when quality is actually losing
+         * packets. RSSI/jitter trend alone was driving the 20fps baseline down
+         * to the 192kbps floor during static or startup windows. */
+        if (g_signal_state.current_trend == SIGNAL_TREND_DEGRADING &&
+            cq_valid &&
+            (had_drop_events > 0 || cq_snapshot.loss_rate_pct >= 80)) {
             int reduction = g_signal_state.current_bitrate / 10;
             if (reduction < 25) reduction = 25;
             g_signal_state.current_bitrate -= reduction;
-            pspDebugScreenPrintf("[PHASE4-ADAPT] IDR-avoid: -%d kbps\n", reduction);
+            diag_log_write("SIG", "[ADAPT] IDR-avoid: -%d kbps\n", reduction);
         }
 
-        /* Dead-zone: +/-15% stability band */
-        {
-            int prev = g_signal_state.adapt_prev_bitrate;
-            int diff = g_signal_state.current_bitrate - prev;
-            int threshold = (prev * ADAPT_DEADZONE_PCT) / 100;
-            if (threshold < 10) threshold = 10;
-            if (diff > -threshold && diff < threshold && diff != 0) {
-                g_signal_state.current_bitrate = prev;
-            } else {
-                g_signal_state.adapt_prev_bitrate = g_signal_state.current_bitrate;
-            }
-        }
+        /* Recovery is already rate limited above. Do not dead-zone small
+         * upward steps: baseline runs pinned at the post-loss cap and kept
+         * macroblocking after the link returned to green. */
+        g_signal_state.adapt_prev_bitrate = g_signal_state.current_bitrate;
 
         /* Final clamp to adaptive floor/ceiling */
         if (g_signal_state.current_bitrate < adapt_floor)
             g_signal_state.current_bitrate = adapt_floor;
+        /* No green floor here: PSP Wi-Fi needs to hold the post-loss cap
+         * until the explicit slow-recovery path earns bitrate back. */
         if (g_signal_state.current_bitrate > adapt_ceiling)
             g_signal_state.current_bitrate = adapt_ceiling;
         if (g_signal_state.current_bitrate > g_signal_state.base_bitrate)
@@ -498,6 +579,8 @@ void signal_strength_report_frame_drop(void)
     if (!g_initialized)
         return;
     g_signal_state.adapt_consecutive_drops++;
+    if (g_signal_state.adapt_drop_events < 1000)
+        g_signal_state.adapt_drop_events++;
 }
 
 void signal_strength_report_frame_ok(void)

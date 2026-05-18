@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <math.h>
 
+#include "diag_log.h"
+
+#define stub_log(fmt, ...) diag_log_write("STUB", fmt, ##__VA_ARGS__)
+
 /*============================================================================
  * PSP newlib fixups - isfinitef referenced by libm but not exported
  *============================================================================*/
@@ -97,7 +101,7 @@ int pairing_init(PairingSession *session, const char *server_ip,
     strncpy(session->unique_id, unique_id ? unique_id : "", 31);
     strncpy(session->device_name, device_name ? device_name : "", 63);
     session->state = PAIR_STATE_IDLE;
-    pspDebugScreenPrintf("[STUB] pairing_init() OK\n");
+    stub_log("pairing_init() OK\n");
     return 0;
 }
 
@@ -107,7 +111,7 @@ int pairing_init(PairingSession *session, const char *server_ip,
 int pairing_start(PairingSession *session)
 {
     if (!session) return -1;
-    pspDebugScreenPrintf("[STUB] pairing_start() — mbedTLS not available\n");
+    stub_log("pairing_start() unavailable\n");
     session->state = PAIR_STATE_FAILED;
     session->result = PAIR_RESULT_NETWORK_ERROR;
     snprintf(session->error_message, sizeof(session->error_message),
@@ -122,7 +126,7 @@ PairingResult pairing_verify_pin(PairingSession *session, const char *pin)
 {
     (void)pin;
     if (!session) return PAIR_RESULT_FAILED;
-    pspDebugScreenPrintf("[STUB] pairing_verify_pin() — not available\n");
+    stub_log("pairing_verify_pin() unavailable\n");
     return PAIR_RESULT_FAILED;
 }
 

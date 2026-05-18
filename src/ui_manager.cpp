@@ -69,7 +69,7 @@ static const u32 s_theme_sels[10] = {
     0xFF483828u, 0xFF603050u, 0xFF404040u, 0xFF306020u, 0xFF302040u
 };
 
-/* 1, 2, 4, 6, 9 -> Serif (Sunset, Forest, Golden, Desert, Midnight) 
+/* 1, 2, 4, 6, 9 -> Serif (Sunset, Forest, Golden, Desert, Midnight)
  * 0, 3, 5, 7, 8 -> Sans */
 void ui_apply_theme(int index) {
     if (index < 0 || index >= 10) index = 0;
@@ -489,9 +489,9 @@ void ui_begin_frame(void)
     sceGuClear(GU_COLOR_BUFFER_BIT);
 
     /* Sync the C-side texture-state tracker with the hardware state we
-     * just forced above.  Without this reset (set to 0 because we just 
-     * called sceGuDisable), tex_disable/tex_enable guards will skip the 
-     * actual sceGu calls on real hardware because they think the state 
+     * just forced above.  Without this reset (set to 0 because we just
+     * called sceGuDisable), tex_disable/tex_enable guards will skip the
+     * actual sceGu calls on real hardware because they think the state
      * is already what they want. */
     s_tex_enabled = 0;
 
@@ -578,7 +578,7 @@ UIEvent ui_process_input(void)
 
     /* Log button transitions with high-resolution timestamps for latency analysis */
     if (buttons != s_prev_buttons) {
-        diag_log_write("UI", "Button transition: 0x%08X -> 0x%08X (XOR: 0x%08X)", 
+        diag_log_write("UI", "Button transition: 0x%08X -> 0x%08X (XOR: 0x%08X)",
                        s_prev_buttons, buttons, buttons ^ s_prev_buttons);
     }
 
@@ -794,7 +794,7 @@ void ui_draw_rect(int x, int y, int w, int h, u32 color)
 void ui_draw_rect_batch(int num_rects, const int *rects, u32 color)
 {
     if (num_rects <= 0) return;
-    
+
     ColorVert *v = (ColorVert *)sceGuGetMemory(num_rects * 2 * sizeof(ColorVert));
     if (!v) return;
 
@@ -803,7 +803,7 @@ void ui_draw_rect_batch(int num_rects, const int *rects, u32 color)
         v[2*i].x = (float)rects[i*4 + 0];
         v[2*i].y = (float)rects[i*4 + 1];
         v[2*i].z = 0.0f;
-        
+
         v[2*i+1].color = color;
         v[2*i+1].x = (float)(rects[i*4 + 0] + rects[i*4 + 2]);
         v[2*i+1].y = (float)(rects[i*4 + 1] + rects[i*4 + 3]);
@@ -847,12 +847,12 @@ void ui_draw_rect_rounded(int x, int y, int w, int h, int r, u32 color)
     ADD_RECT(x + r, y, w - 2*r, h);
     ADD_RECT(x, y + r, r, h - 2*r);
     ADD_RECT(x + w - r, y + r, r, h - 2*r);
-    
+
     /* Simple, fast hardware-friendly corner plotting */
     for (int i = 0; i < r; i++) {
         int dx = r - 1;
         while (dx * dx + (r - i) * (r - i) > r * r && dx > 0) dx--;
-        
+
         ADD_RECT(x + r - dx, y + i, dx, 1); /* TL */
         ADD_RECT(x + w - r, y + i, dx, 1); /* TR */
         ADD_RECT(x + r - dx, y + h - 1 - i, dx, 1); /* BL */
@@ -867,7 +867,7 @@ void ui_draw_rect_rounded(int x, int y, int w, int h, int r, u32 color)
     // Small corner glisten bits
     ui_draw_rect(x + r - 2, y + 2, 2, 1, 0x30FFFFFFu);
     ui_draw_rect(x + w - r, y + 2, 2, 1, 0x30FFFFFFu);
-    
+
     /* Wii-Style Soft Bottom Shadow (Depth illusion) */
     ui_draw_rect(x + r, y + h - 2, w - 2*r, 1, 0x30000000u); // Bottom edge bevel
     ui_set_blend(0);
@@ -941,7 +941,7 @@ void ui_draw_hollow_rect_rounded(int x, int y, int w, int h, int r, int t, u32 c
         /* The bezel is the difference between inner and outer circles */
         int start_x = r - dx_out;
         int width   = dx_out - dx_in;
-        
+
         if (width > 0) {
             ADD_CORNER_RECT(x + start_x, y + i, width, 1); /* TL */
             ADD_CORNER_RECT(x + w - r + dx_in, y + i, width, 1); /* TR */
@@ -952,7 +952,7 @@ void ui_draw_hollow_rect_rounded(int x, int y, int w, int h, int r, int t, u32 c
 #undef ADD_CORNER_RECT
 
     ui_draw_rect_batch(count, rects, color);
-    
+
     /* Subtle 3D highlight on inner cut-out edge of bezel */
     ui_draw_rect(x + r, y + t - 1, w - 2*r, 1, 0x30000000u); /* Inner dark shadow */
 
@@ -961,7 +961,7 @@ void ui_draw_hollow_rect_rounded(int x, int y, int w, int h, int r, int t, u32 c
     /* Small corner glisten bits */
     ui_draw_rect(x + r - 2, y + 2, 2, 1, 0x30FFFFFFu);
     ui_draw_rect(x + w - r, y + 2, 2, 1, 0x30FFFFFFu);
-    
+
     /* Wii-Style Soft Bottom Shadow (Depth illusion) */
     ui_draw_rect(x + r, y + h - 2, w - 2*r, 1, 0x30000000u); /* Bottom edge bevel */
 
@@ -984,7 +984,7 @@ float ui_draw_text(float x, float y, u32 color, const char *text)
         static int logged = 0;
         if (!logged) {
 #ifndef RETAIL_BUILD
-            SceUID fd = sceIoOpen("ms0:/moonlight_debug.log", 
+            SceUID fd = sceIoOpen("ms0:/moonlight_debug.log",
                                   PSP_O_WRONLY | PSP_O_APPEND | PSP_O_CREAT, 0644);
             if (fd >= 0) {
                 const char *msg = "[CRITICAL] s_font is NULL in ui_draw_text — falling back to BMF\n";
@@ -1031,7 +1031,7 @@ float ui_draw_text_right(float right_margin_x, float y, u32 color, const char *t
 {
     if (!text) return right_margin_x;
     if (!s_font) return right_margin_x;
-    
+
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
     intraFontSetStyle(s_font, 0.48f, color, 0, INTRAFONT_ALIGN_LEFT); /* Match header font size */
@@ -1532,7 +1532,7 @@ void ui_draw_progress_bar(int x, int y, int w, int h,
         float fval = (value < 0.0f) ? 0.0f : (value > max ? max : value);
         float ratio = fval / max;
         int fw = (int)(ratio * (float)w);
-        
+
         if (fw > 2) {
             /* Draw rounded fill: width must be at least h for proper rounding,
                but we can draw a clipped version for small progresses. */
@@ -1570,7 +1570,7 @@ void ui_draw_spinner(int x, int y, const char *label)
     float dw = 32.0f; /* Fallback width for dots */
     float lw = 0.0f;
     float scale = (s_font == s_font_serif) ? 0.50f : 0.45f;
-    
+
     if (s_font) {
         intraFontSetStyle(s_font, scale, UI_COL_TEXT_DIM, 0, INTRAFONT_ALIGN_LEFT);
         dw = intraFontMeasureText(s_font, dot_chars[s_spinner_frame]);
@@ -1605,16 +1605,55 @@ void ui_draw_texture_placeholder(int x, int y, int w, int h,
     u32 bg  = focused ? UI_COL_CARD_SEL : UI_COL_CARD;
     u32 brd = focused ? UI_COL_BORDER_FOC : UI_COL_BORDER;
     u32 tc  = focused ? UI_COL_TEXT_FOCUS  : UI_COL_TEXT_DIM;
+    int is_desktop = 0;
 
     int t = focused ? 2 : 1;
     ui_draw_rect_rounded(x, y, w, h, 12, brd); /* Outer border */
     ui_draw_rect_rounded(x + t, y + t, w - 2*t, h - 2*t, 12 - t, bg); /* Inner body */
 
-    /* Centred "game controller" icon: rounded pill shapes */
-    int icon_x = x + w/2 - 8;
-    int icon_y = y + h/2 - 10;
-    ui_draw_rect_rounded(icon_x,     icon_y,     16, 10, 4, UI_COL_BORDER);
-    ui_draw_rect_rounded(icon_x + 4, icon_y - 3,  4, 4,  2, UI_COL_BORDER);
+    if (title && title[0]) {
+        const char *d = "desktop";
+        int k;
+        is_desktop = 1;
+        for (k = 0; d[k] != '\0'; k++) {
+            char a = title[k];
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a + 32);
+            if (a != d[k]) {
+                is_desktop = 0;
+                break;
+            }
+        }
+        if (title[k] != '\0')
+            is_desktop = 0;
+    }
+
+    if (is_desktop) {
+        int mon_w = (w * 58) / 100;
+        int mon_h = (h * 28) / 100;
+        int mon_x = x + (w - mon_w) / 2;
+        int mon_y = y + h / 2 - mon_h / 2 - 10;
+        int stand_w = mon_w / 7;
+        int stand_h = 12;
+        int stand_x = x + w / 2 - stand_w / 2;
+        int stand_y = mon_y + mon_h + 3;
+        int base_w = mon_w / 2;
+        int base_x = x + w / 2 - base_w / 2;
+
+        ui_draw_rect_rounded(mon_x, mon_y, mon_w, mon_h, 5, brd);
+        ui_draw_rect_rounded(mon_x + 3, mon_y + 3, mon_w - 6, mon_h - 6, 3, 0xFF182321u);
+        ui_draw_rect(mon_x + 8, mon_y + 9, mon_w - 16, 2, UI_COL_ACCENT);
+        ui_draw_rect(mon_x + 8, mon_y + 16, (mon_w - 20) / 2, 2, UI_COL_TEXT_DIM);
+        ui_draw_rect(mon_x + mon_w / 2 + 2, mon_y + 16, (mon_w - 20) / 2, 2, UI_COL_TEXT_DIM);
+        ui_draw_rect_rounded(stand_x, stand_y, stand_w, stand_h, 2, brd);
+        ui_draw_rect_rounded(base_x, stand_y + stand_h - 1, base_w, 5, 2, brd);
+    } else {
+        /* Centered fallback glyph for non-desktop placeholders. */
+        int icon_x = x + w/2 - 8;
+        int icon_y = y + h/2 - 10;
+        ui_draw_rect_rounded(icon_x,     icon_y,     16, 10, 4, UI_COL_BORDER);
+        ui_draw_rect_rounded(icon_x + 4, icon_y - 3,  4, 4,  2, UI_COL_BORDER);
+    }
 
     /* Game title below the icon */
     if (title && title[0]) {
@@ -1646,7 +1685,7 @@ void ui_draw_texture_placeholder(int x, int y, int w, int h,
  */
 
 void ui_draw_texture_rgb565(int x, int y, int dw, int dh,
-                             void *tex_data, int sw, int sh, 
+                             void *tex_data, int sw, int sh,
                              int tw, int th, int focused)
 {
     if (!tex_data) {
@@ -1702,7 +1741,7 @@ void ui_draw_texture_rgb565(int x, int y, int dw, int dh,
 }
 
 void ui_draw_texture_rounded_rgb565(int x, int y, int dw, int dh, int r,
-                                    void *tex_data, int sw, int sh, 
+                                    void *tex_data, int sw, int sh,
                                     int tw, int th, int focused)
 {
     if (!tex_data) {
@@ -1748,7 +1787,7 @@ void ui_draw_texture_rounded_rgb565(int x, int y, int dw, int dh, int r,
     for (int i = 0; i < r; i++) {
         int dx = r - 1;
         while (dx * dx + (r - i) * (r - i) > r * r && dx > 0) dx--;
-        
+
         ADD_TEX_RECT(x + r - dx, y + i, dx, 1);
         ADD_TEX_RECT(x + dw - r, y + i, dx, 1);
         ADD_TEX_RECT(x + r - dx, y + dh - 1 - i, dx, 1);

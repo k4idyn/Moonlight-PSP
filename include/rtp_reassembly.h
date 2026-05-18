@@ -25,7 +25,7 @@
 
 /**
  * Process a single RTP packet from the network
- * 
+ *
  * This function parses RTP + NV_VIDEO_PACKET headers and reassembles frame
  * payload. When a frame is complete, it calls decode_nal() automatically.
  *
@@ -46,11 +46,22 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len);
  */
 void rtp_reassembly_reset(void);
 
+/* Tell the depacketizer a frame was lost so it can drop normal P-frames
+ * until Sunshine sends a post-RFI recovery frame. */
+void rtp_reassembly_note_frame_loss(u32 start_frame, u32 end_frame);
+
+/* Non-zero while the depacketizer is dropping P-frames until a true IDR
+ * frame arrives. Used by FEC to avoid sending contradictory RFI requests. */
+int rtp_reassembly_waiting_for_idr(void);
+
 /* Replayed frames captured before decoder_ready and now ready. */
 void rtp_reassembly_flush_pre_ready_frames(void);
 
 /* Flush partially assembled frame (e.g. on START_A request) */
 void rtp_reassembly_flush_partial_frame(void);
+
+/* Clear stale partial state before FEC resubmits a recovered frame. */
+void rtp_reassembly_prepare_fec_frame(u32 frame_id);
 
 /* Host processing latency extracted from Sunshine frame headers (microseconds).
  * Updated per-frame when Sunshine type-0x01 headers are present. */

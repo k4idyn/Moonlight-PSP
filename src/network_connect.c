@@ -38,6 +38,7 @@
 #include "diag_log.h"
 #include "net_send.h"
 #include "signal_strength.h"
+#include "control_stream.h"
 #define pair_log(fmt, ...) diag_log_write("NET", fmt, ##__VA_ARGS__)
 
 #ifndef CLIENT_CERT_SIG_LEN
@@ -48,9 +49,10 @@ extern int network_me_reserve_client_port(unsigned short *out_port);
 extern int network_me_send_video_ping_burst(const char *server_ip,
                                             int server_port,
                                             const char *ping_payload);
+extern void network_me_shutdown(void);
 
-/* GU owns VRAM during UI flows; debug-screen writes cause visible corruption. */
-#define pspDebugScreenPrintf(...) ((void)0)
+/* GU owns VRAM during UI flows; route legacy debug prints to the log only. */
+#define pspDebugScreenPrintf(...) pair_log(__VA_ARGS__)
 
 #define MBEDTLS_CONFIG_FILE "mbedtls_psp_config.h"
 #include "mbedtls/ctr_drbg.h"
@@ -76,6 +78,33 @@ extern int network_me_send_video_ping_burst(const char *server_ip,
 #define SUNSHINE_RTSP_PORT_PRIMARY   MOONLIGHT_RTSP_PORT
 #define SUNSHINE_RTSP_PORT_FALLBACK  MOONLIGHT_RTSP_PORT_LEGACY
 #define CLIENT_UNIQUE_ID    client_identity_get_uid() /* 16-char unique device ID   */
+
+#ifndef PSP_VIDEO_FEC_PERCENT
+#define PSP_VIDEO_FEC_PERCENT 35
+#endif
+
+/* Build-time stream controls. Defaults keep the source-selected low-work
+ * values; explicit overrides make each binary's SDP policy reproducible. */
+#ifndef PSP_VIDEO_FEC_MIN_REQUIRED
+#define PSP_VIDEO_FEC_MIN_REQUIRED 1
+#endif
+
+#ifndef PSP_AUDIO_PACKET_DURATION_MS
+#define PSP_AUDIO_PACKET_DURATION_MS 60
+#endif
+
+#ifndef PSP_LOW_AUDIO_CONFIGURED_ADD_KBPS
+/* Baseline 144p/20 PSP-1000 video-budget correction. 112 kbps and the
+ * measured full audio+FEC addback both raised useful video bits but regressed
+ * packet survival on hardware, so the source default remains the stable floor. */
+#define PSP_LOW_AUDIO_CONFIGURED_ADD_KBPS 96
+#endif
+
+#ifndef PSP_VIDEO_INTRA_REFRESH
+/* -1 = auto, 0 = force disabled, 1 = force enabled */
+#define PSP_VIDEO_INTRA_REFRESH -1
+#endif
+
 #define DEVICE_NAME         "roth"             /* Device name for pairing    */
 
 extern PspConfig g_psp_config;
@@ -84,10 +113,20 @@ extern PspConfig g_psp_config;
 #define HTTP_BUF_SIZE       4096
 #define RTSP_BUF_SIZE       4096
 #define SDP_BUF_SIZE        2048
-#define RTSP_CONNECT_TIMEOUT_MS 10000
-#define RTSP_RECV_TIMEOUT_MS    5000
-#define RTSP_CONNECT_MAX_RETRIES 3
+#define RTSP_CONNECT_TIMEOUT_MS          1500
+/* Match moonlight-common-c's 10s RTSP launch-race window. Sunshine can return
+ * /launch 200 before the RTSP listener is reachable on weak PSP WiFi. */
+#define RTSP_POST_SETUP_CONNECT_TIMEOUT_MS 10000
+#define RTSP_SEND_TIMEOUT_MS             3000
+#define RTSP_RECV_TIMEOUT_MS             15000
+#define RTSP_DRAIN_TIMEOUT_MS            250
+#define RTSP_CONNECT_MAX_RETRIES         2
+#define RTSP_POST_SETUP_CONNECT_MAX_RETRIES 2
+#define RTSP_CONNECT_RETRY_DELAY_MS      500
 #define TLS_PIN_DIR         "ms0:/PSP/GAME/Moonlight/tls_pins"
+#define HTTPS_CONNECT_TIMEOUT_US    (5 * 1000 * 1000)
+#define HTTPS_HANDSHAKE_TIMEOUT_US  (8 * 1000 * 1000)
+#define HTTPS_IO_TIMEOUT_US         (6 * 1000 * 1000)
 
 /* RTSP CSeq counter (increments per request) */
 static int rtsp_cseq = 1;
@@ -116,16 +155,26 @@ static uint32_t g_rtsp_enc_tx_seq = 0;
 static mbedtls_gcm_context g_rtsp_gcm_ctx;
 
 /* Encryption capability advertised by the server in DESCRIBE SDP.
- * Parsed from "a=x-ss-general.encryptionSupported:<N>".
- * Sunshine typically sends 5 = SS_ENC_VIDEO(1) | SS_ENC_CONTROL_V2(4). */
+ * Parsed from "a=x-ss-general.encryptionSupported:<N>".  These values are
+ * common-c wire values and must not drift from Sunshine's RTSP contract. */
+#define SS_ENC_CONTROL_V2 0x01
+#define SS_ENC_VIDEO      0x02
+#define SS_ENC_AUDIO      0x04
+
+#define ML_FF_FEC_STATUS    0x01
+#define ML_FF_SESSION_ID_V1 0x02
+
+#define RTSP_ERR_PLAY_SESSION_DEAD (-610)
+
 static int g_encryption_supported = 0;
+static int g_encryption_requested = 0;
 
 /* avRiKeyId — first 4 bytes of the AV decryption IV for audio packets.
  * Set during /launch or /resume from the locally generated rikeyid. */
 unsigned int g_av_ri_key_id = 0;
 
 /* Whether audio AES-CBC encryption was negotiated with the server.
- * Set to 1 only if both the server and client agree on SS_ENC_AUDIO (bit 1).
+ * Set to 1 only if both the server and client agree on SS_ENC_AUDIO.
  * When 0, audio RTP payloads are raw Opus and must NOT be decrypted. */
 int g_audio_encryption_enabled = 0;
 
@@ -142,15 +191,33 @@ void network_set_local_bind_ip(const char *ip)
 
 static char g_rtsp_target_url[256] = "";
 static char g_rtsp_session_id[64] = "";
+static int s_retry_appid = -1;
+static char s_retry_host[16] = "";
+static char s_retry_title[64] = "";
 
 static int g_rtsp_port = SUNSHINE_RTSP_PORT_PRIMARY;
 static char g_rtsp_connect_host[64] = DEFAULT_SUNSHINE_HOST;
 static char g_rtsp_host_header[96] = DEFAULT_SUNSHINE_HOST;
 
+void network_connect_clear_retry_app(void)
+{
+    s_retry_appid = -1;
+    s_retry_host[0] = '\0';
+    s_retry_title[0] = '\0';
+}
+
 static void rtsp_update_host_header(void)
 {
-    /* Moonlight-common-c usually sends JUST the host in the Host: header. */
-    strncpy(g_rtsp_host_header, g_rtsp_connect_host, sizeof(g_rtsp_host_header) - 1);
+    /* Sunshine/GFE select the Opus bitrate tier from the RTSP Host header:
+     * a real local address requests high-quality audio, while 0.0.0.0
+     * requests the normal low-audio tier. Keep the TCP target
+     * in g_rtsp_connect_host, but advertise the low-audio Host value so audio
+     * stays inside the PSP-1000 802.11b budget.
+     *
+     * This mirrors moonlight-common-c's low-bitrate workaround for streams
+     * below the high-audio threshold. */
+    strncpy(g_rtsp_host_header, "0.0.0.0", sizeof(g_rtsp_host_header) - 1);
+    g_rtsp_host_header[sizeof(g_rtsp_host_header) - 1] = '\0';
 }
 
 
@@ -181,12 +248,53 @@ int network_auto_bind_for_loopback(const char *target_ip)
 }
 
 static char g_last_paired_host[16] = "";
+static int g_launch_wlan_ps_saved = -1;
+
+void wifi_launch_disable_power_save(void)
+{
+    int ps_val = -1;
+    int ret = sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                                          &ps_val);
+    if (ret == 0) {
+        if (g_launch_wlan_ps_saved < 0) {
+            g_launch_wlan_ps_saved = ps_val;
+        }
+        if (ps_val != PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF) {
+            ret = sceUtilitySetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                                              PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF);
+            pair_log("[WIFIPS] disabled for UI/launch (was=%d ret=%d)\n",
+                     ps_val, ret);
+        } else {
+            pair_log("[WIFIPS] already off for UI/launch\n");
+        }
+    } else {
+        pair_log("[WIFIPS] query failed for UI/launch (%d)\n", ret);
+    }
+}
+
+static void wifi_launch_restore_power_save(void)
+{
+    if (g_launch_wlan_ps_saved >= 0) {
+#ifdef RETAIL_BUILD
+        sceUtilitySetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                                    g_launch_wlan_ps_saved);
+#else
+        int ret = sceUtilitySetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE,
+                                              g_launch_wlan_ps_saved);
+        pair_log("[WIFIPS] restored UI/launch power save=%d ret=%d\n",
+                 g_launch_wlan_ps_saved, ret);
+#endif
+        g_launch_wlan_ps_saved = -1;
+    }
+}
 
 static void rtsp_rewrite_target_authority(const char *host, int port)
 {
     const char *scheme_end;
     const char *path_start;
     char path_part[160];
+    char scheme[16];
+    int scheme_len;
 
     if (!host || !host[0] || port <= 0) {
         return;
@@ -200,6 +308,14 @@ static void rtsp_rewrite_target_authority(const char *host, int port)
         return;
     }
 
+    scheme_len = (int)(scheme_end - g_rtsp_target_url);
+    if (scheme_len <= 0 || scheme_len >= (int)sizeof(scheme)) {
+        strcpy(scheme, "rtsp");
+    } else {
+        memcpy(scheme, g_rtsp_target_url, scheme_len);
+        scheme[scheme_len] = '\0';
+    }
+
     path_start = strchr(scheme_end + 3, '/');
     if (path_start && path_start[0]) {
         strncpy(path_part, path_start, sizeof(path_part) - 1);
@@ -209,7 +325,7 @@ static void rtsp_rewrite_target_authority(const char *host, int port)
     }
 
     snprintf(g_rtsp_target_url, sizeof(g_rtsp_target_url),
-             "rtsp://%s:%d%s", host, port, path_part);
+             "%s://%s:%d%s", scheme, host, port, path_part);
     rtsp_update_host_header();
 }
 
@@ -385,6 +501,26 @@ static int psp_bio_recv(void *ctx, unsigned char *buf, size_t len)
         return MBEDTLS_ERR_NET_RECV_FAILED;
     }
     return ret;
+}
+
+static void psp_tcp_close_bounded(int sock, int abortive)
+{
+    if (sock < 0) {
+        return;
+    }
+
+    if (abortive) {
+        struct linger lg = { 1, 0 };
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
+
+    {
+        int nb_close = 1;
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK,
+                             &nb_close, sizeof(nb_close));
+    }
+
+    sceNetInetClose(sock);
 }
 
 static void sha256_hex_upper(const unsigned char *in32, char *out65)
@@ -605,6 +741,7 @@ int https_launch_get(const char *host, int port,
     int sock = -1;
     int ret, nb;
     int connected = 0;
+    int tls_ready = 0;
     struct sockaddr_in addr;
 
     mbedtls_ssl_context ssl;
@@ -652,7 +789,7 @@ int https_launch_get(const char *host, int port,
         size_t pem_size = (hex_len / 2) + 1;
         char pem_buf[1536]; /* Typical Moonlight client cert is ~1KB */
         if (pem_size > sizeof(pem_buf)) { ret = -1; goto tls_cleanup; }
-        
+
         hex_to_bytes_lite(active_cert_hex, (unsigned char*)pem_buf, hex_len);
         pem_buf[pem_size - 1] = '\0';
 
@@ -715,7 +852,7 @@ int https_launch_get(const char *host, int port,
 
         FD_ZERO(&wfds);
         FD_SET(sock, &wfds);
-        tv.tv_sec  = 10;
+        tv.tv_sec  = HTTPS_CONNECT_TIMEOUT_US / 1000000;
         tv.tv_usec = 0;
 
         ret = sceNetInetSelect(sock + 1, NULL, &wfds, NULL, &tv);
@@ -732,7 +869,8 @@ int https_launch_get(const char *host, int port,
     }
 
     if (!connected) {
-        pair_log("[LAUNCH-TLS] connect timed out (10s)\n");
+        pair_log("[LAUNCH-TLS] connect timed out (%ds)\n",
+                 HTTPS_CONNECT_TIMEOUT_US / 1000000);
         ret = -1;
         goto tls_cleanup;
     }
@@ -792,13 +930,15 @@ int https_launch_get(const char *host, int port,
             pair_log("[LAUNCH-TLS] handshake failed: -0x%04X\n", -ret);
             goto tls_cleanup;
         }
-        if (sceKernelGetSystemTimeLow() - hs_t > 20000000) {
-            pair_log("[LAUNCH-TLS] handshake timed out (20s)\n");
+        if (sceKernelGetSystemTimeLow() - hs_t > HTTPS_HANDSHAKE_TIMEOUT_US) {
+            pair_log("[LAUNCH-TLS] handshake timed out (%ds)\n",
+                     HTTPS_HANDSHAKE_TIMEOUT_US / 1000000);
             goto tls_cleanup;
         }
         sceKernelDelayThread(5000); /* Reduced from 10ms for speed */
     }
     pair_log("[LAUNCH-TLS] TLS handshake OK\n");
+    tls_ready = 1;
 
     {
         unsigned int verify_flags = (unsigned int)mbedtls_ssl_get_verify_result(&ssl);
@@ -836,7 +976,7 @@ int https_launch_get(const char *host, int port,
                 pair_log("[LAUNCH-TLS] write failed: -0x%04X\n", -ret);
                 goto tls_cleanup;
             }
-            if (sceKernelGetSystemTimeLow() - wr_t > 10000000) {
+            if (sceKernelGetSystemTimeLow() - wr_t > HTTPS_IO_TIMEOUT_US) {
                 pair_log("[LAUNCH-TLS] write timed out\n");
                 goto tls_cleanup;
             }
@@ -852,7 +992,7 @@ int https_launch_get(const char *host, int port,
                                 raw_size - 1 - total);
         if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
             ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (sceKernelGetSystemTimeLow() - rd_t > 10000000) {
+            if (sceKernelGetSystemTimeLow() - rd_t > HTTPS_IO_TIMEOUT_US) {
                 pair_log("[LAUNCH-TLS] read timeout (%d bytes recv)\n", total);
                 break;
             }
@@ -894,7 +1034,21 @@ int https_launch_get(const char *host, int port,
     ret = (total > 0) ? 0 : -1;
 
 tls_cleanup:
-    mbedtls_ssl_close_notify(&ssl);
+    if (tls_ready) {
+        u32 close_start_us = sceKernelGetSystemTimeLow();
+        int close_ret;
+        do {
+            close_ret = mbedtls_ssl_close_notify(&ssl);
+            if (close_ret == 0) {
+                break;
+            }
+            if (close_ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                close_ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                break;
+            }
+            sceKernelDelayThread(5000);
+        } while (sceKernelGetSystemTimeLow() - close_start_us < 500000);
+    }
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_x509_crt_free(&clicert);
@@ -902,12 +1056,11 @@ tls_cleanup:
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
     if (sock >= 0) {
-        /* Force RST (not FIN) so kernel frees the address immediately.
-         * Without this, the PSP TCP stack enters TIME_WAIT and returns
-         * EADDRNOTAVAIL (errno 125) on ALL subsequent connect() calls. */
-        struct linger lg = { 1, 0 };
-        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-        sceNetInetClose(sock);
+        int abortive = (ret < 0 || !tls_ready);
+        if (abortive) {
+            pair_log("[LAUNCH-TLS] abortive socket close after failed HTTPS transaction\n");
+        }
+        psp_tcp_close_bounded(sock, abortive);
     }
     /* Removed free(raw) as it is now on stack */
 
@@ -928,6 +1081,7 @@ int https_launch_get_binary(const char *host, int port,
     int sock = -1;
     int ret, nb;
     int connected = 0;
+    int tls_ready = 0;
     struct sockaddr_in addr;
 
     mbedtls_ssl_context ssl;
@@ -1033,7 +1187,7 @@ int https_launch_get_binary(const char *host, int port,
         goto bin_cleanup;
     }
 
-    nb = 0;
+    nb = 1;
     sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
 
     ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
@@ -1069,6 +1223,7 @@ int https_launch_get_binary(const char *host, int port,
         if (sceKernelGetSystemTimeLow() - hs_t > 5000000) goto bin_cleanup;
         sceKernelDelayThread(10000);
     }
+    tls_ready = 1;
 
     {
         unsigned int verify_flags = (unsigned int)mbedtls_ssl_get_verify_result(&ssl);
@@ -1186,7 +1341,21 @@ int https_launch_get_binary(const char *host, int port,
     ret = body_len;
 
 bin_cleanup:
-    mbedtls_ssl_close_notify(&ssl);
+    if (tls_ready) {
+        u32 close_start_us = sceKernelGetSystemTimeLow();
+        int close_ret;
+        do {
+            close_ret = mbedtls_ssl_close_notify(&ssl);
+            if (close_ret == 0) {
+                break;
+            }
+            if (close_ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                close_ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                break;
+            }
+            sceKernelDelayThread(5000);
+        } while (sceKernelGetSystemTimeLow() - close_start_us < 500000);
+    }
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
     mbedtls_x509_crt_free(&clicert);
@@ -1194,9 +1363,7 @@ bin_cleanup:
     mbedtls_ctr_drbg_free(&ctr_drbg);
     mbedtls_entropy_free(&entropy);
     if (sock >= 0) {
-        struct linger lg = { 1, 0 };
-        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-        sceNetInetClose(sock);
+        psp_tcp_close_bounded(sock, (ret < 0 || !tls_ready));
     }
 
     return ret;
@@ -1281,10 +1448,14 @@ static int sunshine_launch_session(int target_appid)
     char session_url[256];
     char currentgame_val[16];
     char state_val[64];
+    char serverinfo_url[256];
+    int serverinfo_unknown = 0;
     int status_code;
     int current_game;
     int ret;
     int rikeyid;
+    int serverinfo_attempt;
+    int serverinfo_https_attempt;
 
     /* ------------------------------------------------------------------
      * Step A: Query /serverinfo to check if an app is already streaming.
@@ -1298,63 +1469,92 @@ static int sunshine_launch_session(int target_appid)
     snprintf(path, sizeof(path),
              "/serverinfo?uniqueid=%s&uuid=%s",
              CLIENT_UNIQUE_ID, client_identity_get_uuid());
-    pair_log("[SERVERINFO] GET https://%s:%d%s\n",
-             g_sunshine_host, SUNSHINE_HTTPS_PORT, path);
+    serverinfo_unknown = 1;
+    status_code = 0;
 
-    ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
-                           path, resp, sizeof(resp));
-    if (ret < 0) {
-        sceKernelDelayThread(2000 * 1000);
+    /* App list, launch, resume, and cancel all use authenticated HTTPS on
+     * Sunshine/Apollo. Probe serverinfo there first so a dead plain HTTP
+     * port does not strand the PSP at "Requesting Stream...". */
+    for (serverinfo_https_attempt = 1;
+         serverinfo_https_attempt <= 2;
+         serverinfo_https_attempt++) {
+        resp[0] = '\0';
+        pair_log("[SERVERINFO] GET https://%s:%d%s (attempt %d/2)\n",
+                 g_sunshine_host, SUNSHINE_HTTPS_PORT, path,
+                 serverinfo_https_attempt);
         ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
                                path, resp, sizeof(resp));
-        if (ret < 0) {
-            pair_log("[SERVERINFO] request failed\n");
-            return -1;
+        if (ret >= 0) {
+            status_code = xml_get_status_code_attr(resp);
+            if (status_code == 200) {
+                serverinfo_unknown = 0;
+                break;
+            }
+            pair_log("[SERVERINFO] HTTPS status=%d on attempt %d/2\n",
+                     status_code, serverinfo_https_attempt);
+        } else {
+            pair_log("[SERVERINFO] HTTPS request failed on attempt %d/2\n",
+                     serverinfo_https_attempt);
+        }
+
+        if (serverinfo_https_attempt < 2) {
+            sceKernelDelayThread(750 * 1000);
+        }
+    }
+
+    if (serverinfo_unknown) {
+        snprintf(serverinfo_url, sizeof(serverinfo_url),
+                 "http://%s:%d%s", g_sunshine_host, SUNSHINE_HTTP_PORT, path);
+
+        for (serverinfo_attempt = 1;
+             serverinfo_attempt <= 2;
+             serverinfo_attempt++) {
+            resp[0] = '\0';
+            pair_log("[SERVERINFO] GET %s (fallback attempt %d/2)\n",
+                     serverinfo_url, serverinfo_attempt);
+            ret = http_pair_get(serverinfo_url, resp, sizeof(resp));
+            if (ret >= 0) {
+                status_code = xml_get_status_code_attr(resp);
+                if (status_code == 200) {
+                    serverinfo_unknown = 0;
+                    break;
+                }
+                pair_log("[SERVERINFO] plain status=%d on attempt %d/2\n",
+                         status_code, serverinfo_attempt);
+            } else {
+                pair_log("[SERVERINFO] plain request failed on attempt %d/2\n",
+                         serverinfo_attempt);
+            }
+
+            if (serverinfo_attempt < 2) {
+                sceKernelDelayThread(750 * 1000);
+            }
         }
     }
 
     pair_log("[SERVERINFO] response body: %.300s\n", resp);
 
-    status_code = xml_get_status_code_attr(resp);
-    if (status_code != 200) {
-        pair_log("[SERVERINFO] unexpected status=%d\n", status_code);
-
-        if (status_code == 401) {
-            extern PspConfig g_psp_config;
-            pair_log("[SERVERINFO] 401 — clearing stale pairing\n");
-            g_is_paired = 0;
-            g_last_paired_host[0] = '\0';
-            /* Remove current target from paired list */
-            { int _pi; for (_pi = 0; _pi < g_psp_config.pairedHostCount; _pi++) {
-                if (strcmp(g_psp_config.pairedHostIps[_pi], g_sunshine_host) == 0) {
-                    int _pj; for (_pj = _pi; _pj < g_psp_config.pairedHostCount - 1; _pj++)
-                        memcpy(g_psp_config.pairedHostIps[_pj], g_psp_config.pairedHostIps[_pj+1], 16);
-                    memset(g_psp_config.pairedHostIps[g_psp_config.pairedHostCount - 1], 0, 16);
-                    g_psp_config.pairedHostCount--; break;
-                }
-            }}
-            saveConfig(&g_psp_config);
-            return -401;
-        }
-        return -1;
-    }
-
     current_game = 0;
-    if (xml_get_value_safe(resp, "currentgame", currentgame_val,
-                           sizeof(currentgame_val)) >= 0) {
-        current_game = atoi(currentgame_val);
-    }
-    /* Sunshine keeps currentgame set even after streaming ends; only treat
-     * it as active if the server state says BUSY (matching vita-moonlight). */
-    if (current_game > 0) {
-        if (xml_get_value_safe(resp, "state", state_val,
-                               sizeof(state_val)) >= 0) {
-            if (strstr(state_val, "_SERVER_BUSY") == NULL) {
-                current_game = 0;
+    if (serverinfo_unknown) {
+        pair_log("[SERVERINFO] currentgame unknown after retries; deferring /launch\n");
+        return -1;
+    } else {
+        if (xml_get_value_safe(resp, "currentgame", currentgame_val,
+                               sizeof(currentgame_val)) >= 0) {
+            current_game = atoi(currentgame_val);
+        }
+        /* Sunshine keeps currentgame set even after streaming ends; only treat
+         * it as active if the server state says BUSY (matching vita-moonlight). */
+        if (current_game > 0) {
+            if (xml_get_value_safe(resp, "state", state_val,
+                                   sizeof(state_val)) >= 0) {
+                if (strstr(state_val, "_SERVER_BUSY") == NULL) {
+                    current_game = 0;
+                }
             }
         }
+        pair_log("[SERVERINFO] currentgame=%d\n", current_game);
     }
-    pair_log("[SERVERINFO] currentgame=%d\n", current_game);
 
     /* ------------------------------------------------------------------
      * Step B: Generate rikey / rikeyid for this session.
@@ -1412,12 +1612,16 @@ static int sunshine_launch_session(int target_appid)
 
         if (user_choice == 0) {
             /* Resume existing session — send /resume instead of /launch */
+            int surround_audio_info = AUDIO_STREAM_SURROUND_INFO;
             pair_log("[RESUME] user chose resume\n");
             snprintf(path, sizeof(path),
                      "/resume?uniqueid=%s&uuid=%s&rikey=%s&rikeyid=%d"
-                     "&surroundAudioInfo=196610",
+                     "&surroundAudioInfo=%d&continuousAudio=0",
                      CLIENT_UNIQUE_ID, client_identity_get_uuid(),
-                     ri_key_hex, rikeyid);
+                     ri_key_hex, rikeyid, surround_audio_info);
+            pair_log("[RESUME] audioEnabled=%d surroundAudioInfo=%d continuousAudio=0%s\n",
+                     g_psp_config.audioEnabled, surround_audio_info,
+                     g_psp_config.audioEnabled ? "" : " (client drain/drop only)");
             pair_log("[RESUME] GET https://%s:%d%s\n",
                      g_sunshine_host, SUNSHINE_HTTPS_PORT, path);
 
@@ -1453,11 +1657,13 @@ static int sunshine_launch_session(int target_appid)
             pair_log("[CANCEL] GET https://%s:%d%s\n",
                      g_sunshine_host, SUNSHINE_HTTPS_PORT, path);
 
+            cancel_resp[0] = '\0';
             ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
                                    path, cancel_resp, sizeof(cancel_resp));
             if (ret < 0) {
                 pair_log("[CANCEL] first attempt failed, waiting 3s for TCP recovery\n");
                 sceKernelDelayThread(3000 * 1000);
+                cancel_resp[0] = '\0';
                 ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
                                        path, cancel_resp, sizeof(cancel_resp));
             }
@@ -1498,9 +1704,9 @@ static int sunshine_launch_session(int target_appid)
      * ------------------------------------------------------------------ */
     if (current_game == 0) {
         /* Defensive: keep width/height and resolutionIndex consistent.
-         * If explicit width/height match a known preset, sync the index to
-         * that preset. Only force width/height from preset when the current
-         * dimensions are invalid/unmapped. */
+         * If explicit width/height match a known resolution, sync the index to
+         * that resolution. Only force width/height from the resolution row
+         * when the current dimensions are invalid/unmapped. */
         {
             int ri = g_psp_config.resolutionIndex;
             int matched_ri = -1;
@@ -1541,27 +1747,31 @@ static int sunshine_launch_session(int target_appid)
          *   Browser mode → sops=0: leave desktop display untouched
          *                (better for text/desktop content)
          *
-         * videoCapabilities=2: bit 1 = support CAVLC / fast decode */
+         * videoCapabilities=2: H.264 reference-frame invalidation capability
+         * (common-c CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC). */
         {
             int sops_flag = (g_psp_config.controlMode == CONTROL_MODE_XBOX) ? 1 : 0;
+            int rtsp_corever = g_psp_config.disableEncryption ? 0 : 1;
+            int surround_audio_info = AUDIO_STREAM_SURROUND_INFO;
             snprintf(path, sizeof(path),
                      "/launch?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d&sops=%d"
                      "&rikey=%s&rikeyid=%d&localAudioPlayMode=0&additionalStates=0"
-                     "&surroundAudioInfo=196610&remoteControllersBitmap=1&gcmap=1"
-                     "&corever=1&supportedVideoFormats=1&videoCapabilities=2"
+                    "&surroundAudioInfo=%d&remoteControllersBitmap=1&gcmap=1"
+                    "&continuousAudio=0&corever=%d&supportedVideoFormats=1&videoCapabilities=2"
                      "&videoEncoderSlicesPerFrame=1",
                      CLIENT_UNIQUE_ID, client_identity_get_uuid(),
                      target_appid, g_psp_config.width, g_psp_config.height, g_psp_config.fps,
-                     sops_flag, ri_key_hex, rikeyid);
+                     sops_flag, ri_key_hex, rikeyid, surround_audio_info,
+                     rtsp_corever);
+            pair_log("[LAUNCH] rtsp corever=%d disableAVEncryption=%d audioEnabled=%d surroundAudioInfo=%d continuousAudio=0%s%s\n",
+                     rtsp_corever, g_psp_config.disableEncryption,
+                     g_psp_config.audioEnabled, surround_audio_info,
+                     g_psp_config.disableEncryption ? " (plaintext RTSP)" : "",
+                     g_psp_config.audioEnabled ? "" : " (client drain/drop only)");
         }
 
         pair_log("[LAUNCH] GET https://%s:%d%s\n",
                  g_sunshine_host, SUNSHINE_HTTPS_PORT, path);
-
-        /* Allow PSP network stack to fully tear down the serverinfo TLS
-         * session before opening a new one.  Without this gap the
-         * second handshake times out on 802.11b WiFi. */
-        sceKernelDelayThread(2000 * 1000);
 
         ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
                                path, resp, sizeof(resp));
@@ -1782,6 +1992,7 @@ int wifi_connect(void)
             memset(&info, 0, sizeof(info));
             sceNetApctlGetInfo(8, &info); /* 8 = SCE_NET_APCTL_INFO_IP */
             pspDebugScreenPrintf("wifi: connected! IP: %s\n", info.ip);
+            wifi_launch_disable_power_save();
             return 0;
         }
 
@@ -1804,6 +2015,7 @@ int wifi_connect(void)
  */
 void wifi_disconnect(void)
 {
+    wifi_launch_restore_power_save();
     sceNetApctlDisconnect();
     sceNetApctlTerm();
     sceNetInetTerm();
@@ -1815,6 +2027,9 @@ void wifi_disconnect(void)
  * Step 3: RTSP Session (OPTIONS, DESCRIBE, SETUP, PLAY)
  * ============================================================================
  */
+
+static void rtsp_drain_before_close(int sock);
+static void rtsp_close_transaction_socket(int *sockp);
 
 /*
  * rtsp_send_and_recv - Send an RTSP request and receive the response
@@ -1829,6 +2044,113 @@ void wifi_disconnect(void)
  *
  * Returns: number of bytes received, or negative on error
  */
+static void rtsp_apply_io_timeouts(int sock)
+{
+    struct timeval snd_to;
+    struct timeval rcv_to;
+
+    snd_to.tv_sec = RTSP_SEND_TIMEOUT_MS / 1000;
+    snd_to.tv_usec = (RTSP_SEND_TIMEOUT_MS % 1000) * 1000;
+    rcv_to.tv_sec = RTSP_RECV_TIMEOUT_MS / 1000;
+    rcv_to.tv_usec = (RTSP_RECV_TIMEOUT_MS % 1000) * 1000;
+    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
+    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+}
+
+static int rtsp_wait_socket(int sock, int want_write, int timeout_ms)
+{
+    fd_set fds;
+    struct timeval tv;
+    int ret;
+
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    ret = sceNetInetSelect(sock + 1,
+                           want_write ? NULL : &fds,
+                           want_write ? &fds : NULL,
+                           NULL,
+                           &tv);
+    if (ret <= 0) {
+        return ret;
+    }
+    return FD_ISSET(sock, &fds) ? 1 : 0;
+}
+
+static int rtsp_send_all_timeout(int sock, const char *data, int data_len,
+                                 const char *label, int *out_sent)
+{
+    int sent = 0;
+    u32 start_ms = sceKernelGetSystemTimeLow() / 1000;
+    int nb = 1;
+
+    if (out_sent) {
+        *out_sent = 0;
+    }
+
+    rtsp_apply_io_timeouts(sock);
+    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+
+    while (sent < data_len) {
+        int remaining = data_len - sent;
+        int chunk = remaining > 536 ? 536 : remaining;
+        int ret;
+
+        ret = rtsp_wait_socket(sock, 1, 50);
+        if (ret < 0) {
+            pair_log("[RTSP] %s send wait failed at %d/%d (errno %d)\n",
+                     label ? label : "request", sent, data_len,
+                     sceNetInetGetErrno());
+            return -1;
+        }
+        if (ret == 0) {
+            if ((sceKernelGetSystemTimeLow() / 1000) - start_ms > RTSP_SEND_TIMEOUT_MS) {
+                pair_log("[RTSP] %s send timeout at %d/%d bytes\n",
+                         label ? label : "request", sent, data_len);
+                return -1;
+            }
+            continue;
+        }
+
+        ret = (int)sceNetInetSend(sock, data + sent, chunk, 0);
+
+        if (ret > 0) {
+            sent += ret;
+            if (out_sent) {
+                *out_sent = sent;
+            }
+            continue;
+        }
+
+        if ((sceKernelGetSystemTimeLow() / 1000) - start_ms > RTSP_SEND_TIMEOUT_MS) {
+            pair_log("[RTSP] %s send timeout at %d/%d bytes\n",
+                     label ? label : "request", sent, data_len);
+            return -1;
+        }
+
+        if (ret < 0) {
+            int err = sceNetInetGetErrno();
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                sceKernelDelayThread(1000);
+                continue;
+            }
+            pair_log("[RTSP] %s send failed at %d/%d (errno %d)\n",
+                     label ? label : "request", sent, data_len, err);
+            return -1;
+        }
+
+        pair_log("[RTSP] %s send closed at %d/%d bytes\n",
+                 label ? label : "request", sent, data_len);
+        return -1;
+    }
+
+    pair_log("[RTSP] sent request bytes=%d encrypted=%d\n", sent, g_rtsp_encrypted);
+    diag_log_flush();
+    return 0;
+}
+
 static int rtsp_send_and_recv(int sock, const char *request,
                                char *response, int resp_size)
 {
@@ -1843,9 +2165,12 @@ static int rtsp_send_and_recv(int sock, const char *request,
 
     g_rtsp_last_resp_encrypted = 0;
 
-    /* Send the request on blocking socket and handle partial writes. */
-    nb = 0;
-    sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+    /* Send the request with a hard timeout. Blocking PSP TCP sends can hang
+     * indefinitely on weak WiFi after RTSP connect succeeds, leaving the UI
+     * stuck on "Requesting Stream" with no actionable log. */
+    pair_log("[RTSP] send request len=%d encrypted=%d\n",
+             (int)strlen(request), g_rtsp_encrypted);
+    diag_log_flush();
 
     if (g_rtsp_encrypted) {
         int plaintext_len = (int)strlen(request);
@@ -1877,41 +2202,23 @@ static int rtsp_send_and_recv(int sock, const char *request,
         encrypted_buf[7] = (unsigned char)(g_rtsp_enc_tx_seq);
         memcpy(encrypted_buf + 8, tag, 16);
 
-        /* Send encrypted frame in MSS-sized chunks (MTU safety,
-         * matching moonlight-common-c sendMtuSafe). */
-        {
-            int total_to_send = plaintext_len + 24;
-            int bytes_sent = 0;
-            while (bytes_sent < total_to_send) {
-                int chunk = total_to_send - bytes_sent;
-                if (chunk > 536) chunk = 536;  /* TCPv4 MSS */
-                ret = sceNetInetSend(sock, encrypted_buf + bytes_sent, chunk, 0);
-                if (ret <= 0) {
-                    pair_log("[RTSP] encrypted send failed at %d/%d (errno %d)\n",
-                             bytes_sent, total_to_send, sceNetInetGetErrno());
-                    return -1;
-                }
-                bytes_sent += ret;
-            }
+        if (rtsp_send_all_timeout(sock, (const char *)encrypted_buf,
+                                  plaintext_len + 24,
+                                  "encrypted request", &sent) != 0) {
+            return -1;
         }
     } else {
-        int send_errno = 0;
         req_len = (int)strlen(request);
-        if (net_send_all_psp(sock, request, req_len,
-                             1, 1000, &send_errno, &sent) != 0) {
-            if (send_errno == 0) {
-                pair_log("[RTSP] send returned 0 before full request write\n");
-            } else {
-                pair_log("[RTSP] send failed at %d/%d (errno %d)\n",
-                         sent, req_len, send_errno);
-            }
+        if (rtsp_send_all_timeout(sock, request, req_len,
+                                  "request", &sent) != 0) {
             return -1;
         }
     }
 
-    /* Removed debug screen printf — interferes with GU rendering */
+    /* Debug screen printing is routed to the diagnostic log above. */
 
-    /* Receive the response (non-blocking with timeout). */
+    /* Receive the response (select-bounded, non-blocking with timeout). */
+    rtsp_apply_io_timeouts(sock);
     nb = 1;
     sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
 
@@ -1924,6 +2231,24 @@ static int rtsp_send_and_recv(int sock, const char *request,
             break;
         }
 
+        {
+            u32 now_ms = sceKernelGetSystemTimeLow() / 1000;
+            int remaining_ms = RTSP_RECV_TIMEOUT_MS - (int)(now_ms - start_ms);
+            int wait_ms = remaining_ms > 50 ? 50 : remaining_ms;
+            if (wait_ms <= 0) {
+                break;
+            }
+            ret = rtsp_wait_socket(sock, 0, wait_ms);
+            if (ret < 0) {
+                pair_log("[RTSP] recv wait failed (errno %d)\n",
+                         sceNetInetGetErrno());
+                return -1;
+            }
+            if (ret == 0) {
+                continue;
+            }
+        }
+
         ret = sceNetInetRecv(sock, response + total_recv,
                              resp_size - 1 - total_recv, 0);
         if (ret > 0)
@@ -1932,14 +2257,14 @@ static int rtsp_send_and_recv(int sock, const char *request,
             response[total_recv] = '\0';
 
             if (g_rtsp_encrypted && total_recv >= 24) {
-                uint32_t type_len = ((unsigned char)response[0] << 24) | ((unsigned char)response[1] << 16) | 
+                uint32_t type_len = ((unsigned char)response[0] << 24) | ((unsigned char)response[1] << 16) |
                                     ((unsigned char)response[2] << 8) | (unsigned char)response[3];
                 if (type_len & 0x80000000) {
                     int len = (int)(type_len & 0x7FFFFFFF);
                     if (total_recv >= len + 24) {
                         unsigned char dec_buf[RTSP_BUF_SIZE];
                         unsigned char iv[12] = {0};
-                        uint32_t seq = ((unsigned char)response[4] << 24) | ((unsigned char)response[5] << 16) | 
+                        uint32_t seq = ((unsigned char)response[4] << 24) | ((unsigned char)response[5] << 16) |
                                        ((unsigned char)response[6] << 8) | (unsigned char)response[7];
                         iv[0] = (unsigned char)(seq);
                         iv[1] = (unsigned char)(seq >> 8);
@@ -2023,20 +2348,6 @@ static int rtsp_send_and_recv(int sock, const char *request,
 
     response[total_recv] = '\0';
 
-    /* Drain any remaining data (e.g. server FIN) to prevent RST on close.
-     * moonlight-common-c reads until recv returns 0 (FIN); we break early
-     * after decrypting the encrypted response.  Without draining, close()
-     * on a socket with unread FIN can send RST, potentially causing the
-     * server to reject the next TCP connection. */
-    if (g_rtsp_last_resp_encrypted) {
-        char drain_buf[64];
-        int drain_ret;
-        sceKernelDelayThread(10 * 1000);  /* 10ms for FIN to arrive */
-        do {
-            drain_ret = sceNetInetRecv(sock, drain_buf, sizeof(drain_buf), 0);
-        } while (drain_ret > 0);
-    }
-
     if (header_end_pos >= 0 && content_length >= 0) {
         if (total_recv < header_end_pos + content_length) {
             pair_log("[RTSP] incomplete response body (%d/%d)\n",
@@ -2046,13 +2357,77 @@ static int rtsp_send_and_recv(int sock, const char *request,
     }
 
     if (total_recv <= 0) {
+#ifndef RETAIL_BUILD
         u32 elapsed = (sceKernelGetSystemTimeLow() / 1000) - start_ms;
         pair_log("[RTSP] empty response (elapsed=%dms, timeout=%d)\n",
                  (int)elapsed, RTSP_RECV_TIMEOUT_MS);
+#endif
         return -1;
     }
 
     return total_recv;
+}
+
+static void rtsp_drain_before_close(int sock)
+{
+    char drain_buf[128];
+    u32 start_ms;
+    int ret;
+
+    /* moonlight-common-c reads RTSP-over-TCP until the host closes the
+     * transaction socket. PSP TCP shutdown can block for seconds here, so keep
+     * the compatibility drain very short and let close() finish asynchronously. */
+    start_ms = sceKernelGetSystemTimeLow() / 1000;
+    do {
+        ret = sceNetInetRecv(sock, drain_buf, sizeof(drain_buf), 0);
+        if (ret == 0) {
+            return;
+        }
+        if (ret > 0) {
+            start_ms = sceKernelGetSystemTimeLow() / 1000;
+            continue;
+        }
+        {
+            int err = sceNetInetGetErrno();
+            if (err != EAGAIN && err != EWOULDBLOCK) {
+                return;
+            }
+        }
+        sceKernelDelayThread(10 * 1000);
+    } while ((sceKernelGetSystemTimeLow() / 1000) - start_ms < RTSP_DRAIN_TIMEOUT_MS);
+}
+
+static void rtsp_close_transaction_socket(int *sockp)
+{
+    int sock;
+    u32 close_start_us;
+    u32 close_elapsed_us;
+
+    if (!sockp || *sockp < 0) {
+        return;
+    }
+
+    sock = *sockp;
+    *sockp = -1;
+
+    close_start_us = sceKernelGetSystemTimeLow();
+
+    /* PSP's TCP shutdown path can linger for seconds on Sunshine RTSP
+     * transaction sockets after we've already consumed the complete response.
+     * Do not call shutdown() here; keep close as bounded cleanup so a launched
+     * Apollo session cannot expire between SETUP and PLAY. Use a normal close:
+     * abortive SO_LINGER/RST can poison Sunshine's per-launch RTSP session
+     * after ANNOUNCE and make PLAY return empty/reset. */
+    {
+        int nb = 1;
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+    }
+    rtsp_drain_before_close(sock);
+    sceNetInetClose(sock);
+    close_elapsed_us = sceKernelGetSystemTimeLow() - close_start_us;
+    if (close_elapsed_us > 100000) {
+        pair_log("[RTSP] transaction close took %dus\n", (int)close_elapsed_us);
+    }
 }
 
 static int rtsp_response_is_200(const char *response)
@@ -2125,7 +2500,7 @@ static void rtsp_parse_session_id(const char *response)
     g_rtsp_session_id[len] = '\0';
 }
 
-static int rtsp_connect_port(const char *host, int port)
+static int rtsp_connect_port(const char *host, int port, int timeout_ms)
 {
     int sock, ret, nb;
     struct sockaddr_in server_addr;
@@ -2173,13 +2548,13 @@ static int rtsp_connect_port(const char *host, int port)
      * (matches power_handler.c and moonlight-common-c connectTcpSocket) */
     FD_ZERO(&writefds);
     FD_SET(sock, &writefds);
-    timeout.tv_sec  = RTSP_CONNECT_TIMEOUT_MS / 1000;
-    timeout.tv_usec = (RTSP_CONNECT_TIMEOUT_MS % 1000) * 1000;
+    timeout.tv_sec  = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
 
     ret = sceNetInetSelect(sock + 1, NULL, &writefds, NULL, &timeout);
     if (ret <= 0) {
-        pair_log("[RTSP] connect %s:%d timed out (select ret=%d, errno %d)\n",
-                 host, port, ret, sceNetInetGetErrno());
+        pair_log("[RTSP] connect %s:%d timed out after %dms (select ret=%d, errno %d)\n",
+                 host, port, timeout_ms, ret, sceNetInetGetErrno());
         sceNetInetClose(sock);
         return -1;
     }
@@ -2218,7 +2593,9 @@ connected:
  *
  * Returns: socket file descriptor, or negative on error
  */
-static int rtsp_connect(void)
+static int rtsp_connect_with_policy(const char *phase,
+                                    int timeout_ms,
+                                    int max_retries)
 {
     int sock;
     int i, attempt;
@@ -2232,24 +2609,83 @@ static int rtsp_connect(void)
         ports[num_ports++] = SUNSHINE_RTSP_PORT_PRIMARY;
     }
 
-    for (attempt = 0; attempt < RTSP_CONNECT_MAX_RETRIES; attempt++) {
+    if (timeout_ms <= 0) {
+        timeout_ms = RTSP_CONNECT_TIMEOUT_MS;
+    }
+    if (max_retries <= 0) {
+        max_retries = 1;
+    }
+
+    for (attempt = 0; attempt < max_retries; attempt++) {
         for (i = 0; i < num_ports; i++) {
-            sock = rtsp_connect_port(g_rtsp_connect_host, ports[i]);
+            sock = rtsp_connect_port(g_rtsp_connect_host, ports[i], timeout_ms);
             if (sock >= 0) {
                 g_rtsp_port = ports[i];
                 rtsp_rewrite_target_authority(g_rtsp_connect_host, g_rtsp_port);
                 return sock;
             }
         }
-        if (attempt < RTSP_CONNECT_MAX_RETRIES - 1) {
-            pair_log("[RTSP] connect attempt %d/%d failed, retrying in 1s...\n",
-                     attempt + 1, RTSP_CONNECT_MAX_RETRIES);
-            sceKernelDelayThread(1000 * 1000); /* 1 second */
+        if (attempt < max_retries - 1) {
+            pair_log("[RTSP] %s connect attempt %d/%d failed, retrying in %dms...\n",
+                     phase ? phase : "transaction",
+                     attempt + 1, max_retries, RTSP_CONNECT_RETRY_DELAY_MS);
+            sceKernelDelayThread(RTSP_CONNECT_RETRY_DELAY_MS * 1000);
         }
     }
 
-    pair_log("[RTSP] all %d connect attempts exhausted\n", RTSP_CONNECT_MAX_RETRIES);
+    pair_log("[RTSP] %s connect exhausted (%d attempts, timeout=%dms)\n",
+             phase ? phase : "transaction", max_retries, timeout_ms);
     return -1;
+}
+
+static int rtsp_connect_post_setup(const char *phase)
+{
+    return rtsp_connect_with_policy(phase,
+                                    RTSP_POST_SETUP_CONNECT_TIMEOUT_MS,
+                                    RTSP_POST_SETUP_CONNECT_MAX_RETRIES);
+}
+
+static void rtsp_prime_video_endpoint(const char *phase, int settle_us)
+{
+#ifndef RETAIL_BUILD
+    const char *tag = phase ? phase : "video";
+
+    if (network_me_send_video_ping_burst(g_video_server_ip,
+                                         g_video_server_port,
+                                         g_video_ping_payload) == 0) {
+        pair_log("[RTSP] %s video ping burst sent to %s:%d\n",
+                 tag, g_video_server_ip, g_video_server_port);
+    } else {
+        pair_log("[RTSP] WARN: %s video ping burst failed\n", tag);
+    }
+#else
+    (void)phase;
+    (void)network_me_send_video_ping_burst(g_video_server_ip,
+                                           g_video_server_port,
+                                           g_video_ping_payload);
+#endif
+
+    if (settle_us > 0) {
+        sceKernelDelayThread((SceUInt)settle_us);
+    }
+}
+
+static void rtsp_seed_media_server_ip(void)
+{
+    if (g_video_server_ip[0] != '\0') {
+        return;
+    }
+
+    if (g_rtsp_connect_host[0] != '\0' &&
+        strchr(g_rtsp_connect_host, ':') == NULL &&
+        g_rtsp_connect_host[0] != '[') {
+        strncpy(g_video_server_ip, g_rtsp_connect_host,
+                sizeof(g_video_server_ip) - 1);
+    } else {
+        strncpy(g_video_server_ip, g_sunshine_host,
+                sizeof(g_video_server_ip) - 1);
+    }
+    g_video_server_ip[sizeof(g_video_server_ip) - 1] = '\0';
 }
 
 /*
@@ -2424,6 +2860,14 @@ static int rtsp_setup_stream(int sock, const char *stream_id)
         client_port_hi = 58000;
     }
 
+    {
+        char session_header[96];
+        session_header[0] = '\0';
+        if (g_rtsp_session_id[0]) {
+            snprintf(session_header, sizeof(session_header),
+                     "Session: %s\r\n", g_rtsp_session_id);
+        }
+
     if (g_local_bind_ip[0] != '\0') {
         snprintf(request, sizeof(request),
                  "SETUP %s RTSP/1.0\r\n"
@@ -2431,11 +2875,12 @@ static int rtsp_setup_stream(int sock, const char *stream_id)
                  "User-Agent: psp-moonlight\r\n"
                  "X-GS-ClientVersion: %d\r\n"
                  "Host: %s\r\n"
-                 "Session: %s\r\n"
+                 "%s"
                  "Transport: unicast;X-GS-ClientPort=%d-%d;destination=%s\r\n"
                  "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
                  "\r\n",
-                 stream_id, rtsp_cseq++, CLIENT_VERSION, g_rtsp_host_header, g_rtsp_session_id[0] ? g_rtsp_session_id : "",
+                 stream_id, rtsp_cseq++, CLIENT_VERSION, g_rtsp_host_header,
+                 session_header,
                  client_port_lo, client_port_hi, g_local_bind_ip);
     } else {
         snprintf(request, sizeof(request),
@@ -2444,12 +2889,14 @@ static int rtsp_setup_stream(int sock, const char *stream_id)
                  "User-Agent: psp-moonlight\r\n"
                  "X-GS-ClientVersion: %d\r\n"
                  "Host: %s\r\n"
-                 "Session: %s\r\n"
+                 "%s"
                  "Transport: unicast;X-GS-ClientPort=%d-%d\r\n"
                  "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
                  "\r\n",
-                 stream_id, rtsp_cseq++, CLIENT_VERSION, g_rtsp_host_header, g_rtsp_session_id[0] ? g_rtsp_session_id : "",
+                 stream_id, rtsp_cseq++, CLIENT_VERSION, g_rtsp_host_header,
+                 session_header,
                  client_port_lo, client_port_hi);
+    }
     }
 
     ret = rtsp_send_and_recv(sock, request, response, sizeof(response));
@@ -2569,27 +3016,55 @@ static int rtsp_announce(int sock, int enc_enabled)
         extern PspConfig g_psp_config;
         int requested_bitrate_kbps = g_psp_config.bitrate > 0 ? g_psp_config.bitrate : 1600;
         int launch_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(requested_bitrate_kbps);
-        int transport_bitrate_kbps = launch_bitrate_kbps;
-        int packet_size = g_psp_config.packetSize > 0 ? g_psp_config.packetSize : 1392;
-        /* Resolution from preset array — authoritative source of truth. */
+        int transport_bitrate_kbps;
+        int configured_bitrate_kbps;
+        int minimum_bitrate_kbps;
+        int packet_size = g_psp_config.packetSize > 0 ? g_psp_config.packetSize : DEFAULT_PACKET_SIZE;
+        /* Resolution row array - authoritative source of stream dimensions. */
         int ri = g_psp_config.resolutionIndex;
         if (ri < 0 || ri >= RESOLUTION_COUNT) ri = 0;
         int stream_w = RESOLUTION_WIDTHS[ri];
         int stream_h = RESOLUTION_HEIGHTS[ri];
         int stream_fps = g_psp_config.fps > 0 ? g_psp_config.fps : 30;
-        
+        int client_refresh_x100 = stream_fps * 100;
+        int audio_packet_duration_ms = 10;
+        int fec_min_required_packets = 2;
+        int requested_fec_percent = PSP_VIDEO_FEC_PERCENT;
+        int video_fec_enabled = 1;
+        int intra_refresh_enabled = 1;
+        int suppress_soft_idr_for_intra_refresh = 0;
+
+        /* Keep video FEC explicit. Normal PSP presets request repair packets,
+         * while FEC=0 must stay a real low-work experiment that asks both the
+         * host config and SDP sender path to stop adding video parity. */
+        if (requested_fec_percent <= 0) {
+            video_fec_enabled = 0;
+            requested_fec_percent = 0;
+        }
+        if (requested_fec_percent > 255) {
+            requested_fec_percent = 255;
+        }
+
         /* Moonlight-common-c rounds packet size to 16-byte chunks and subtracts
          * encrypted video header overhead when video encryption is enabled. */
         packet_size -= (packet_size % 16);
-        if (packet_size <= 0) {
-            packet_size = 1024;
+        if (packet_size < MIN_STREAM_PACKET_SIZE) {
+            packet_size = MIN_STREAM_PACKET_SIZE;
         }
-        if (packet_size > 1024) {
-            packet_size = 1024;
+        if (packet_size > MAX_STREAM_PACKET_SIZE) {
+            packet_size = MAX_STREAM_PACKET_SIZE;
         }
+        /* Keep Sunshine's configured and transport bitrate at the requested
+         * preset value for startup/IDR behavior. The adaptive controller still
+         * reports a lower PSP survival floor through minimumBitrateKbps and
+         * control bandwidth reports, but capping the SDP transport target at
+         * 80% caused media starvation on hardware. */
+        transport_bitrate_kbps = launch_bitrate_kbps;
         if (transport_bitrate_kbps < 32) {
             transport_bitrate_kbps = 32;
         }
+        configured_bitrate_kbps = launch_bitrate_kbps;
+        minimum_bitrate_kbps = signal_strength_get_adaptive_floor_kbps(transport_bitrate_kbps);
         /* Subtract ENC_VIDEO_HEADER (32 bytes) from packetSize only when
          * SS_ENC_VIDEO (0x02) is negotiated — matching moonlight-common-c
          * SdpGenerator.c: "if (EncryptionFeaturesEnabled & SS_ENC_VIDEO)".
@@ -2606,12 +3081,108 @@ static int rtsp_announce(int sock, int enc_enabled)
                 packet_size = 16;
             }
         }
+        if (stream_w * stream_h <= 256 * 144 && stream_fps <= 30) {
+            /* Hardware rerun: fecMin=2 at 320kbps/p1056 raised video FEC
+             * overhead to about 61%, kept the same two unrecoverable frames,
+             * and introduced audio underruns. Keep the low-work floor at one
+             * parity packet for 144p and tune the host repair percentage
+             * instead of doubling every small frame's parity burst. */
+            fec_min_required_packets = 1;
 
-        pair_log("[RTSP] negotiated bitrate requested=%d kbps launch=%d kbps transport=%d kbps, resolution=%dx%d@%d\n",
+            /* PSP-1000 low-work audio: keep Opus mono and a sparse packet
+             * cadence. A 2026-05-17 40 ms rerun lowered burst size but
+             * regressed failed-frame count and usable video, so 60 ms remains
+             * the 144p baseline until a source fix removes the receive stall. */
+            audio_packet_duration_ms = 60;
+
+            /* A 2026-05-16 PSP-1000 hardware run rejected auto-disabling
+             * intra refresh at 144p20: strict recovery regressed from one
+             * unrecoverable/gap event to four, with no release-grade visual
+             * improvement. Keep the default enabled unless build-forced. */
+        }
+        if (!g_psp_config.audioEnabled && configured_bitrate_kbps > 0) {
+            /* There is no official client-side GameStream/Sunshine control
+             * that stops audio RTP while leaving the host config untouched.
+             * Audio Disabled is a local PSP work saver: keep audio SETUP/ping
+             * for liveness, drain/drop RTP, and skip Opus/SRC/playback. Do
+             * not add back audio budget here because the host may still send
+             * the low-audio RTP stream. */
+            pair_log("[RTSP] audio disabled: client drains/drops audio RTP; no video-budget addback\n");
+        } else if (stream_w * stream_h <= 256 * 144 && stream_fps <= 30 &&
+                   configured_bitrate_kbps > 0 && g_psp_config.audioEnabled) {
+            int low_audio_add_kbps =
+                PSP_LOW_AUDIO_CONFIGURED_ADD_KBPS * AUDIO_STREAM_CHANNELS;
+            /* Sunshine treats x-ml-video.configuredBitrateKbps as a total
+             * stream budget, then subtracts video FEC, low-quality audio, and
+             * protocol overhead before setting the encoder bitrate. Add back a
+             * bounded one-channel allowance. Hardware rejected 112 kbps and
+             * full audio+FEC addback because both crossed the packet-survival
+             * cliff before they fixed visible blockiness. */
+            configured_bitrate_kbps += low_audio_add_kbps;
+            pair_log("[RTSP] low-audio configured-bitrate addback=%dkbps\n",
+                     low_audio_add_kbps);
+        }
+        if (PSP_VIDEO_FEC_MIN_REQUIRED >= 0) {
+            fec_min_required_packets = PSP_VIDEO_FEC_MIN_REQUIRED;
+            pair_log("[RTSP] build override fecMin=%d\n",
+                     fec_min_required_packets);
+        }
+        if (fec_min_required_packets < 0) {
+            fec_min_required_packets = 0;
+        }
+        if (fec_min_required_packets > 16) {
+            fec_min_required_packets = 16;
+        }
+        if (!video_fec_enabled) {
+            fec_min_required_packets = 0;
+        }
+        if (PSP_AUDIO_PACKET_DURATION_MS > 0) {
+            int override_ms = PSP_AUDIO_PACKET_DURATION_MS;
+            if (override_ms == 5 || override_ms == 10 ||
+                override_ms == 20 || override_ms == 40 ||
+                override_ms == 60) {
+                audio_packet_duration_ms = override_ms;
+                pair_log("[RTSP] build override audio packetDuration=%dms\n",
+                         audio_packet_duration_ms);
+            } else {
+                pair_log("[RTSP] ignored unsupported audio packetDuration override=%dms\n",
+                         override_ms);
+            }
+        }
+        if (PSP_VIDEO_INTRA_REFRESH >= 0) {
+            intra_refresh_enabled = PSP_VIDEO_INTRA_REFRESH ? 1 : 0;
+            pair_log("[RTSP] build override intraRefresh=%d\n",
+                     intra_refresh_enabled);
+        }
+        if (client_refresh_x100 < 100) {
+            client_refresh_x100 = 100;
+        }
+
+        pair_log("[RTSP] negotiated bitrate requested=%d kbps launch=%d kbps transport=%d kbps min=%d kbps, resolution=%dx%d@%d\n",
              requested_bitrate_kbps, launch_bitrate_kbps,
-             transport_bitrate_kbps, stream_w, stream_h, stream_fps);
-        pair_log("[RTSP] using packetSize=%d (enc_enabled=%d)\n",
-                 packet_size, enc_enabled);
+             transport_bitrate_kbps, minimum_bitrate_kbps, stream_w, stream_h, stream_fps);
+        pair_log("[RTSP] Sunshine configured bitrate=%d kbps (video budget request)\n",
+                 configured_bitrate_kbps);
+        if (PSP_VIDEO_FEC_PERCENT <= 0) {
+            pair_log("[RTSP] requested FEC0 low-work mode; using fec.enable=0 repair=0 fecMin=0\n");
+        }
+        pair_log("[RTSP] using packetSize=%d fec=%s repair=%d fecMin=%d (enc_enabled=%d)\n",
+                 packet_size, video_fec_enabled ? "on" : "off",
+                 requested_fec_percent, fec_min_required_packets, enc_enabled);
+        pair_log("[RTSP] audio packetDuration=%dms\n",
+                 audio_packet_duration_ms);
+        pair_log("[RTSP] clientRefreshRateX100=%d (matches maxFPS)\n",
+                 client_refresh_x100);
+        audio_thread_set_packet_duration_ms(audio_packet_duration_ms);
+        g_intra_refresh_active = suppress_soft_idr_for_intra_refresh;
+        pair_log("[RTSP] intraRefresh=%d, post-startup soft IDR suppression=%s\n",
+                 intra_refresh_enabled,
+                 suppress_soft_idr_for_intra_refresh ? "on" : "off");
+        pair_log("[RTSP] low-audio Host header=%s (Sunshine normal audio tier)\n",
+                 g_rtsp_host_header);
+        pair_log("[STREAM CFG] %dx%d@%d bitrate=%d packet=%d\n",
+                 stream_w, stream_h, stream_fps,
+                 requested_bitrate_kbps, packet_size);
 
         {
             int announce_video_port = g_video_client_port > 0 ?
@@ -2624,8 +3195,9 @@ static int rtsp_announce(int sock, int enc_enabled)
                     announce_audio_port > 0) {
                     snprintf(audio_media_sdp, sizeof(audio_media_sdp),
                              "m=audio %d\r\n"
-                             "a=rtpmap:97 opus/48000/2\r\n",
-                             (int)announce_audio_port);
+                             "a=rtpmap:97 opus/48000/%d\r\n",
+                             (int)announce_audio_port,
+                             AUDIO_STREAM_CHANNELS);
                     pair_log("[RTSP] audio media enabled in SDP on port=%d\n",
                              (int)announce_audio_port);
                 } else {
@@ -2647,19 +3219,21 @@ static int rtsp_announce(int sock, int enc_enabled)
              * plus PSP-specific optimizations for 802.11b WiFi:
              *
              *  BUG FIXES from prior version:
-             *   - clientRefreshRateX100 was hardcoded 0, now reads config (6000=60Hz)
+             *   - clientRefreshRateX100 now matches maxFPS; Sunshine rejects
+             *     mismatched low-FPS RTSP metadata on some encoder paths.
              *   - minimumBitrateKbps was missing (server couldn't latch bitrate)
              *   - configuredBitrateKbps was missing (server couldn't adjust FEC)
              *
              *  NEW ATTRIBUTES (from reference moonlight-common-c):
              *   - timeoutLengthMs:7000         encoder timeout
              *   - framesWithInvalidRefThreshold:0  no tolerance for bad refs
-             *   - fec.enable:1                 explicitly enable FEC
+             *   - fec.enable:1                 keep upstream FEC sequencing path
+             *   - fec.repairPercent            requested repair percentage for hosts that honor it
              *   - bllFec.enable:0              disable BLL-FEC (worse on lossy nets)
              *   - drc.enable:0                 disable dynamic resolution changes
              *   - enableRecoveryMode:0         recovery mode breaks FEC queue
              *   - videoQualityScoreUpdateTime:5000  quality scoring interval
-             *   - minimumBitrateKbps           latch bitrate (no server scaling)
+             *   - minimumBitrateKbps           adaptive floor for PSP WiFi recovery
              *   - configuredBitrateKbps        client-selected target bitrate
              */
             /* Profile/entropy selection: Baseline+CAVLC by default,
@@ -2683,27 +3257,28 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "a=x-nv-video[0].clientViewportHt:%d\r\n"
                 "a=x-nv-video[0].maxFPS:%d\r\n"
                 "a=x-nv-video[0].packetSize:%d\r\n"
-                /* --- Audio: stereo, low quality (PSP can't decode surround) --- */
-                "a=x-nv-audio.surround.numChannels:2\r\n"
-                "a=x-nv-audio.surround.channelMask:3\r\n"
+                /* --- Audio: mono, low quality, expanded to stereo locally --- */
+                "a=x-nv-audio.surround.numChannels:%d\r\n"
+                "a=x-nv-audio.surround.channelMask:%d\r\n"
                 "a=x-nv-audio.surround.AudioQuality:0\r\n"
                 "a=x-nv-audio.surround.enable:0\r\n"
-                "a=x-nv-aqos.packetDuration:10\r\n"
+                "a=x-nv-aqos.packetDuration:%d\r\n"
                 /* --- Transport: ENet reliable UDP, no qWAVE DSCP --- */
                 "a=x-nv-general.useReliableUdp:1\r\n"
                 "a=x-nv-aqos.qosTrafficType:0\r\n"
                 "a=x-nv-vqos[0].qosTrafficType:0\r\n"
                 /* --- FEC: critical for 802.11b packet loss --- */
-                "a=x-nv-vqos[0].fec.enable:1\r\n"
-                "a=x-nv-vqos[0].fec.minRequiredFecPackets:2\r\n"
+                "a=x-nv-vqos[0].fec.enable:%d\r\n"
+                "a=x-nv-vqos[0].fec.repairPercent:%d\r\n"
+                "a=x-nv-vqos[0].fec.minRequiredFecPackets:%d\r\n"
                 "a=x-nv-vqos[0].bllFec.enable:0\r\n"
                 /* --- Feature flags --- */
-                "a=x-ml-general.featureFlags:0\r\n"
+                "a=x-ml-general.featureFlags:%d\r\n"
                 "a=x-nv-general.featureFlags:0\r\n"
                 /* --- Encryption / codec / intra refresh --- */
                 "a=x-ss-general.encryptionEnabled:%d\r\n"
                 "a=x-ss-video[0].chromaSamplingType:0\r\n"
-                "a=x-ss-video[0].intraRefresh:1\r\n"
+                "a=x-ss-video[0].intraRefresh:%d\r\n"
                 /* --- Encoder constraints: profile + entropy coding --- */
                 "a=x-nv-video[0].videoEncoderSlicesPerFrame:1\r\n"
                 "a=x-nv-vqos[0].bitStreamFormat:0\r\n"
@@ -2713,9 +3288,9 @@ static int rtsp_announce(int sock, int enc_enabled)
                 /* --- Color: BT.601 full range, SDR --- */
                 "a=x-nv-video[0].encoderCscMode:1\r\n"
                 "a=x-nv-video[0].dynamicRangeMode:0\r\n"
-                /* --- Display refresh: 60Hz PSP LCD (was hardcoded 0 = BUG) --- */
+                /* --- Stream refresh: must match maxFPS for Sunshine/Apollo --- */
                 "a=x-nv-video[0].clientRefreshRateX100:%d\r\n"
-                /* --- Rate control: latch bitrate (no dynamic scaling) --- */
+                /* --- Rate control: initial/max target with adaptive floor --- */
                 "a=x-nv-video[0].rateControlMode:4\r\n"
                 "a=x-nv-video[0].initialBitrateKbps:%d\r\n"
                 "a=x-nv-video[0].initialPeakBitrateKbps:%d\r\n"
@@ -2740,12 +3315,20 @@ static int rtsp_announce(int sock, int enc_enabled)
                 CLIENT_VERSION,
                 stream_w, stream_h, stream_fps,
                 packet_size,
+                AUDIO_STREAM_CHANNELS,
+                AUDIO_STREAM_CHANNEL_MASK,
+                audio_packet_duration_ms,
+                video_fec_enabled,
+                requested_fec_percent,
+                fec_min_required_packets,
+                (ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1),
                 enc_enabled,
+                intra_refresh_enabled,
                 h264_profile, entropy_mode,
-                g_psp_config.clientRefreshRateX100 > 0 ? g_psp_config.clientRefreshRateX100 : 6000,
+                client_refresh_x100,
                 transport_bitrate_kbps, transport_bitrate_kbps,
-                transport_bitrate_kbps, transport_bitrate_kbps,
-                launch_bitrate_kbps,
+                minimum_bitrate_kbps, transport_bitrate_kbps,
+                configured_bitrate_kbps,
                 announce_video_port,
                 profile_level_id,
                 audio_media_sdp);
@@ -2753,9 +3336,10 @@ static int rtsp_announce(int sock, int enc_enabled)
 
             if (sdp_len >= (int)sizeof(sdp_payload))
                 sdp_len = (int)sizeof(sdp_payload) - 1;
-            /* qosTrafficType:0 tells Apollo this is a remote connection (no DSCP tagging).
-             * If omitted, Apollo defaults to 5/4 (local) which enables qWAVE and
-             * causes WSASendMsg 10022 on the server's UDP send socket. */
+            /* qosTrafficType:0 keeps Sunshine/Apollo's host-side qWAVE/DSCP path
+             * disabled. The PSP cannot benefit from Windows QoS tagging, and the
+             * extra host socket flow setup is wasted work for the low-bitrate PSP
+             * path. */
 
             /* Log the full SDP body we are sending */
             {
@@ -2853,7 +3437,7 @@ static int rtsp_play(int sock)
 
     ret = rtsp_send_and_recv(sock, request, response, sizeof(response));
     if (ret < 0)
-        return ret;
+        return RTSP_ERR_PLAY_SESSION_DEAD;
 
     pair_log("[RTSP] PLAY response: %.180s\n", response);
 
@@ -2861,7 +3445,7 @@ static int rtsp_play(int sock)
     if (!rtsp_response_is_200(response))
     {
         pair_log("[RTSP] PLAY failed (no 200)\n");
-        return -1;
+        return RTSP_ERR_PLAY_SESSION_DEAD;
     }
 
     pair_log("[RTSP] PLAY succeeded, stream started\n");
@@ -2878,7 +3462,7 @@ static void rtsp_parse_stream_ids(const char *sdp)
     const char *p = sdp;
     const char *m_video = NULL;
     const char *m_audio = NULL;
-    
+
     /* Hunt for video and audio blocks in SDP */
     while ((p = strstr(p, "m=")) != NULL) {
         if (strncmp(p, "m=video", 7) == 0) m_video = p;
@@ -2915,8 +3499,8 @@ static void rtsp_parse_stream_ids(const char *sdp)
             }
         }
     }
-    
-    pair_log("[RTSP] Parsed Video ID: %s, Audio ID: %s\n", 
+
+    pair_log("[RTSP] Parsed Video ID: %s, Audio ID: %s\n",
              g_video_stream_id, g_audio_stream_id);
 }
 
@@ -2940,25 +3524,34 @@ int rtsp_session(void)
     g_audio_ping_payload[0] = '\0';
 
     /* ---------------------------------------------------------------
-     * Per-command TCP connections (matching moonlight-common-c).
-     * Sunshine/GFE closes the TCP connection after each RTSP response.
-     * Reusing a socket causes the next recv() to get an immediate FIN
-     * ("empty response").  Create a fresh connection for every command.
+     * Per-command RTSP transactions. Apollo/Sunshine closes the RTSP TCP
+     * socket after each response on this plaintext corever=0 path; hardware
+     * logs show DESCRIBE receives EOF immediately if we try to reuse OPTIONS'
+     * socket. Keep each command bounded and close quickly; SETUP retries are
+     * still single-shot relaunch recovery points because each retry may bind a
+     * fresh UDP receive socket.
      * --------------------------------------------------------------- */
 
     /* 1. OPTIONS */
-    sock = rtsp_connect();
-    if (sock < 0) { pair_log("[RTSP] OPTIONS connect failed\n"); return sock; }
+    sock = rtsp_connect_post_setup("OPTIONS");
+    if (sock < 0) {
+        pair_log("[RTSP] OPTIONS connect failed; launched session RTSP listener is unreachable\n");
+        return RTSP_ERR_PLAY_SESSION_DEAD;
+    }
     ret = rtsp_options(sock);
-    sceNetInetClose(sock); sock = -1;
+    rtsp_close_transaction_socket(&sock);
     if (ret < 0) {
         pair_log("[RTSP] OPTIONS failed, retrying...\n");
         sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
+        sock = rtsp_connect_post_setup("OPTIONS retry");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_options(sock);
-        sceNetInetClose(sock); sock = -1;
-        if (ret < 0) goto rtsp_fail;
+        rtsp_close_transaction_socket(&sock);
+        if (ret < 0) {
+            pair_log("[RTSP] OPTIONS failed twice; launched session is dead, relaunch required\n");
+            ret = RTSP_ERR_PLAY_SESSION_DEAD;
+            goto rtsp_fail;
+        }
     }
 
     /* Auto-detect: if server responded plaintext to our encrypted OPTIONS,
@@ -2975,110 +3568,135 @@ int rtsp_session(void)
     /* 2. DESCRIBE */
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
     memset(sdp_buf, 0, sizeof(sdp_buf));
-    sock = rtsp_connect();
+    sock = rtsp_connect_post_setup("DESCRIBE");
     if (sock < 0) { ret = -1; goto rtsp_fail; }
     ret = rtsp_describe(sock, sdp_buf, sizeof(sdp_buf));
-    sceNetInetClose(sock); sock = -1;
+    rtsp_close_transaction_socket(&sock);
     if (ret < 0) {
         pair_log("[RTSP] DESCRIBE failed, retrying...\n");
         sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
+        sock = rtsp_connect_post_setup("DESCRIBE retry");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_describe(sock, sdp_buf, sizeof(sdp_buf));
-        sceNetInetClose(sock); sock = -1;
-        if (ret < 0) goto rtsp_fail;
+        rtsp_close_transaction_socket(&sock);
+        if (ret < 0) {
+            pair_log("[RTSP] DESCRIBE failed twice; launched session is dead, relaunch required\n");
+            ret = RTSP_ERR_PLAY_SESSION_DEAD;
+            goto rtsp_fail;
+        }
     }
 
-    /* Parse stream IDs and encryptionSupported from DESCRIBE SDP */
+    /* Parse stream IDs and Sunshine encryption feature masks from DESCRIBE SDP */
     rtsp_parse_stream_ids(sdp_buf);
     g_encryption_supported = 0;
+    g_encryption_requested = 0;
     {
         const char *enc_tag = strstr(sdp_buf, "encryptionSupported:");
         if (enc_tag) {
             enc_tag += strlen("encryptionSupported:");
             g_encryption_supported = atoi(enc_tag);
         }
-        pair_log("[RTSP] encryptionSupported=%d\n", g_encryption_supported);
+        enc_tag = strstr(sdp_buf, "encryptionRequested:");
+        if (enc_tag) {
+            enc_tag += strlen("encryptionRequested:");
+            g_encryption_requested = atoi(enc_tag);
+        }
+        pair_log("[RTSP] encryptionSupported=0x%x requested=0x%x\n",
+                 g_encryption_supported, g_encryption_requested);
     }
-
     pair_log("[RTSP] DESCRIBE done, delaying 100ms before SETUP...\n");
     sceKernelDelayThread(100 * 1000);
 
-    /* 3a. SETUP audio (non-fatal — video continues if audio SETUP fails).
-     * Sunshine/Apollo starts an audio session thread for every stream and will
-     * tear down the whole session if the client never sends the audio ping.
-     * Even when local playback is disabled, keep RTSP audio SETUP/ping alive;
-     * audioEnabled=0 only skips Opus decode/playback on the PSP. */
+    /* 3a. SETUP audio. Sunshine still requires an audio SS_PING to keep the
+     * session alive. With Audio Disabled, this remains a client-side low-work
+     * path: the PSP performs audio SETUP/ping, drains/drops audio RTP, and
+     * skips Opus/SRC/playback. */
     g_audio_rtsp_ok = 0;
-    if (!g_psp_config.audioEnabled) {
-        pair_log("[RTSP] audio playback disabled by config; keeping SETUP for host session validity\n");
-    }
-    pair_log("[RTSP] connecting for SETUP audio...\n");
+    pair_log("[RTSP] connecting for SETUP audio%s...\n",
+             g_psp_config.audioEnabled ? "" : " (keepalive-only)");
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_VIDEO);
-    sock = rtsp_connect();
+    sock = rtsp_connect_post_setup("SETUP audio");
     if (sock < 0) {
         pair_log("[RTSP] WARN: audio connect failed, continuing without audio\n");
     } else {
         ret = rtsp_setup_stream(sock, g_audio_stream_id);
-        sceNetInetClose(sock); sock = -1;
+        rtsp_close_transaction_socket(&sock);
         if (ret < 0) {
             pair_log("[RTSP] SETUP audio failed, retrying...\n");
             sceKernelDelayThread(500 * 1000);
-            sock = rtsp_connect();
+            sock = rtsp_connect_post_setup("SETUP audio retry");
             if (sock >= 0) {
                 ret = rtsp_setup_stream(sock, g_audio_stream_id);
-                sceNetInetClose(sock); sock = -1;
+                rtsp_close_transaction_socket(&sock);
             }
         }
         if (ret >= 0) {
             g_audio_rtsp_ok = 1;
-            ret = audio_thread_start_ping_only();
-            if (ret < 0) pair_log("[RTSP] WARN: audio ping failed\n");
+            rtsp_seed_media_server_ip();
+            if (audio_thread_start_ping_only() == 0) {
+                pair_log("[RTSP] early audio ping started before SETUP video%s\n",
+                         g_psp_config.audioEnabled ? "" : " (keepalive-only)");
+            } else {
+                pair_log("[RTSP] WARN: early audio ping failed before SETUP video\n");
+            }
         } else {
             pair_log("[RTSP] WARN: audio SETUP failed after retry, continuing without audio\n");
         }
     }
 
-    pair_log("[RTSP] SETUP audio %s, delaying 50ms before SETUP video...\n",
-             g_audio_rtsp_ok ? "done" : "skipped/failed");
-    sceKernelDelayThread(50 * 1000);
+    if (g_audio_rtsp_ok) {
+        pair_log("[RTSP] SETUP audio done, delaying 50ms before SETUP video...\n");
+        sceKernelDelayThread(50 * 1000);
+    } else {
+        pair_log("[RTSP] SETUP audio skipped/failed; continuing directly to SETUP video...\n");
+    }
 
     /* 3b. SETUP video */
-    sock = rtsp_connect();
+    sock = rtsp_connect_post_setup("SETUP video");
     if (sock < 0) { ret = -1; goto rtsp_fail; }
     ret = rtsp_setup_stream(sock, g_video_stream_id);
-    sceNetInetClose(sock); sock = -1;
+    rtsp_close_transaction_socket(&sock);
     if (ret < 0) {
         pair_log("[RTSP] SETUP video failed, retrying...\n");
         sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
+        sock = rtsp_connect_post_setup("SETUP video retry");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_setup_stream(sock, g_video_stream_id);
-        sceNetInetClose(sock); sock = -1;
-        if (ret < 0) goto rtsp_fail;
+        rtsp_close_transaction_socket(&sock);
+        if (ret < 0) {
+            ret = RTSP_ERR_PLAY_SESSION_DEAD;
+            goto rtsp_fail;
+        }
     }
 
     sceKernelDelayThread(50 * 1000);
 
     /* 3c. SETUP control */
-    sock = rtsp_connect();
+    sock = rtsp_connect_post_setup("SETUP control");
     if (sock < 0) { ret = -1; goto rtsp_fail; }
     ret = rtsp_setup_stream(sock, g_control_stream_id);
-    sceNetInetClose(sock); sock = -1;
+    rtsp_close_transaction_socket(&sock);
     if (ret < 0) {
         pair_log("[RTSP] SETUP control failed, retrying...\n");
         sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
+        sock = rtsp_connect_post_setup("SETUP control retry");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_setup_stream(sock, g_control_stream_id);
-        sceNetInetClose(sock); sock = -1;
-        if (ret < 0) goto rtsp_fail;
+        rtsp_close_transaction_socket(&sock);
+        if (ret < 0) {
+            ret = RTSP_ERR_PLAY_SESSION_DEAD;
+            goto rtsp_fail;
+        }
     }
 
-    sceKernelDelayThread(100 * 1000);
+    /* Idempotent safety net for audio-enabled streams. */
+    if (g_audio_rtsp_ok) {
+        ret = audio_thread_start_ping_only();
+        if (ret < 0) pair_log("[RTSP] WARN: audio ping failed\n");
+    }
 
     upnp_video_port = (g_video_client_port > 0 && g_video_client_port <= 65535)
-                         ? (unsigned short)g_video_client_port
+                          ? (unsigned short)g_video_client_port
                          : 0;
     if (g_audio_rtsp_ok) {
         audio_thread_reserve_client_port(&upnp_audio_port);
@@ -3098,78 +3716,94 @@ int rtsp_session(void)
 
     /* 4. ANNOUNCE */
     {
-        /* Negotiate encryption: only enable video encryption (bit 0).
+        /* Negotiate encryption. SS_ENC_CONTROL_V2 is the low-overhead control
          * The PSP client does NOT implement SS_ENC_CONTROL_V2 (bit 2) —
          * requesting it causes the server to ECONNRESET on RTSP PLAY.
          * Track audio encryption separately for the audio recv loop.
          *
-         * When disableEncryption=1, force enc_to_use=0 and audio_enc=0
-         * to skip AES-GCM/CBC on all AV streams (~5% CPU savings on
-         * 333MHz PSP).  Control stream encryption stays active. */
-        int enc_to_use = (g_encryption_supported & 1) ? 1 : 0;  /* SS_ENC_VIDEO only */
-        g_audio_encryption_enabled = (g_encryption_supported & 2) ? 1 : 0;
-        if (g_psp_config.disableEncryption) {
-            enc_to_use = 0;
-            g_audio_encryption_enabled = 0;
-            pair_log("[RTSP] AV encryption DISABLED by config (control enc stays active)\n");
+         * The PSP control stream is always Gen7Enc in control_stream.c, so
+         * advertise SS_ENC_CONTROL_V2 whenever Sunshine supports it. The
+         * disableEncryption flag disables video/audio AES, which is the
+         * measurable steady-state PSP-1000 stream load. */
+        int enc_to_use = 0;
+        if (g_encryption_supported & SS_ENC_CONTROL_V2) {
+            enc_to_use |= SS_ENC_CONTROL_V2;
         }
-        pair_log("[RTSP] enc_to_use=%d (audio_enc=%d server_supported=0x%x disableConfig=%d)\n",
+
+        g_audio_encryption_enabled = 0;
+        if (!g_psp_config.disableEncryption) {
+            if ((g_encryption_requested & SS_ENC_VIDEO) &&
+                (g_encryption_supported & SS_ENC_VIDEO)) {
+                enc_to_use |= SS_ENC_VIDEO;
+            }
+            if (g_psp_config.audioEnabled && g_audio_rtsp_ok &&
+                (g_encryption_requested & SS_ENC_AUDIO) &&
+                (g_encryption_supported & SS_ENC_AUDIO)) {
+                enc_to_use |= SS_ENC_AUDIO;
+                g_audio_encryption_enabled = 1;
+            }
+        } else {
+            pair_log("[RTSP] AV encryption disabled by config; keeping RTSP/control compatibility control-v2=%d\n",
+                     (enc_to_use & SS_ENC_CONTROL_V2) ? 1 : 0);
+        }
+
+        pair_log("[RTSP] enc_to_use=0x%x (audio_enc=%d server_supported=0x%x requested=0x%x disableConfig=%d)\n",
                  enc_to_use, g_audio_encryption_enabled,
-                 g_encryption_supported, g_psp_config.disableEncryption);
-        sock = rtsp_connect();
+                 g_encryption_supported, g_encryption_requested,
+                 g_psp_config.disableEncryption);
+        sock = rtsp_connect_post_setup("ANNOUNCE");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_announce(sock, enc_to_use);
-        sceNetInetClose(sock); sock = -1;
+        rtsp_close_transaction_socket(&sock);
         if (ret < 0) {
             pair_log("[RTSP] ANNOUNCE failed, retrying...\n");
             sceKernelDelayThread(500 * 1000);
-            sock = rtsp_connect();
+            sock = rtsp_connect_post_setup("ANNOUNCE retry");
             if (sock < 0) { ret = -1; goto rtsp_fail; }
             ret = rtsp_announce(sock, enc_to_use);
-            sceNetInetClose(sock); sock = -1;
+            rtsp_close_transaction_socket(&sock);
             if (ret < 0) goto rtsp_fail;
         }
     }
 
-    sceKernelDelayThread(1000 * 1000);  /* 1s: let server settle after ANNOUNCE */
+    /* Sunshine/Apollo creates the stream session from ANNOUNCE and immediately
+     * starts waiting for SS_PING. Keep one low-cost video prime before PLAY,
+     * then follow the common-c order and issue PLAY immediately. The audio
+     * ping thread is already running here; for Audio Disabled it exists only
+     * to satisfy Sunshine's session liveness check. */
+    rtsp_prime_video_endpoint("pre-PLAY", 100 * 1000);
 
-    /* Note: intraRefresh:1 is in SDP but only works for HEVC on Sunshine.
-     * For H.264, IDR requests are the only way to get keyframes.
-     * g_intra_refresh_active stays 0 (default) so IDR requests work. */
+    /* Apollo/AMF has historically been sensitive to low-res refresh-mode
+     * changes, so intraRefresh is negotiated explicitly above and can be
+     * forced at build time when a hardware run proves the auto mode wrong. */
 
     /* 5. PLAY */
-    sock = rtsp_connect();
+    sock = rtsp_connect_post_setup("PLAY");
     if (sock < 0) { ret = -1; goto rtsp_fail; }
     ret = rtsp_play(sock);
     if (ret < 0) {
-        sceNetInetClose(sock); sock = -1;
+        rtsp_close_transaction_socket(&sock);
+        if (ret == RTSP_ERR_PLAY_SESSION_DEAD) {
+            pair_log("[RTSP] PLAY reset/failed; launched session is dead, relaunch required\n");
+            goto rtsp_fail;
+        }
         pair_log("[RTSP] PLAY failed, retrying...\n");
         sceKernelDelayThread(500 * 1000);
-        sock = rtsp_connect();
+        sock = rtsp_connect_post_setup("PLAY retry");
         if (sock < 0) { ret = -1; goto rtsp_fail; }
         ret = rtsp_play(sock);
-        if (ret < 0) { sceNetInetClose(sock); sock = -1; goto rtsp_fail; }
+        if (ret < 0) { rtsp_close_transaction_socket(&sock); goto rtsp_fail; }
     }
     /* Keep PLAY socket open for potential TEARDOWN later */
     g_rtsp_persistent_sock = sock;
     sock = -1;
 
-    /* Prime video endpoint */
-    if (network_me_send_video_ping_burst(g_video_server_ip,
-                                         g_video_server_port,
-                                         g_video_ping_payload) == 0) {
-        pair_log("[RTSP] sent initial video ping burst to %s:%d\n",
-                 g_video_server_ip, g_video_server_port);
-    }
-
-    /* Prime audio endpoint — mirrors video burst so Sunshine locks onto
-     * the client audio port immediately after PLAY. */
-    if (g_audio_rtsp_ok) {
-        if (audio_thread_send_ping_burst() == 0) {
-            pair_log("[RTSP] sent initial audio ping burst to %s:%d\n",
-                     g_video_server_ip, g_audio_server_port);
-        }
-    }
+    /* Keep the video endpoint fresh after PLAY returns. The audio SS_PING
+     * thread is already running from SETUP audio; sending an extra 3-ping
+     * audio burst here pulls audio+audio-FEC into the PSP before the first
+     * video IDR has settled, which increases startup packet pressure on
+     * PSP-1000 WiFi. */
+    rtsp_prime_video_endpoint("post-PLAY", 0);
 
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_READY);
     sceKernelDelayThread(100 * 1000);
@@ -3180,7 +3814,17 @@ int rtsp_session(void)
 
 rtsp_fail:
     upnp_remove_stream_mappings();
-    if (sock >= 0) sceNetInetClose(sock);
+    if (sock >= 0) rtsp_close_transaction_socket(&sock);
+    if (g_audio_rtsp_ok) {
+        audio_thread_shutdown();
+        g_audio_rtsp_ok = 0;
+    }
+    if (g_video_client_port > 0) {
+        network_me_shutdown();
+        g_video_client_port = 0;
+    }
+    g_video_ping_payload[0] = '\0';
+    g_audio_ping_payload[0] = '\0';
     diag_log_flush();
     return ret;
 }
@@ -3199,7 +3843,7 @@ static void generate_random_pin(char *pin_buf)
 {
     /* Use current time as seed for pseudo-random generation */
     u32 seed = sceKernelGetSystemTimeLow();
-    
+
     /* Generate 4 random digits */
     for (int i = 0; i < PIN_DIGITS; i++) {
         /* Simple LCG (Linear Congruential Generator) */
@@ -3238,6 +3882,15 @@ typedef struct {
  *
  * Returns : 0 on success, -1 on failure.
  */
+static void http_pair_close_abortive(int sock)
+{
+    if (sock >= 0) {
+        struct linger lg = { 1, 0 };
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        sceNetInetClose(sock);
+    }
+}
+
 static int http_pair_get(const char *url, char *resp, int resp_size)
 {
     int  sock = -1;
@@ -3302,7 +3955,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
         int e = sceNetInetGetErrno();
         if (e != EINPROGRESS && e != EAGAIN && e != EWOULDBLOCK) {
             pair_log("[HTTP] connect failed errno=%d\n", e);
-            sceNetInetClose(sock);
+            http_pair_close_abortive(sock);
             return -1;
         }
     }
@@ -3333,7 +3986,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
 
     if (!connected) {
         pair_log("[HTTP] connect timed out %s:%d\n", host, port);
-        sceNetInetClose(sock);
+        http_pair_close_abortive(sock);
         return -1;
     }
 
@@ -3354,7 +4007,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
                              0, 0, &send_errno, &send_off) != 0) {
             pair_log("[HTTP] send failed at %d/%d errno=%d\n",
                      send_off, piece_len, send_errno);
-            sceNetInetClose(sock);
+            http_pair_close_abortive(sock);
             return -1;
         }
 
@@ -3365,7 +4018,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
                              0, 0, &send_errno, &send_off) != 0) {
             pair_log("[HTTP] send path failed at %d/%d errno=%d\n",
                      send_off, piece_len, send_errno);
-            sceNetInetClose(sock);
+            http_pair_close_abortive(sock);
             return -1;
         }
 
@@ -3380,7 +4033,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
                              0, 0, &send_errno, &send_off) != 0) {
             pair_log("[HTTP] send hdr failed at %d/%d errno=%d\n",
                      send_off, hdr_len, send_errno);
-            sceNetInetClose(sock);
+            http_pair_close_abortive(sock);
             return -1;
         }
     }
@@ -3410,6 +4063,27 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
 
     pair_log("[HTTP] body %.120s\n", resp);
     return (total > 0) ? 0 : -1;
+}
+
+static void pairing_unpair_best_effort(const char *host, const char *pair_uuid)
+{
+    char url[256];
+    char resp[256];
+
+    if (!host || !host[0]) {
+        return;
+    }
+
+    snprintf(url, sizeof(url),
+             "http://%s:%d/unpair?uniqueid=%s&uuid=%s",
+             host, SUNSHINE_HTTP_PORT, CLIENT_UNIQUE_ID,
+             (pair_uuid && pair_uuid[0]) ? pair_uuid : client_identity_get_uuid());
+    resp[0] = '\0';
+    if (http_pair_get(url, resp, sizeof(resp)) == 0) {
+        pair_log("[PAIR] cleanup /unpair response: %.80s\n", resp);
+    } else {
+        pair_log("[PAIR] cleanup /unpair failed\n");
+    }
 }
 
 /*
@@ -3569,6 +4243,7 @@ static int pairing_thread_func(SceSize args, void *argp)
     unsigned char aes_key_full[32];
     const char   *pair_uuid;
     const char   *active_cert_hex;
+    int           pairing_success = 0;
 
     pair_log("[PAIR] Thread started host=%s pin=****\n", host);
     pair_uuid = client_identity_get_uuid();
@@ -3771,13 +4446,43 @@ static int pairing_thread_func(SceSize args, void *argp)
         ta->result = -10;
         goto done;
     }
-    pair_log("[PAIR] Step 4 OK - pairing complete!\n");
+    pair_log("[PAIR] Step 4 OK\n");
+
+    /* Official Moonlight clients finish pairing with an authenticated HTTPS
+     * pairchallenge using the newly registered client certificate.  Without
+     * this, some Sunshine versions keep the web UI in a failed/half-paired
+     * state even when the four plain HTTP challenge steps succeeded. */
+    if (ta->cancel) goto done;
+    pair_log("[PAIR] Step 5: HTTPS pairchallenge\n");
+    snprintf(url, sizeof(url),
+             "/pair?uniqueid=%s&uuid=%s&devicename=%s&updateState=1&phrase=pairchallenge",
+             CLIENT_UNIQUE_ID, pair_uuid, DEVICE_NAME);
+
+    resp[0] = '\0';
+    ret = https_launch_get(host, SUNSHINE_HTTPS_PORT, url, resp, sizeof(resp));
+    if (ret < 0) {
+        pair_log("[PAIR] Step 5 HTTPS failed\n");
+        ta->result = -11;
+        goto done;
+    }
+    ret = xml_get_value_safe(resp, "paired", paired_val, sizeof(paired_val));
+    if (ret < 0 || strcmp(paired_val, "1") != 0) {
+        pair_log("[PAIR] Step 5 rejected (paired=%s)\n",
+                 (ret < 0) ? "<missing>" : paired_val);
+        ta->result = -12;
+        goto done;
+    }
+    pair_log("[PAIR] Step 5 OK - pairing complete!\n");
 
     /* Pairing protocol succeeded */
+    pairing_success = 1;
     *(ta->is_paired) = 1;
     ta->result = 0;
 
 done:
+    if (!pairing_success) {
+        pairing_unpair_best_effort(host, pair_uuid);
+    }
     ta->thread_done = 1;
     return 0;
 }
@@ -3905,28 +4610,55 @@ int network_connect_all(void)
     /* Brief delay to let network settle after pairing */
     sceKernelDelayThread(100 * 1000);
 
+    if (s_retry_appid >= 0 && strcmp(s_retry_host, g_sunshine_host) != 0) {
+        network_connect_clear_retry_app();
+    }
+
     /*--- Show Game Library so the user picks an app -------------------------*/
     {
-        int selected_appid = game_grid_ui_run(g_sunshine_host);
-        if (selected_appid == -3) {
-            /* Empty game list → probable stale pairing. Clear cached state
-             * so the next connect_to_sunshine() triggers a fresh PIN pair. */
-            pair_log("[STEP 4] Game list empty — clearing stale pairing for %s\n",
-                     g_sunshine_host);
-            g_is_paired = 0;
-            g_last_paired_host[0] = '\0';
-            return -1;  /* -1 triggers full re-pair flow in main.c */
+        int selected_appid;
+        const char *selected_title;
+
+        if (s_retry_appid >= 0) {
+            selected_appid = s_retry_appid;
+            selected_title = s_retry_title[0] ? s_retry_title : game_grid_ui_get_selected_title();
+            pair_log("[STEP 4] Retrying previous appid=%d (%s) after infrastructure failure\n",
+                     selected_appid,
+                     selected_title && selected_title[0] ? selected_title : "unknown");
+        } else {
+            selected_appid = game_grid_ui_run(g_sunshine_host);
+            if (selected_appid == -3) {
+                /* Empty game list -> probable stale pairing. Clear cached state
+                 * so the next connect_to_sunshine() triggers a fresh PIN pair. */
+                pair_log("[STEP 4] Game list empty - clearing stale pairing for %s\n",
+                         g_sunshine_host);
+                network_connect_clear_retry_app();
+                g_is_paired = 0;
+                g_last_paired_host[0] = '\0';
+                return -1;  /* -1 triggers full re-pair flow in main.c */
+            }
+            if (selected_appid < 0) {
+                /* User pressed Circle (back) - return to host menu */
+                pair_log("[STEP 4] User cancelled game selection\n");
+                network_connect_clear_retry_app();
+                return -2;
+            }
+            selected_title = game_grid_ui_get_selected_title();
+            s_retry_appid = selected_appid;
+            strncpy(s_retry_host, g_sunshine_host, sizeof(s_retry_host) - 1);
+            s_retry_host[sizeof(s_retry_host) - 1] = '\0';
+            if (selected_title && selected_title[0]) {
+                strncpy(s_retry_title, selected_title, sizeof(s_retry_title) - 1);
+                s_retry_title[sizeof(s_retry_title) - 1] = '\0';
+            } else {
+                s_retry_title[0] = '\0';
+            }
+            pair_log("[STEP 4] User selected appid=%d\n", selected_appid);
         }
-        if (selected_appid < 0) {
-            /* User pressed Circle (back) — return to host menu */
-            pair_log("[STEP 4] User cancelled game selection\n");
-            return -2;
-        }
-        pair_log("[STEP 4] User selected appid=%d\n", selected_appid);
 
         /* Start the 60fps connection UI render thread */
         stream_connect_start();
-        stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
+        stream_connect_draw(selected_title, STREAM_PHASE_RTSP);
 
         /* Launch/resume stream session before RTSP handshake, as required by
          * Sunshine's /launch contract.  Retry once on failure — WiFi packet
@@ -3935,12 +4667,13 @@ int network_connect_all(void)
         if (launch_ret != 0 && launch_ret != -401) {
             pair_log("[STEP 4] launch attempt 1 failed (%d), retrying after 2s...\n", launch_ret);
             sceKernelDelayThread(2000 * 1000);
-            stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_RTSP);
+            stream_connect_draw(selected_title, STREAM_PHASE_RTSP);
             launch_ret = sunshine_launch_session(selected_appid);
         }
         if (launch_ret == -401) {
             /* 401: stale pairing already cleared; signal re-pair needed */
             pair_log("[STEP 4] 401 - stale pairing cleared, need re-pair\n");
+            network_connect_clear_retry_app();
             stream_connect_stop();
             return -1;  /* -1 triggers full re-pair flow in main.c */
         }
@@ -3957,6 +4690,10 @@ int network_connect_all(void)
     sceKernelDelayThread(500 * 1000);
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
     ret = rtsp_session();
+    if (ret == RTSP_ERR_PLAY_SESSION_DEAD) {
+        pair_log("[RTSP] launched session RTSP not reachable yet; keeping same launch for retry\n");
+        ret = -1;
+    }
     if (ret < 0)
     {
         /* RTSP failed — retry with increasing backoff.  WiFi packet loss
@@ -3967,6 +4704,10 @@ int network_connect_all(void)
         sceKernelDelayThread(1000 * 1000);
         stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_CONTROL);
         ret = rtsp_session();
+        if (ret == RTSP_ERR_PLAY_SESSION_DEAD) {
+            pair_log("[RTSP] retry RTSP listener still unreachable; one final same-launch retry\n");
+            ret = -1;
+        }
     }
     if (ret < 0)
     {
@@ -3982,13 +4723,36 @@ int network_connect_all(void)
         {
             char cancel_path[256];
             char cancel_resp[512];
+            int cancel_ret;
+            int cancel_attempt;
             snprintf(cancel_path, sizeof(cancel_path),
-                     "/cancel?uniqueid=%s", CLIENT_UNIQUE_ID);
-            pair_log("[CANCEL] sending %s\n", cancel_path);
-            https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
-                             cancel_path, cancel_resp, sizeof(cancel_resp));
-            pair_log("[CANCEL] response: %.120s\n", cancel_resp);
+                     "/cancel?uniqueid=%s&uuid=%s",
+                     CLIENT_UNIQUE_ID, client_identity_get_uuid());
+            cancel_ret = -1;
+            for (cancel_attempt = 1; cancel_attempt <= 2; cancel_attempt++) {
+                pair_log("[CANCEL] sending %s (attempt %d/2)\n",
+                         cancel_path, cancel_attempt);
+                cancel_resp[0] = '\0';
+                cancel_ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
+                                              cancel_path, cancel_resp, sizeof(cancel_resp));
+                if (cancel_ret >= 0) {
+                    break;
+                }
+                if (cancel_attempt < 2) {
+                    pair_log("[CANCEL] attempt %d failed (%d), retrying after 3s\n",
+                             cancel_attempt, cancel_ret);
+                    sceKernelDelayThread(3000 * 1000);
+                }
+            }
+            if (cancel_ret >= 0) {
+                pair_log("[CANCEL] response: %.120s\n", cancel_resp);
+            } else {
+                pair_log("[CANCEL] request failed (%d); host may keep stale RTSP session\n",
+                         cancel_ret);
+            }
         }
+        pair_log("[CANCEL] waiting 8s for host RTSP/session cleanup\n");
+        sceKernelDelayThread(8000 * 1000);
         /* Return -3 to distinguish RTSP failure from user cancel (-2) and
          * pairing failure (-1).  Pairing was already successful so
          * g_is_paired should stay set; -3 is retryable in main.c. */
@@ -3997,6 +4761,7 @@ int network_connect_all(void)
     }
 
     stream_connect_stop();
+    network_connect_clear_retry_app();
     return 0;
 }
 
@@ -4012,12 +4777,20 @@ static int cancel_thread_func(SceSize args, void *argp)
     if (g_sunshine_host[0]) {
         char cancel_path[256];
         char cancel_resp[512];
+        int cancel_ret;
         snprintf(cancel_path, sizeof(cancel_path),
-                 "/cancel?uniqueid=%s", CLIENT_UNIQUE_ID);
+                 "/cancel?uniqueid=%s&uuid=%s",
+                 CLIENT_UNIQUE_ID, client_identity_get_uuid());
         pair_log("[CANCEL-THREAD] Sending explicit abort via %s\n", cancel_path);
-        https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
-                         cancel_path, cancel_resp, sizeof(cancel_resp));
-        pair_log("[CANCEL-THREAD] explicit abort response: %.120s\n", cancel_resp);
+        cancel_resp[0] = '\0';
+        cancel_ret = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
+                                      cancel_path, cancel_resp, sizeof(cancel_resp));
+        if (cancel_ret >= 0) {
+            pair_log("[CANCEL-THREAD] explicit abort response: %.120s\n", cancel_resp);
+        } else {
+            pair_log("[CANCEL-THREAD] explicit abort request failed (%d)\n",
+                     cancel_ret);
+        }
     }
 
     sceKernelExitDeleteThread(0);
@@ -4032,7 +4805,7 @@ void network_cancel_stream_session(void)
         /* thread already in progress, don't overlap */
         return;
     }
-    
+
     g_cancel_tid = sceKernelCreateThread("cancel_th",
                                         cancel_thread_func,
                                         0x18,

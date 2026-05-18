@@ -28,7 +28,7 @@ QSV is available on:
 | `slower` | Slow | Excellent |
 | `veryslow` | Slowest | Best |
 
-**PSP recommendation:** `veryfast` or `faster`. At 368×208, quality differences between presets are negligible. Use the fastest preset for lowest encoding latency.
+**PSP recommendation:** `veryfast` or `faster`. At the v1.2 PSP preset sizes, quality differences between presets are negligible. Use the fastest preset for lowest encoding latency.
 
 ---
 
@@ -68,7 +68,7 @@ qsv_preset = veryfast
 qsv_coder = cavlc
 qsv_slow_hevc = disabled
 qp = 28
-fec_percentage = 20
+fec_percentage = 35
 ```
 
 ## QSV Quirks and Tips

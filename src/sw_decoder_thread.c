@@ -38,6 +38,7 @@
 #include "settings_menu.h"  /* PspConfig */
 #include "decode_flags.h"
 #include "safety_buffer.h"
+#include "runtime_telemetry.h"
 
 extern PspConfig g_psp_config;
 
@@ -49,10 +50,16 @@ extern void oh264_pipeline_invalidate_refs(void);
 extern void oh264_pipeline_flush_buffers(void);
 extern int  oh264_pipeline_reset_codec(void);
 extern void oh264_pipeline_abandon(void);
+extern volatile u32 g_oh264_me_wait_us;
 
 /* Forward declaration — lightweight CABAC detection */
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len);
+static void check_nal_for_sps_contract(const u8 *nal_data, int nal_len);
+static int sps_rewrite_frame_low_latency(const u8 *nal_data, int nal_len,
+                                         u8 *out_buf, int out_cap,
+                                         int *out_len);
 static int s_pps_checked = 0;  /* PPS scan state — reset in init for new streams */
+static int s_sps_checked = 0;  /* SPS low-latency contract scan state */
 
 /* CABAC dialog gate — main thread sets to 1 while dialog is on-screen */
 volatile int g_cabac_dialog_active = 0;
@@ -70,6 +77,10 @@ volatile int g_cabac_dialog_active = 0;
 #define PACKET_BACKLOG_FLUSH_CABAC     224u
 #define DECODER_DRAIN_BATCH_LIMIT      128
 #define SW_DECODER_THREAD_PRIORITY     0x21
+#define OH264_RET_PENDING_NO_OUTPUT    (-5)
+#define OH264_RET_REF_LOST_NO_OUTPUT   (-7)
+#define REF_LOSS_RFI_SPAN_MIN          4u
+#define REF_LOSS_RFI_SPAN_MAX          8u
 
 #define dec_log(fmt, ...) diag_log_write("DEC", fmt, ##__VA_ARGS__)
 
@@ -80,16 +91,76 @@ volatile int g_cabac_dialog_active = 0;
 static SceUID           g_dec_thread_id = -1;
 static SceUID           g_dec_sema = -1;
 static volatile int     g_dec_running = 0;
+static u8               g_sps_fixup_buf[16384] __attribute__((aligned(64)));
 
 /* These are now defined in openh264_decode.cpp */
 extern int              g_saw_first_idr;
 extern volatile int     g_idr_fully_decoded;
+extern volatile unsigned int g_last_good_frame;
 int                     g_decoder_ready = 0;
 
 static int              g_frames_decoded = 0;
 static int              g_frames_dropped = 0;
 static FrameRingBuffer *g_frame_rb = NULL;
 static PacketRingBuffer *g_packet_rb = NULL;
+
+static unsigned int ref_loss_rfi_span_limit(void)
+{
+    unsigned int fps = (g_psp_config.fps > 0) ? (unsigned int)g_psp_config.fps : 20u;
+    unsigned int limit = fps / 3u;
+
+    if (limit < REF_LOSS_RFI_SPAN_MIN) {
+        limit = REF_LOSS_RFI_SPAN_MIN;
+    }
+    if (limit > REF_LOSS_RFI_SPAN_MAX) {
+        limit = REF_LOSS_RFI_SPAN_MAX;
+    }
+    return limit;
+}
+
+static unsigned int frame_span_inclusive(unsigned int start, unsigned int end)
+{
+    if (end < start) {
+        return 1u;
+    }
+    return (end - start) + 1u;
+}
+
+static void request_reference_recovery(unsigned int span)
+{
+    if (g_refs_corrupted || !g_idr_fully_decoded) {
+        dec_log("reference recovery: decoder refs corrupt, requesting IDR (lgf=%u)\n",
+                (unsigned)g_last_good_frame);
+        if (!g_idr_fully_decoded && g_last_good_frame == 0) {
+            control_stream_request_idr_startup();
+        } else {
+            control_stream_request_idr();
+        }
+        return;
+    }
+
+    if (g_saw_first_idr && g_last_good_frame != 0) {
+        unsigned int start = g_last_good_frame + 1;
+        unsigned int end = g_last_good_frame + span;
+        unsigned int span_limit = ref_loss_rfi_span_limit();
+
+        if (end < start) {
+            end = start;
+        }
+        if (frame_span_inclusive(start, end) > span_limit) {
+            dec_log("reference recovery: span=%u exceeds RFI limit=%u, requesting IDR (lgf=%u)\n",
+                    frame_span_inclusive(start, end), span_limit,
+                    (unsigned)g_last_good_frame);
+            g_refs_corrupted = 1;
+            g_idr_fully_decoded = 0;
+            control_stream_request_idr();
+            return;
+        }
+        control_stream_request_rfi(start, end);
+    } else {
+        control_stream_request_idr_startup();
+    }
+}
 
 static void nal_scan_headers(const u8 *nal_data, int nal_len,
                              int *out_has_idr, int *out_has_sync_nal)
@@ -157,6 +228,8 @@ static u32 decoder_flush_threshold_packets(void)
 
 /* Timestamp of last decoded frame — read by main loop for latency display */
 volatile u32 g_last_frame_decode_us = 0;
+volatile int g_last_decode_output_ok = 0;
+volatile unsigned int g_decode_current_frame_id = 0;
 
 /* Per-frame decode duration (µs) — smoothed EMA for HUD display */
 volatile u32 g_decode_time_us = 0;
@@ -183,8 +256,13 @@ static void push_sw_frame(u8 *rgba_frame)
     /* Zero-copy: push orchestrator's RGBA double-buffer pointer directly.
      * The orchestrator alternates g_rgba_buf[0]/[1], so the previous
      * frame's buffer stays valid until the next-next decode (~186ms).
-     * display_frame() calls sceKernelDcacheWritebackInvalidateAll()
-     * + sceGuSync(0,0) before GPU upload, ensuring coherency. */
+     * display_frame() writes back the active texture range before the
+     * GU blit, ensuring coherency without a whole-cache flush.
+     *
+     * Presentation policy mirrors the handheld clients that keep latency
+     * bounded by preserving the newest frame. If the display ring is full,
+     * replace the newest queued pointer instead of dropping this freshly
+     * decoded frame. The consumer already skips to head-1 before drawing. */
     u32 h = g_frame_rb->head;
     u32 n = (h + 1) % FRAME_RING_SLOTS;
     if (n != g_frame_rb->tail) {
@@ -193,11 +271,16 @@ static void push_sw_frame(u8 *rgba_frame)
         g_frame_rb->frame_ready = 1;
         g_last_frame_decode_us = sceKernelGetSystemTimeLow();
     } else {
-        static int s_drop_count = 0;
-        s_drop_count++;
-        if (s_drop_count <= 5 || (s_drop_count % 120) == 0) {
-            dec_log("RING_FULL drop=%d h=%u t=%u\n",
-                    s_drop_count, (unsigned)h, (unsigned)g_frame_rb->tail);
+        static int s_replace_count = 0;
+        u32 replace = (h + FRAME_RING_SLOTS - 1) % FRAME_RING_SLOTS;
+        g_frame_rb->frame_data[replace] = rgba_frame;
+        g_frame_rb->frame_ready = 1;
+        g_last_frame_decode_us = sceKernelGetSystemTimeLow();
+        s_replace_count++;
+        if (s_replace_count <= 5 || (s_replace_count % 120) == 0) {
+            dec_log("RING_FULL keep-latest=%d h=%u t=%u replace=%u\n",
+                    s_replace_count, (unsigned)h,
+                    (unsigned)g_frame_rb->tail, (unsigned)replace);
         }
     }
 
@@ -213,8 +296,10 @@ static void push_sw_frame(u8 *rgba_frame)
 
 void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
 {
+#ifndef RETAIL_BUILD
     static u64 s_prev_done = 0;
     static int s_perf_count = 0;
+#endif
     static int s_wait_count = 0;
     static int s_no_output_streak = 0;
     static int s_cb_count = 0;
@@ -224,6 +309,8 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     int decode_len;
     int decode_has_idr = 0;
     int decode_has_sync_nal = 0;
+
+    g_last_decode_output_ok = 0;
 
     if (!nal_data || nal_len <= 0) return;
 
@@ -256,8 +343,10 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     {
         extern volatile int g_decode_counters_reset_pending;
         if (g_decode_counters_reset_pending) {
+#ifndef RETAIL_BUILD
             s_prev_done = 0;
             s_perf_count = 0;
+#endif
             s_wait_count = 0;
             s_no_output_streak = 0;
             s_cb_count = 0;
@@ -304,7 +393,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
                 extern volatile unsigned int g_last_good_frame;
                 g_last_good_frame = 0;
             }
-            control_stream_request_idr();
+            control_stream_request_idr_force();
             s_wait_count = 0;
             s_no_output_streak = 0;
         }
@@ -371,8 +460,8 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             dec_log("STARTUP P-SKIP: skip=%u len=%d waiting for IDR/SPS\n",
                     (unsigned)s_startup_pskip_count, decode_len);
         }
-        if ((s_startup_pskip_count % 30) == 1) {
-            control_stream_request_idr();
+        if ((s_startup_pskip_count % 10) == 1) {
+            control_stream_request_idr_startup();
         }
         g_frames_dropped++;
         return;
@@ -404,12 +493,28 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     u64 t_cb_entry;
     sceRtcGetCurrentTick(&t_cb_entry);
 
+    if (decode_has_sync_nal) {
+        int fixed_len = 0;
+        if (sps_rewrite_frame_low_latency(decode_nal, decode_len,
+                                          g_sps_fixup_buf,
+                                          (int)sizeof(g_sps_fixup_buf),
+                                          &fixed_len)) {
+            decode_nal = g_sps_fixup_buf;
+            decode_len = fixed_len;
+            nal_scan_headers(decode_nal, decode_len,
+                             &decode_has_idr, &decode_has_sync_nal);
+        }
+    }
+
     /* Check first PPS NAL for CABAC before feeding to OpenH264.
      * After first successful PPS check OR 10 frames (whichever first),
      * skip scanning entirely — saves ~50µs/frame of NAL traversal. */
     {
         static int s_cabac_check_count = 0;
         if (s_cb_count <= 1) s_cabac_check_count = 0;  /* reset on restart */
+        if (!s_sps_checked) {
+            check_nal_for_sps_contract(decode_nal, decode_len);
+        }
         if (!g_cabac_detected && s_cabac_check_count < 10) {
             check_nal_for_cabac(decode_nal, decode_len);
             s_cabac_check_count++;
@@ -425,6 +530,14 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     u8 *rgba_out = NULL;
     g_decode_active_us = sceKernelGetSystemTimeLow();
     int ret = oh264_pipeline_decode_frame(decode_nal, decode_len, &rgba_out);
+    {
+        u32 decode_wall_us = sceKernelGetSystemTimeLow() - g_decode_active_us;
+        u32 me_wait_us = g_oh264_me_wait_us;
+        if (me_wait_us > decode_wall_us) {
+            me_wait_us = decode_wall_us;
+        }
+        telemetry_accum_cpu(decode_wall_us - me_wait_us);
+    }
     g_decode_active_us = 0;  /* decode finished — watchdog can relax */
 
     if (s_cb_count <= 3 || (s_cb_count % 120) == 0 || ret < 0) {
@@ -432,6 +545,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     }
 
     if (ret == 0 && rgba_out) {
+        g_last_decode_output_ok = 1;
         push_sw_frame(rgba_out);
         s_startup_pskip_count = 0;
         s_wait_count = 0;  /* Reset — decode succeeded, SPS/PPS is valid */
@@ -450,6 +564,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             g_decode_time_us = (u32)(s_dec_ema + 0.5f);
         }
 
+#ifndef RETAIL_BUILD
         s_perf_count++;
         if (s_prev_done && (s_perf_count % 60) == 0) {
             u32 cycle_us = (u32)(t_cb_done - s_prev_done);
@@ -461,6 +576,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
                     fps_x10 / 10, fps_x10 % 10);
         }
         s_prev_done = t_cb_done;
+#endif
 
         /* Frame pacing DISABLED — at 256x144@30fps with 12-17ms decode
          * time, the PSP can barely sustain 15fps.  Any sleep here wastes
@@ -510,23 +626,49 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
                  * the reference chain.  Refs stay valid so P-frames
                  * that arrive before the IDR can still be decoded
                  * (they'll be blocky but visible). */
-                control_stream_request_idr();
+                control_stream_request_idr_force();
             }
         }
-    } else if (ret == -5 || ret == -6) {
-        /* -5: Waiting for SPS/PPS — not an error, just not ready yet
-         * -6: P-frame without valid reference — expected after IDR failure
-         * Request IDR every 30 consecutive failures so we don't wait forever. */
+    } else if (ret == OH264_RET_PENDING_NO_OUTPUT) {
+        s_no_output_streak++;
+        if (s_no_output_streak == 30 || (s_no_output_streak % 120) == 0) {
+            dec_log("decode pending/no-output: streak=%d saw_idr=%d lgf=%u\n",
+                    s_no_output_streak, g_saw_first_idr,
+                    (unsigned)g_last_good_frame);
+        }
+
+        /* OpenH264 can legally report "no frame yet" for SPS/PPS-only input
+         * or while its low-latency pipeline catches up. Treat that like the
+         * N3DS path treats decode units: keep draining until a real recovery
+         * boundary appears instead of converting transient pending status into
+         * an IDR storm. Only escalate if the pending run is long enough to be
+         * a visible freeze. */
+        if (!g_saw_first_idr && s_no_output_streak >= 60) {
+            dec_log("STARTUP PENDING: no output after %d callbacks, requesting IDR\n",
+                    s_no_output_streak);
+            control_stream_request_idr_startup();
+            s_no_output_streak = 0;
+        } else if (g_saw_first_idr && g_last_good_frame != 0 &&
+                   s_no_output_streak >= 120) {
+            dec_log("PENDING RECOVERY: failures=%d saw_idr=%d lgf=%u, requesting targeted recovery\n",
+                    s_no_output_streak, g_saw_first_idr,
+                    (unsigned)g_last_good_frame);
+            request_reference_recovery(60);
+            s_no_output_streak = 0;
+        }
+    } else if (ret == -6) {
+        /* P-frame without a valid reference: expected after reference loss.
+         * Request IDR periodically so we do not wait forever, but keep the
+         * softer pending/no-output path above for legal OpenH264 buffering. */
         s_wait_count++;
         s_no_output_streak++;
         if (s_wait_count <= 10 || (s_wait_count % 30) == 0) {
             dec_log("waiting: ret=%d (count=%d)\n", ret, s_wait_count);
-            control_stream_request_idr();
-        }
-        if (ret == -5 && s_wait_count > 200) {
-            /* After 200+ frames with no SPS/PPS, something is very wrong */
-            dec_log("STUCK: %d frames without SPS/PPS, forcing IDR burst\n", s_wait_count);
-            control_stream_request_idr();
+            if (!g_saw_first_idr && g_last_good_frame == 0) {
+                control_stream_request_idr_startup();
+            } else {
+                control_stream_request_idr();
+            }
         }
         if (!g_saw_first_idr && s_no_output_streak >= 24 && (s_no_output_streak % 24) == 0) {
             dec_log("STARTUP RECOVERY: no IDR after %d callbacks, flushing + IDR\n",
@@ -546,15 +688,65 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             s_wait_count = 0;
             s_no_output_streak = 0;
             s_startup_pskip_count = 0;
-            control_stream_request_idr();
+            control_stream_request_idr_startup();
         }
         /* Reset counter on any successful decode (handled above in ret==0 path) */
+    } else if (ret == OH264_RET_REF_LOST_NO_OUTPUT) {
+        g_frames_dropped++;
+        s_no_output_streak++;
+
+        if (g_saw_first_idr && g_last_good_frame != 0) {
+            unsigned int start = g_last_good_frame + 1;
+            unsigned int end = g_decode_current_frame_id;
+            unsigned int span_limit = ref_loss_rfi_span_limit();
+            unsigned int span;
+            if (end < start) {
+                end = start;
+            }
+            span = frame_span_inclusive(start, end);
+            if (span > span_limit || s_no_output_streak >= 3) {
+                dec_log("decoder ref-lost: span=%u limit=%u streak=%d frames %u-%u -> IDR wait (lgf=%u)\n",
+                        span, span_limit, s_no_output_streak, start, end,
+                        (unsigned)g_last_good_frame);
+                g_refs_corrupted = 1;
+                g_idr_fully_decoded = 0;
+                g_fec_requested_idr = 0;
+                rtp_reassembly_reset();
+                rtp_fec_reset();
+                safety_buffer_clear();
+                control_stream_request_idr_force();
+            } else {
+                dec_log("decoder ref-lost: requesting RFI frames %u-%u span=%u (lgf=%u)\n",
+                        start, end, span, (unsigned)g_last_good_frame);
+                rtp_reassembly_note_frame_loss(start, end);
+                control_stream_request_rfi(start, end);
+            }
+            s_wait_count = 0;
+        } else {
+            dec_log("decoder ref-lost before first good ref: forcing startup IDR\n");
+            g_refs_corrupted = 1;
+            g_idr_fully_decoded = 0;
+            control_stream_request_idr_startup();
+        }
+
+        if (s_no_output_streak >= 40 &&
+            (s_no_output_streak == 40 || (s_no_output_streak % 80) == 0)) {
+            dec_log("REF-LOST HARD-RESYNC: failures=%d lgf=%u, escalating to IDR\n",
+                    s_no_output_streak, (unsigned)g_last_good_frame);
+            g_refs_corrupted = 1;
+            g_idr_fully_decoded = 0;
+            rtp_reassembly_reset();
+            rtp_fec_reset();
+            control_stream_request_idr_force();
+            s_no_output_streak = 0;
+        }
     } else if (ret < 0) {
         g_frames_dropped++;
         s_no_output_streak++;
         if (s_no_output_streak >= 18 && (s_no_output_streak == 18 || (s_no_output_streak % 60) == 0)) {
-            dec_log("NO-OUTPUT RECOVERY: failures=%d ret=%d saw_idr=%d, codec reset + IDR\n",
-                    s_no_output_streak, ret, g_saw_first_idr);
+            dec_log("NO-OUTPUT HARD-RESYNC: failures=%d ret=%d saw_idr=%d lgf=%u, codec reset + forced IDR\n",
+                    s_no_output_streak, ret, g_saw_first_idr,
+                    (unsigned)g_last_good_frame);
             if (g_packet_rb) {
                 g_packet_rb->tail = g_packet_rb->head;
             }
@@ -564,17 +756,14 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
             if (oh264_pipeline_reset_codec() < 0) {
                 oh264_pipeline_flush_buffers();
             }
-            {
-                extern volatile unsigned int g_last_good_frame;
-                g_last_good_frame = 0;
-            }
+            g_last_good_frame = 0;
             g_idr_fully_decoded = 0;
             g_saw_first_idr = 0;
             g_fec_requested_idr = 0;
             s_wait_count = 0;
             s_no_output_streak = 0;
             s_startup_pskip_count = 0;
-            control_stream_request_idr();
+            control_stream_request_idr_force();
         }
         if ((g_frames_dropped % 30) == 1) {
             dec_log("decode failed: %d (dropped=%d)\n", ret, g_frames_dropped);
@@ -582,8 +771,9 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
         /* Request IDR on decode failure — the current reference chain
          * may be broken, and a fresh keyframe resets everything.
          * Skip if FEC already requested IDR for this error event (C-2). */
-        if (!g_fec_requested_idr) {
-            control_stream_request_idr();
+        if (!g_fec_requested_idr &&
+            (s_no_output_streak <= 2 || (s_no_output_streak % 30) == 0)) {
+            request_reference_recovery(60);
         }
         g_fec_requested_idr = 0;
     }
@@ -667,17 +857,29 @@ static int sw_decoder_thread(SceSize args, void *argp)
             u32 flush_threshold = decoder_flush_threshold_packets();
 
             if (queued > flush_threshold) {
-                dec_log("RING BACKLOG %u/1024 (>%u) -- flushing to prevent overflow\n",
-                        (unsigned)queued, (unsigned)flush_threshold);
-                g_packet_rb->tail = g_packet_rb->head;
-                rtp_reassembly_reset();
-                rtp_fec_reset();
-                oh264_pipeline_flush_buffers();
-                {
-                    extern volatile unsigned int g_last_good_frame;
-                    g_last_good_frame = 0;
+                if (g_saw_first_idr && g_last_good_frame != 0) {
+                    u32 keep = flush_threshold / 2;
+                    if (keep < 32) keep = 32;
+                    if (keep > queued) keep = queued;
+                    dec_log("RING BACKLOG %u/1024 (>%u) -- dropping stale packets, preserving refs (keep=%u)\n",
+                            (unsigned)queued, (unsigned)flush_threshold,
+                            (unsigned)keep);
+                    g_packet_rb->tail = (g_packet_rb->head + RING_BUFFER_SLOTS - keep) % RING_BUFFER_SLOTS;
+                    rtp_reassembly_reset();
+                    rtp_fec_reset();
+                } else {
+                    dec_log("RING BACKLOG %u/1024 (>%u) -- flushing while waiting for first IDR\n",
+                            (unsigned)queued, (unsigned)flush_threshold);
+                    g_packet_rb->tail = g_packet_rb->head;
+                    rtp_reassembly_reset();
+                    rtp_fec_reset();
+                    oh264_pipeline_flush_buffers();
+                    {
+                        extern volatile unsigned int g_last_good_frame;
+                        g_last_good_frame = 0;
+                    }
+                    control_stream_request_idr_startup();
                 }
-                control_stream_request_idr();
             }
         }
 
@@ -708,6 +910,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     g_packet_rb = &g_shared.packet_ring;
     g_cabac_detected = 0;
     s_pps_checked = 0;     /* Allow re-detection on new stream */
+    s_sps_checked = 0;     /* Allow SPS low-latency contract validation */
 
     dec_log("Init: Software H.264 decode (CAVLC+VFPU dual-core)\n");
 
@@ -833,6 +1036,7 @@ void sw_decoder_thread_force_restart(void)
      * The stalled decoder, codec context, and thread stack are still live at
      * this point, so a pre-teardown free-memory check underestimates the
      * headroom available for restart and can suppress recovery entirely. */
+#ifndef RETAIL_BUILD
     {
         SceSize free_mem = sceKernelTotalFreeMemSize();
         SceSize max_free = sceKernelMaxFreeMemSize();
@@ -840,6 +1044,7 @@ void sw_decoder_thread_force_restart(void)
                 (unsigned)(free_mem / 1024),
                 (unsigned)(max_free / 1024));
     }
+#endif
 
     /* 1. Kill the stuck decode thread */
     g_dec_running = 0;
@@ -870,6 +1075,7 @@ void sw_decoder_thread_force_restart(void)
     /* 2b. Re-measure headroom after teardown. This is the memory state that
      * actually matters for restart, because the dead decoder resources are
      * gone and the retry path below already handles init/create failures. */
+#ifndef RETAIL_BUILD
     {
         SceSize free_mem = sceKernelTotalFreeMemSize();
         SceSize max_free = sceKernelMaxFreeMemSize();
@@ -877,6 +1083,7 @@ void sw_decoder_thread_force_restart(void)
                 (unsigned)(free_mem / 1024),
                 (unsigned)(max_free / 1024));
     }
+#endif
 
     /* 3. Allocate fresh OpenH264 codec context + RGBA buffers.
      *    oh264_pipeline_init skips ME PRX load (already loaded)
@@ -949,7 +1156,7 @@ void sw_decoder_thread_force_restart(void)
      * decoder starts consuming.  Without this, the new decoder only
      * sees P-frames (useless without reference) until CTRL PING's
      * stall detection fires IDR ~5s later. */
-    control_stream_request_idr();
+    control_stream_request_idr_force();
 
     /* 8. Start fresh decode thread */
     g_dec_running = 1;
@@ -1063,6 +1270,825 @@ static int nal_read_ue(const u8 *data, int total_bits, int *bit_pos, unsigned in
     *out_val = ((1u << zeros) - 1u) + val;
     *bit_pos = pos;
     return 1;
+}
+
+static int nal_read_bits(const u8 *data, int total_bits, int *bit_pos,
+                         int count, unsigned int *out_val)
+{
+    unsigned int value = 0;
+    int i;
+
+    if (!data || !bit_pos || !out_val ||
+        count < 0 || count > 32 || *bit_pos + count > total_bits) {
+        return 0;
+    }
+
+    for (i = 0; i < count; i++) {
+        int byte_idx = (*bit_pos) >> 3;
+        int bit_idx = 7 - ((*bit_pos) & 7);
+        value = (value << 1) | ((data[byte_idx] >> bit_idx) & 1u);
+        (*bit_pos)++;
+    }
+
+    *out_val = value;
+    return 1;
+}
+
+static int nal_read_bit(const u8 *data, int total_bits, int *bit_pos, int *out_bit)
+{
+    unsigned int value = 0;
+    if (!nal_read_bits(data, total_bits, bit_pos, 1, &value))
+        return 0;
+    *out_bit = (int)value;
+    return 1;
+}
+
+static int nal_skip_se(const u8 *data, int total_bits, int *bit_pos)
+{
+    unsigned int tmp = 0;
+    return nal_read_ue(data, total_bits, bit_pos, &tmp);
+}
+
+static int nal_payload_to_rbsp(const u8 *src, int src_len, u8 *dst, int dst_cap)
+{
+    int i;
+    int out = 0;
+
+    for (i = 0; i < src_len && out < dst_cap; i++) {
+        if (i + 2 < src_len &&
+            src[i] == 0x00 && src[i + 1] == 0x00 && src[i + 2] == 0x03) {
+            dst[out++] = 0x00;
+            if (out >= dst_cap) break;
+            dst[out++] = 0x00;
+            i += 2;
+            continue;
+        }
+        dst[out++] = src[i];
+    }
+
+    return out;
+}
+
+static int nal_find_payload(const u8 *nal_data, int nal_len, int wanted_type,
+                            int *out_start, int *out_len)
+{
+    int i;
+
+    for (i = 0; nal_data && i < nal_len - 5; i++) {
+        int sc_len = 0;
+        int nal_start;
+        int nal_type;
+        int nal_end;
+
+        if (nal_data[i] == 0 && nal_data[i + 1] == 0) {
+            if (nal_data[i + 2] == 1) {
+                sc_len = 3;
+            } else if (nal_data[i + 2] == 0 && i + 3 < nal_len &&
+                       nal_data[i + 3] == 1) {
+                sc_len = 4;
+            }
+        }
+        if (!sc_len)
+            continue;
+
+        nal_start = i + sc_len;
+        if (nal_start >= nal_len)
+            break;
+        nal_type = nal_data[nal_start] & 0x1F;
+        if (nal_type != wanted_type)
+            continue;
+
+        nal_end = nal_len;
+        for (int j = nal_start + 1; j < nal_len - 3; j++) {
+            if (nal_data[j] == 0 && nal_data[j + 1] == 0 &&
+                (nal_data[j + 2] == 1 ||
+                 (j + 3 < nal_len && nal_data[j + 2] == 0 &&
+                  nal_data[j + 3] == 1))) {
+                nal_end = j;
+                break;
+            }
+        }
+
+        *out_start = nal_start + 1;
+        *out_len = nal_end - (nal_start + 1);
+        return *out_len > 0;
+    }
+
+    return 0;
+}
+
+typedef struct {
+    u8 *data;
+    int cap;
+    int bit_pos;
+    int failed;
+} NalBitWriter;
+
+static int nal_bit_at(const u8 *data, int bit_pos)
+{
+    int byte_idx = bit_pos >> 3;
+    int bit_idx = 7 - (bit_pos & 7);
+    return (data[byte_idx] >> bit_idx) & 1;
+}
+
+static void nal_bw_init(NalBitWriter *bw, u8 *data, int cap)
+{
+    bw->data = data;
+    bw->cap = cap;
+    bw->bit_pos = 0;
+    bw->failed = 0;
+    if (data && cap > 0) {
+        memset(data, 0, cap);
+    }
+}
+
+static void nal_bw_write_bit(NalBitWriter *bw, int bit)
+{
+    int byte_idx;
+    int bit_idx;
+    if (!bw || bw->failed) {
+        return;
+    }
+    byte_idx = bw->bit_pos >> 3;
+    if (byte_idx >= bw->cap) {
+        bw->failed = 1;
+        return;
+    }
+    bit_idx = 7 - (bw->bit_pos & 7);
+    if (bit) {
+        bw->data[byte_idx] |= (u8)(1u << bit_idx);
+    }
+    bw->bit_pos++;
+}
+
+static void nal_bw_copy_bits(NalBitWriter *bw, const u8 *src,
+                             int start_bit, int end_bit)
+{
+    int i;
+    for (i = start_bit; i < end_bit; i++) {
+        nal_bw_write_bit(bw, nal_bit_at(src, i));
+    }
+}
+
+static void nal_bw_write_ue(NalBitWriter *bw, unsigned int value)
+{
+    unsigned int code_num = value + 1;
+    unsigned int tmp = code_num;
+    int bits = 0;
+    int i;
+
+    while (tmp) {
+        bits++;
+        tmp >>= 1;
+    }
+    for (i = 0; i < bits - 1; i++) {
+        nal_bw_write_bit(bw, 0);
+    }
+    for (i = bits - 1; i >= 0; i--) {
+        nal_bw_write_bit(bw, (code_num >> i) & 1u);
+    }
+}
+
+static void nal_bw_byte_align_zero(NalBitWriter *bw)
+{
+    while (bw && !bw->failed && (bw->bit_pos & 7)) {
+        nal_bw_write_bit(bw, 0);
+    }
+}
+
+static int nal_bw_bytes(const NalBitWriter *bw)
+{
+    return bw ? ((bw->bit_pos + 7) >> 3) : 0;
+}
+
+static int rbsp_meaningful_bits(const u8 *rbsp, int rbsp_len)
+{
+    int pos;
+    for (pos = rbsp_len * 8 - 1; pos >= 0; pos--) {
+        if (nal_bit_at(rbsp, pos)) {
+            return pos + 1;
+        }
+    }
+    return 0;
+}
+
+static int rbsp_to_ebsp(const u8 *rbsp, int rbsp_len, u8 *ebsp, int ebsp_cap)
+{
+    int i;
+    int out = 0;
+    int zero_count = 0;
+
+    for (i = 0; i < rbsp_len; i++) {
+        u8 b = rbsp[i];
+        if (zero_count >= 2 && b <= 0x03) {
+            if (out >= ebsp_cap) {
+                return -1;
+            }
+            ebsp[out++] = 0x03;
+            zero_count = 0;
+        }
+        if (out >= ebsp_cap) {
+            return -1;
+        }
+        ebsp[out++] = b;
+        if (b == 0) {
+            zero_count++;
+        } else {
+            zero_count = 0;
+        }
+    }
+
+    return out;
+}
+
+typedef struct {
+    int ref_start;
+    int ref_end;
+    unsigned int old_refs;
+    unsigned int old_level_idc;
+    int vui_flag_pos;
+    int vui_present;
+    int bsr_flag_pos;
+    int bsr_present;
+    int bsr_valid;
+    unsigned int old_num_reorder_frames;
+    unsigned int old_max_dec_frame_buffering;
+} SpsLowLatencyInfo;
+
+static void nal_bw_write_trailing_bits(NalBitWriter *bw)
+{
+    nal_bw_write_bit(bw, 1); /* rbsp_stop_one_bit */
+    nal_bw_byte_align_zero(bw);
+}
+
+static void nal_bw_write_minimal_low_latency_vui(NalBitWriter *bw)
+{
+    /* Minimal VUI with the N3DS low-latency bitstream restriction contract.
+     * Keep optional timing/color/HRD absent, then force one-frame DPB. */
+    nal_bw_write_bit(bw, 0); /* aspect_ratio_info_present_flag */
+    nal_bw_write_bit(bw, 0); /* overscan_info_present_flag */
+    nal_bw_write_bit(bw, 0); /* video_signal_type_present_flag */
+    nal_bw_write_bit(bw, 0); /* chroma_loc_info_present_flag */
+    nal_bw_write_bit(bw, 0); /* timing_info_present_flag */
+    nal_bw_write_bit(bw, 0); /* nal_hrd_parameters_present_flag */
+    nal_bw_write_bit(bw, 0); /* vcl_hrd_parameters_present_flag */
+    nal_bw_write_bit(bw, 0); /* pic_struct_present_flag */
+    nal_bw_write_bit(bw, 1); /* bitstream_restriction_flag */
+    nal_bw_write_bit(bw, 1); /* motion_vectors_over_pic_boundaries_flag */
+    nal_bw_write_ue(bw, 2);  /* max_bytes_per_pic_denom */
+    nal_bw_write_ue(bw, 1);  /* max_bits_per_mb_denom */
+    nal_bw_write_ue(bw, 16); /* log2_max_mv_length_horizontal */
+    nal_bw_write_ue(bw, 16); /* log2_max_mv_length_vertical */
+    nal_bw_write_ue(bw, 0);  /* num_reorder_frames */
+    nal_bw_write_ue(bw, 1);  /* max_dec_frame_buffering */
+}
+
+static int nal_skip_hrd_parameters(const u8 *rbsp, int total_bits, int *bit_pos)
+{
+    unsigned int cpb_cnt_minus1 = 0;
+    unsigned int tmp = 0;
+
+    if (!nal_read_ue(rbsp, total_bits, bit_pos, &cpb_cnt_minus1) ||
+        !nal_read_bits(rbsp, total_bits, bit_pos, 4, &tmp) ||
+        !nal_read_bits(rbsp, total_bits, bit_pos, 4, &tmp)) {
+        return 0;
+    }
+
+    for (unsigned int i = 0; i <= cpb_cnt_minus1 && i < 32; i++) {
+        if (!nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp)) {
+            return 0;
+        }
+    }
+
+    return nal_read_bits(rbsp, total_bits, bit_pos, 5, &tmp) &&
+           nal_read_bits(rbsp, total_bits, bit_pos, 5, &tmp) &&
+           nal_read_bits(rbsp, total_bits, bit_pos, 5, &tmp) &&
+           nal_read_bits(rbsp, total_bits, bit_pos, 5, &tmp);
+}
+
+static int sps_parse_vui_low_latency_fields(const u8 *rbsp, int total_bits,
+                                            int *bit_pos,
+                                            SpsLowLatencyInfo *info)
+{
+    unsigned int tmp = 0;
+    int flag = 0;
+    int nal_hrd = 0;
+    int vcl_hrd = 0;
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+    if (flag) {
+        unsigned int aspect_ratio_idc = 0;
+        if (!nal_read_bits(rbsp, total_bits, bit_pos, 8, &aspect_ratio_idc))
+            return 0;
+        if (aspect_ratio_idc == 255 &&
+            (!nal_read_bits(rbsp, total_bits, bit_pos, 16, &tmp) ||
+             !nal_read_bits(rbsp, total_bits, bit_pos, 16, &tmp))) {
+            return 0;
+        }
+    }
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+    if (flag && !nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+    if (flag) {
+        int colour_description_present = 0;
+        if (!nal_read_bits(rbsp, total_bits, bit_pos, 3, &tmp) ||
+            !nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp) ||
+            !nal_read_bit(rbsp, total_bits, bit_pos, &colour_description_present)) {
+            return 0;
+        }
+        if (colour_description_present &&
+            (!nal_read_bits(rbsp, total_bits, bit_pos, 8, &tmp) ||
+             !nal_read_bits(rbsp, total_bits, bit_pos, 8, &tmp) ||
+             !nal_read_bits(rbsp, total_bits, bit_pos, 8, &tmp))) {
+            return 0;
+        }
+    }
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+    if (flag &&
+        (!nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+         !nal_read_ue(rbsp, total_bits, bit_pos, &tmp))) {
+        return 0;
+    }
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &flag)) return 0;
+    if (flag &&
+        (!nal_read_bits(rbsp, total_bits, bit_pos, 32, &tmp) ||
+         !nal_read_bits(rbsp, total_bits, bit_pos, 32, &tmp) ||
+         !nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp))) {
+        return 0;
+    }
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &nal_hrd)) return 0;
+    if (nal_hrd && !nal_skip_hrd_parameters(rbsp, total_bits, bit_pos)) return 0;
+
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &vcl_hrd)) return 0;
+    if (vcl_hrd && !nal_skip_hrd_parameters(rbsp, total_bits, bit_pos)) return 0;
+
+    if ((nal_hrd || vcl_hrd) &&
+        !nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp)) {
+        return 0;
+    }
+
+    if (!nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp)) return 0;
+
+    info->bsr_flag_pos = *bit_pos;
+    if (!nal_read_bit(rbsp, total_bits, bit_pos, &info->bsr_present)) return 0;
+    info->bsr_valid = 1;
+    if (info->bsr_present) {
+        if (!nal_read_bits(rbsp, total_bits, bit_pos, 1, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &info->old_num_reorder_frames) ||
+            !nal_read_ue(rbsp, total_bits, bit_pos, &info->old_max_dec_frame_buffering)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int sps_parse_low_latency_fields(const u8 *rbsp, int total_bits,
+                                        SpsLowLatencyInfo *info)
+{
+    int bit_pos = 0;
+    unsigned int profile_idc = 0;
+    unsigned int tmp = 0;
+
+    memset(info, 0, sizeof(*info));
+    info->vui_flag_pos = -1;
+    info->bsr_flag_pos = -1;
+    info->old_num_reorder_frames = 0xFFFFFFFFu;
+    info->old_max_dec_frame_buffering = 0xFFFFFFFFu;
+
+    if (!nal_read_bits(rbsp, total_bits, &bit_pos, 8, &profile_idc) ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 8, &tmp) ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 8, &info->old_level_idc) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp)) {
+        return 0;
+    }
+
+    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
+        profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
+        profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
+        profile_idc == 138 || profile_idc == 144) {
+        unsigned int chroma_format_idc = 1;
+        int separate_colour_plane_flag = 0;
+        int scaling_matrix_present = 0;
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &chroma_format_idc))
+            return 0;
+        if (chroma_format_idc == 3 &&
+            !nal_read_bit(rbsp, total_bits, &bit_pos, &separate_colour_plane_flag))
+            return 0;
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+            !nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp) ||
+            !nal_read_bit(rbsp, total_bits, &bit_pos, &scaling_matrix_present)) {
+            return 0;
+        }
+        if (scaling_matrix_present) {
+            return 0;
+        }
+    }
+
+    if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp)) {
+        return 0;
+    }
+
+    if (tmp == 0) {
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp))
+            return 0;
+    } else if (tmp == 1) {
+        unsigned int cycle = 0;
+        if (!nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp) ||
+            !nal_skip_se(rbsp, total_bits, &bit_pos) ||
+            !nal_skip_se(rbsp, total_bits, &bit_pos) ||
+            !nal_read_ue(rbsp, total_bits, &bit_pos, &cycle)) {
+            return 0;
+        }
+        for (unsigned int i = 0; i < cycle && i < 32; i++) {
+            if (!nal_skip_se(rbsp, total_bits, &bit_pos))
+                return 0;
+        }
+    }
+
+    info->ref_start = bit_pos;
+    if (!nal_read_ue(rbsp, total_bits, &bit_pos, &info->old_refs))
+        return 0;
+    info->ref_end = bit_pos;
+
+    if (!nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp)) {
+        return 1; /* ref rewrite is still safe */
+    }
+    if (!tmp && !nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp)) {
+        return 1;
+    }
+    if (!nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp)) {
+        return 1;
+    }
+    if (tmp &&
+        (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+         !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+         !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+         !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp))) {
+        return 1;
+    }
+    if (!nal_read_bit(rbsp, total_bits, &bit_pos, &info->vui_present)) {
+        return 1;
+    }
+    info->vui_flag_pos = bit_pos - 1;
+    if (info->vui_present) {
+        (void)sps_parse_vui_low_latency_fields(rbsp, total_bits, &bit_pos, info);
+    }
+    return 1;
+}
+
+static int rewrite_sps_payload_low_latency(const u8 *payload, int payload_len,
+                                           u8 *out_payload, int out_cap)
+{
+    u8 rbsp[512];
+    u8 rbsp_out[512];
+    NalBitWriter bw;
+    SpsLowLatencyInfo info;
+    int rbsp_len;
+    int meaningful_bits;
+    int rbsp_out_len;
+    int ebsp_len;
+    int target_level_idc = 0;
+    int rewrite_refs;
+    int rewrite_level;
+    int rewrite_vui;
+    int vui_rewrite_pos;
+
+    rbsp_len = nal_payload_to_rbsp(payload, payload_len, rbsp, sizeof(rbsp));
+    meaningful_bits = rbsp_meaningful_bits(rbsp, rbsp_len);
+    if (meaningful_bits <= 0 ||
+        !sps_parse_low_latency_fields(rbsp, meaningful_bits, &info)) {
+        return 0;
+    }
+
+    target_level_idc = (int)info.old_level_idc;
+    rewrite_refs = 0;
+    rewrite_level = 0;
+    rewrite_vui = 0;
+    vui_rewrite_pos = info.vui_flag_pos;
+    /* Keep the low-latency VUI parser in place for diagnostics, but do not
+     * rewrite VUI/level in the release path yet. Hardware logs showed the
+     * VUI-injected SPS caused OpenH264 0x4 bitstream errors before first
+     * frame. Do not falsify num_ref_frames either: if the host ignores our
+     * maxNumReferenceFrames=1 request and emits refs>1, rewriting the SPS to
+     * refs=1 makes OpenH264 evict references the real bitstream can still use. */
+
+    if (!rewrite_refs && !rewrite_level && !rewrite_vui) {
+        return 0;
+    }
+
+    nal_bw_init(&bw, rbsp_out, sizeof(rbsp_out));
+    if (rewrite_level) {
+        nal_bw_copy_bits(&bw, rbsp, 0, 16);
+        nal_bw_write_bit(&bw, (target_level_idc >> 7) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 6) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 5) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 4) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 3) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 2) & 1);
+        nal_bw_write_bit(&bw, (target_level_idc >> 1) & 1);
+        nal_bw_write_bit(&bw, target_level_idc & 1);
+        nal_bw_copy_bits(&bw, rbsp, 24, info.ref_start);
+    } else {
+        nal_bw_copy_bits(&bw, rbsp, 0, info.ref_start);
+    }
+    if (rewrite_refs) {
+        nal_bw_write_ue(&bw, 1);
+    } else {
+        nal_bw_copy_bits(&bw, rbsp, info.ref_start, info.ref_end);
+    }
+    if (rewrite_vui && vui_rewrite_pos >= 0) {
+        nal_bw_copy_bits(&bw, rbsp, info.ref_end, vui_rewrite_pos);
+        if (!info.vui_present) {
+            nal_bw_write_bit(&bw, 1);
+            nal_bw_write_minimal_low_latency_vui(&bw);
+        } else {
+            nal_bw_write_bit(&bw, 1);
+            nal_bw_write_bit(&bw, 1);
+            nal_bw_write_ue(&bw, 2);
+            nal_bw_write_ue(&bw, 1);
+            nal_bw_write_ue(&bw, 16);
+            nal_bw_write_ue(&bw, 16);
+            nal_bw_write_ue(&bw, 0);
+            nal_bw_write_ue(&bw, 1);
+        }
+        nal_bw_write_trailing_bits(&bw);
+    } else {
+        nal_bw_copy_bits(&bw, rbsp, info.ref_end, meaningful_bits);
+        nal_bw_byte_align_zero(&bw);
+    }
+    if (bw.failed) {
+        return 0;
+    }
+
+    rbsp_out_len = nal_bw_bytes(&bw);
+    ebsp_len = rbsp_to_ebsp(rbsp_out, rbsp_out_len, out_payload, out_cap);
+    if (ebsp_len <= 0) {
+        return 0;
+    }
+
+    dec_log("SPS fixup: level=%u->%d refs=%u->%u vui=%d bsr=%d reorder=%d dpb=%d rbsp=%d->%d ebsp=%d->%d\n",
+            info.old_level_idc,
+            rewrite_level ? target_level_idc : (int)info.old_level_idc,
+            info.old_refs,
+            rewrite_refs ? 1u : info.old_refs,
+            rewrite_vui,
+            info.bsr_present,
+            info.old_num_reorder_frames == 0xFFFFFFFFu ? -1 : (int)info.old_num_reorder_frames,
+            info.old_max_dec_frame_buffering == 0xFFFFFFFFu ? -1 : (int)info.old_max_dec_frame_buffering,
+            rbsp_len, rbsp_out_len, payload_len, ebsp_len);
+    return ebsp_len;
+}
+
+static int nal_start_code_len_at(const u8 *data, int len, int pos)
+{
+    if (!data || pos + 3 > len || data[pos] != 0 || data[pos + 1] != 0) {
+        return 0;
+    }
+    if (data[pos + 2] == 1) {
+        return 3;
+    }
+    if (pos + 4 <= len && data[pos + 2] == 0 && data[pos + 3] == 1) {
+        return 4;
+    }
+    return 0;
+}
+
+static int nal_find_next_start_code(const u8 *data, int len, int pos,
+                                    int *out_sc_len)
+{
+    int i;
+    for (i = pos; i <= len - 3; i++) {
+        int sc_len = nal_start_code_len_at(data, len, i);
+        if (sc_len) {
+            if (out_sc_len) {
+                *out_sc_len = sc_len;
+            }
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int sps_rewrite_frame_low_latency(const u8 *nal_data, int nal_len,
+                                         u8 *out_buf, int out_cap,
+                                         int *out_len)
+{
+    int pos = 0;
+    int out_pos = 0;
+    int changed = 0;
+
+    if (!nal_data || nal_len <= 0 || !out_buf || out_cap <= 0 || !out_len) {
+        return 0;
+    }
+
+    while (pos < nal_len) {
+        int sc_len = 0;
+        int sc_pos = nal_find_next_start_code(nal_data, nal_len, pos, &sc_len);
+        int nal_start;
+        int nal_end;
+        int next_sc_len = 0;
+        int next_sc;
+        int prefix_len;
+        int payload_len;
+
+        if (sc_pos < 0) {
+            int tail = nal_len - pos;
+            if (out_pos + tail > out_cap) {
+                return 0;
+            }
+            memcpy(out_buf + out_pos, nal_data + pos, tail);
+            out_pos += tail;
+            break;
+        }
+
+        nal_start = sc_pos + sc_len;
+        if (nal_start >= nal_len) {
+            return 0;
+        }
+        next_sc = nal_find_next_start_code(nal_data, nal_len,
+                                           nal_start + 1, &next_sc_len);
+        nal_end = (next_sc >= 0) ? next_sc : nal_len;
+        prefix_len = (nal_start + 1) - pos;
+        if (out_pos + prefix_len > out_cap) {
+            return 0;
+        }
+        memcpy(out_buf + out_pos, nal_data + pos, prefix_len);
+        out_pos += prefix_len;
+
+        payload_len = nal_end - (nal_start + 1);
+        if ((nal_data[nal_start] & 0x1F) == 7 && payload_len > 0) {
+            int fixed_len = rewrite_sps_payload_low_latency(nal_data + nal_start + 1,
+                                                            payload_len,
+                                                            out_buf + out_pos,
+                                                            out_cap - out_pos);
+            if (fixed_len > 0) {
+                out_pos += fixed_len;
+                changed = 1;
+            } else {
+                if (out_pos + payload_len > out_cap) {
+                    return 0;
+                }
+                memcpy(out_buf + out_pos, nal_data + nal_start + 1, payload_len);
+                out_pos += payload_len;
+            }
+        } else {
+            if (out_pos + payload_len > out_cap) {
+                return 0;
+            }
+            memcpy(out_buf + out_pos, nal_data + nal_start + 1, payload_len);
+            out_pos += payload_len;
+        }
+
+        pos = nal_end;
+    }
+
+    if (changed) {
+        *out_len = out_pos;
+        return 1;
+    }
+    return 0;
+}
+
+static void check_nal_for_sps_contract(const u8 *nal_data, int nal_len)
+{
+    int payload_start = 0;
+    int payload_len = 0;
+    u8 rbsp[256];
+    int rbsp_len;
+    int total_bits;
+    int bit_pos = 0;
+    unsigned int profile_idc = 0;
+    unsigned int level_idc = 0;
+    unsigned int tmp = 0;
+    unsigned int max_num_ref_frames = 0;
+    int num_reorder_frames = -1;
+    int max_dec_frame_buffering = -1;
+    int ok = 1;
+
+    if (s_sps_checked)
+        return;
+    if (!nal_find_payload(nal_data, nal_len, 7, &payload_start, &payload_len))
+        return;
+
+    rbsp_len = nal_payload_to_rbsp(nal_data + payload_start, payload_len,
+                                  rbsp, sizeof(rbsp));
+    total_bits = rbsp_len * 8;
+    {
+        SpsLowLatencyInfo info;
+        int meaningful_bits = rbsp_meaningful_bits(rbsp, rbsp_len);
+        if (meaningful_bits > 0 &&
+            sps_parse_low_latency_fields(rbsp, meaningful_bits, &info)) {
+            profile_idc = rbsp[0];
+            level_idc = rbsp[2];
+            max_num_ref_frames = info.old_refs;
+            if (info.vui_present && info.bsr_valid && info.bsr_present) {
+                num_reorder_frames = (int)info.old_num_reorder_frames;
+                max_dec_frame_buffering = (int)info.old_max_dec_frame_buffering;
+            }
+            if (max_num_ref_frames > 1 || profile_idc != 66 ||
+                (num_reorder_frames > 0) ||
+                (max_dec_frame_buffering > 1)) {
+                ok = 0;
+            }
+            dec_log("SPS contract: profile=%u level=%u refs=%u reorder=%d dpb=%d ok=%d\n",
+                    profile_idc, level_idc, max_num_ref_frames,
+                    num_reorder_frames, max_dec_frame_buffering, ok);
+            if (!ok) {
+                g_refs_corrupted = 1;
+                g_idr_fully_decoded = 0;
+                control_stream_request_idr_force();
+            }
+            s_sps_checked = 1;
+            return;
+        }
+    }
+    if (rbsp_len < 4 ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 8, &profile_idc) ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 8, &tmp) ||
+        !nal_read_bits(rbsp, total_bits, &bit_pos, 8, &level_idc) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp)) {
+        dec_log("SPS parse failed: header rbsp=%d\n", rbsp_len);
+        s_sps_checked = 1;
+        return;
+    }
+
+    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
+        profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
+        profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
+        profile_idc == 138 || profile_idc == 144) {
+        unsigned int chroma_format_idc = 1;
+        int separate_colour_plane_flag = 0;
+        int scaling_matrix_present = 0;
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &chroma_format_idc))
+            goto sps_done;
+        if (chroma_format_idc == 3 &&
+            !nal_read_bit(rbsp, total_bits, &bit_pos, &separate_colour_plane_flag))
+            goto sps_done;
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+            !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+            !nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp) ||
+            !nal_read_bit(rbsp, total_bits, &bit_pos, &scaling_matrix_present))
+            goto sps_done;
+        if (scaling_matrix_present) {
+            ok = 0;
+            goto sps_done;
+        }
+    }
+
+    if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp) ||
+        !nal_read_ue(rbsp, total_bits, &bit_pos, &tmp))
+        goto sps_done;
+
+    if (tmp == 0) {
+        if (!nal_read_ue(rbsp, total_bits, &bit_pos, &tmp))
+            goto sps_done;
+    } else if (tmp == 1) {
+        unsigned int cycle = 0;
+        if (!nal_read_bits(rbsp, total_bits, &bit_pos, 1, &tmp) ||
+            !nal_skip_se(rbsp, total_bits, &bit_pos) ||
+            !nal_skip_se(rbsp, total_bits, &bit_pos) ||
+            !nal_read_ue(rbsp, total_bits, &bit_pos, &cycle))
+            goto sps_done;
+        for (unsigned int i = 0; i < cycle && i < 32; i++) {
+            if (!nal_skip_se(rbsp, total_bits, &bit_pos))
+                goto sps_done;
+        }
+    }
+
+    if (!nal_read_ue(rbsp, total_bits, &bit_pos, &max_num_ref_frames))
+        goto sps_done;
+
+sps_done:
+    if (max_num_ref_frames > 1 || profile_idc != 66)
+        ok = 0;
+
+    dec_log("SPS contract: profile=%u level=%u refs=%u reorder=%d dpb=%d ok=%d\n",
+            profile_idc, level_idc, max_num_ref_frames,
+            num_reorder_frames, max_dec_frame_buffering, ok);
+
+    if (!ok) {
+        g_refs_corrupted = 1;
+        g_idr_fully_decoded = 0;
+        control_stream_request_idr_force();
+    }
+
+    s_sps_checked = 1;
 }
 
 static void check_nal_for_cabac(const u8 *nal_data, int nal_len)
