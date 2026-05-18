@@ -51,6 +51,8 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 ### Build and Documentation
 - Public docs updated for v1.2 presets, packet-size setup, pairing behavior, and controller mapping.
 - Generated local build artifacts and internal audit notes are ignored so release diffs stay focused.
+- Added `scripts/smoke_checks.sh` so `make smoke` validates release prerequisites and fails fast on unresolved merge markers.
+- CI now validates `release/**` branches and uploads CI artifacts only; public release assets remain manual to preserve PSPSDK parity.
 
 ## [1.1.0] — 2026-05-06
 

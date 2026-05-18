@@ -7,7 +7,7 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
-[![Status](https://img.shields.io/badge/status-release%20candidate-yellow)](#known-limitations)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen)](#known-limitations)
 [![Release](https://img.shields.io/badge/release-v1.2.0-blue)](#version-history)
 
 </div>

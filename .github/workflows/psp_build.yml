@@ -2,11 +2,10 @@ name: PSP Build
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "release/**" ]
   pull_request:
-    branches: [ "main", "master" ]
-  release:
-    types: [ published ]
+    branches: [ "main", "master", "release/**" ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -37,20 +36,12 @@ jobs:
         ls -lh EBOOT.PBP moonlight.prx moonlight_me_helper/moonlight_me_helper.prx
         echo "Build successful."
 
-    - name: Upload EBOOT.PBP
+    - name: Upload CI artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: moonlight-psp-${{ github.sha }}
+        name: moonlight-psp-ci-${{ github.sha }}
         path: |
           EBOOT.PBP
           moonlight_me_helper/moonlight_me_helper.prx
         if-no-files-found: error
-
-    - name: Upload to release
-      if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          EBOOT.PBP
-          moonlight_me_helper/moonlight_me_helper.prx
 

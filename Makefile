@@ -9,6 +9,9 @@
 # ============================================================================
 PSPSDK   = $(shell psp-config --pspsdk-path)
 PSP_PREFIX = $(shell psp-config --psp-prefix)
+PSPDEV   = $(shell psp-config --pspdev-path)
+PSP_TOOL_BIN := $(PSPDEV)/bin
+export PATH := $(PSP_TOOL_BIN):$(PATH)
 
 # ============================================================================
 # Build Target Configuration
@@ -153,8 +156,8 @@ CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(PSP_TUNE_DEFINES)
            $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 
-CC  = psp-gcc
-CXX = psp-g++
+CC  = $(PSP_TOOL_BIN)/psp-gcc
+CXX = $(PSP_TOOL_BIN)/psp-g++
 
 INCDIR  = include $(PSP_PREFIX)/include/oslib/intraFont $(PSP_PREFIX)/include
 LIBDIR  = lib $(PSP_PREFIX)/lib
@@ -225,7 +228,17 @@ src/%.o: src/%.c $(CORE_HEADERS) $(TUNE_STAMP)
 
 include $(PSPSDK)/lib/build.mak
 
-PSP_TOOL_BIN := $(shell psp-config --pspdev-path)/bin
+override CC := $(PSP_TOOL_BIN)/psp-gcc.exe
+override CXX := $(PSP_TOOL_BIN)/psp-g++.exe
+override AS := $(PSP_TOOL_BIN)/psp-gcc.exe
+override LD := $(PSP_TOOL_BIN)/psp-gcc.exe
+override AR := $(PSP_TOOL_BIN)/psp-ar.exe
+override RANLIB := $(PSP_TOOL_BIN)/psp-ranlib.exe
+override STRIP := $(PSP_TOOL_BIN)/psp-strip.exe
+override MKSFO := $(PSP_TOOL_BIN)/mksfo.exe
+override PACK_PBP := $(PSP_TOOL_BIN)/pack-pbp.exe
+override FIXUP := $(PSP_TOOL_BIN)/psp-fixup-imports.exe
+
 EXPORT_OBJ_RSP := $(subst \,/,$(EXPORT_OBJ))
 
 # Workaround for CreateProcess Windows character limits on the PSP-1000
