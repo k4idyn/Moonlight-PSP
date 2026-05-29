@@ -460,6 +460,15 @@ void wifi_keepalive_stop(void)
     net_log("[KEEPALIVE] stopped\n");
 }
 
+void wifi_keepalive_abort(void)
+{
+    g_keepalive_running = 0;
+    if (g_keepalive_thread_id >= 0) {
+        sceKernelTerminateDeleteThread(g_keepalive_thread_id);
+        g_keepalive_thread_id = -1;
+    }
+}
+
 /* Forward declarations */
 static int network_recv_thread(SceSize args, void *argp);
 static int network_ping_thread(SceSize args, void *argp);

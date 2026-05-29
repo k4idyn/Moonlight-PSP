@@ -7,7 +7,7 @@
  *
  * Architecture:
  * - Circular buffer in RAM stores recent NAL units
- * - Falls back to ms0:/__temp_stream file if RAM is full
+ * - Falls back to ms0:/PSP/SAVEDATA/Moonlight/__temp_stream file if RAM is full
  * - Async writer thread handles file I/O without blocking decode
  * - Packet loss detection triggers rewind/pause UI instead of discarding
  */
@@ -17,6 +17,7 @@
 
 #include <psptypes.h>
 #include <pspkernel.h>  /* For SceUID */
+#include "storage_paths.h"
 
 /*============================================================================
  * Configuration Constants
@@ -36,7 +37,7 @@
 #define SAFETY_BUFFER_SLOTS         128
 
 /* Fallback file path on Memory Stick */
-#define SAFETY_BUFFER_FALLBACK_PATH "ms0:/__temp_stream"
+#define SAFETY_BUFFER_FALLBACK_PATH MOONLIGHT_SAVE_SAFETY_TEMP_PATH
 
 /*============================================================================
  * Safety Buffer State

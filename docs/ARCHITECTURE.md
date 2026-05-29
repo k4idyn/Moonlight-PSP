@@ -1,6 +1,6 @@
 # Architecture
 
-_PSP Moonlight v1.2.0_
+_PSP Moonlight v1.3.0_
 
 ## Overview
 

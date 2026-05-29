@@ -17,6 +17,7 @@
 #include "pairing_pin_ui.h"
 #include "shared.h"
 #include "ui_manager.h"
+#include "storage_paths.h"
 
 /*============================================================================
  * Internal Constants
@@ -127,7 +128,8 @@ int pairing_pin_ui_init(PairingPINUI *ui, const char *pin,
     if (pin_len != PIN_DIGITS) {
         /* Log to debug file; no debug screen calls */
 #ifndef RETAIL_BUILD
-        SceUID fd = sceIoOpen("ms0:/moonlight_debug.log",
+        moonlight_storage_ensure_data_dir();
+        SceUID fd = sceIoOpen(MOONLIGHT_SAVE_DEBUG_LOG_PATH,
                               PSP_O_WRONLY | PSP_O_APPEND | PSP_O_CREAT, 0777);
         if (fd >= 0) {
             char msg[64];

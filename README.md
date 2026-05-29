@@ -2,13 +2,13 @@
 
 # PSP Moonlight
 
-**v1.2.0 - PSP-native H.264 Game Streaming Client**
+**v1.3.0 - PSP-native H.264 Game Streaming Client**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)](#known-limitations)
-[![Release](https://img.shields.io/badge/release-v1.2.0-blue)](#version-history)
+[![Release](https://img.shields.io/badge/release-v1.3.0-blue)](#version-history)
 
 </div>
 
@@ -18,23 +18,14 @@ PSP Moonlight is a Moonlight-compatible game-streaming client for Sony PSP syste
 
 The project streams H.264 video from a host PC running Sunshine, decodes video on the PSP main CPU, and uses the Media Engine for accelerated YUV-to-RGBA conversion.
 
-## New in v1.2
+## New in v1.3
 
-- Three PSP-focused presets are now built into the settings menu:
-  - **Performance:** 300x170 at 30 fps, 384 kbps, 1056-byte packets, audio disabled by default.
-  - **Balanced:** 360x204 at 20 fps, 480 kbps, 1200-byte packets, audio enabled.
-  - **Quality:** 480x272 at 10 fps, 576 kbps, 1200-byte packets, native PSP resolution, audio enabled.
-- The preset selector is separate from the Resolution row, so manual resolution changes no longer re-snap FPS, bitrate, packet size, or audio state.
-- Packet size is now a first-class setting under bitrate.
-- Stream sizes use the PSP LCD aspect ratio so built-in presets fill the 480x272 screen without fixed black bars.
-- Pairing now completes the authenticated HTTPS confirmation step, cleans up failed pair attempts, and recovers from stale paired-host entries more reliably.
-- The default controller map is tuned for Xbox-style input on PSP:
-  - L + Triangle/Cross/Square/Circle = right stick up/down/left/right.
-  - L + D-pad Left/Right = LT/RT.
-  - L + D-pad Down/Up = L3/R3.
-  - The mapper can also switch right-stick control to L + analog nub.
-- Browser mode mouse movement has stronger acceleration, and app-owned combos such as HUD toggle and stream exit are kept local instead of leaking host input.
-- The game library and stream-start paths prime display buffers to reduce stale menu/frame flicker during screen transitions.
+- Runtime data now lives under `ms0:/PSP/SAVEDATA/Moonlight/` so settings, pairing identity, logs, TLS pins, icon cache, and temporary stream files no longer clutter the Memory Stick root or the XMB app folder.
+- Updaters can delete stale old-build clutter such as `ms0:/moonlight/`, old root-level Moonlight logs/dumps, and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying the v1.3 files. Pair again in Sunshine after the clean install.
+- Remote/hotspot launches keep using the selected public IP when Sunshine returns a private LAN address in the RTSP session URL.
+- Pairing now persists the paired host after the authenticated confirm step, including manual public-IP pairing paths.
+- HOME/XMB exit now runs the same cleanup path as app exit, including stream teardown, Wi-Fi helper abort, network disconnect, UI shutdown, and a module-stop fallback for shell exits.
+- The EBOOT includes PSP-safe `ICON0.PNG` and `PIC1.PNG` artwork for the XMB icon and background.
 
 ## Highlights
 
@@ -131,6 +122,10 @@ ms0:/PSP/GAME/Moonlight/
 
 3. Launch from XMB -> Game -> Memory Stick.
 
+Runtime data is written to `ms0:/PSP/SAVEDATA/Moonlight/`, not the install folder.
+
+When updating from an older build, delete stale old-build files/folders such as `ms0:/moonlight/` and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying v1.3, then pair again in Sunshine.
+
 For full setup, pairing flow, and troubleshooting, see [INSTALL.md](INSTALL.md).
 
 ## Known Limitations
@@ -163,6 +158,7 @@ Detailed notes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
 
 ## Version History
 
+- v1.3.0: Savedata runtime layout, remote public-IP launch fix, pairing persistence, XMB artwork, and safer HOME/XMB exit cleanup.
 - v1.2.0: PSP preset ladder, packet-size setting, pairing confirm, controller-map overhaul, Browser input cleanup, and transition-buffer fixes.
 - v1.1.0: Network controller refinements and retail artifact publication.
 - v1.0.0: Public release of the PSP-native rewrite.

@@ -1,4 +1,4 @@
-/* diag_log.h - Diagnostic logging to ms0: and host0: with ring-buffer and kernel semaphore */
+/* diag_log.h - Diagnostic logging to savedata and host0: with ring-buffer and kernel semaphore */
 #ifndef DIAG_LOG_H
 #define DIAG_LOG_H
 
@@ -24,7 +24,7 @@ extern int g_debug_logging;
 void diag_log_set_debug(int enable);
 
 /**
- * diag_log_write - Buffered logging to ms0:/moonlight.log with [TAG] prefix.
+ * diag_log_write - Buffered logging to savedata moonlight.log with [TAG] prefix.
  * Thread-safe. Accumulates in a 4KB ring buffer; auto-flushes when full.
  * Suppressed completely in retail mode.
  *

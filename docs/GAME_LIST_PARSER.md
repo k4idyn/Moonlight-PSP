@@ -11,7 +11,7 @@ This module implements a game list parser and icon downloader for the PSP Moonli
 - **Icon Downloader**: Downloads Sunshine PNG box art through the normal `BoxArtUrl` or `/appasset` path
 - **Static PNG Decode**: Decodes through fixed libpng buffers and a fixed arena; no first-party heap allocation
 - **Fallback Support**: Uses embedded fallback art first, then the generated default texture when icons are missing
-- **Cache System**: Stores downloaded icons in `ms0:/PSP/GAME/Moonlight/cache/`
+- **Cache System**: Stores downloaded icons in `ms0:/PSP/SAVEDATA/Moonlight/cache/`
 
 ## Files
 
@@ -83,7 +83,7 @@ The parser supports multiple XML formats from Sunshine/GameStream:
 Icons are decoded from PNG via libpng and converted directly to RGB565 for display. Runtime icons are stored in padded `128x256` RGB565 texture slots; the visible art area is `100x150`. Each file is stored as raw RGB565:
 
 ```
-ms0:/PSP/GAME/Moonlight/cache/
+ms0:/PSP/SAVEDATA/Moonlight/cache/
 |-- 12345.raw    (Game ID 12345, 128x256x2 bytes = 65,536 bytes)
 |-- 67890.raw
 `-- ...

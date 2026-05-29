@@ -33,6 +33,7 @@
 #include "diag_log.h"
 #include "shared.h"
 #include "btn_icons.h"
+#include "storage_paths.h"
 
 /* Font handles (PGF) */
 static intraFont *s_font_sans  = NULL; /* flash0:/font/ltn0.pgf (Standard) */
@@ -984,7 +985,8 @@ float ui_draw_text(float x, float y, u32 color, const char *text)
         static int logged = 0;
         if (!logged) {
 #ifndef RETAIL_BUILD
-            SceUID fd = sceIoOpen("ms0:/moonlight_debug.log",
+            moonlight_storage_ensure_data_dir();
+            SceUID fd = sceIoOpen(MOONLIGHT_SAVE_DEBUG_LOG_PATH,
                                   PSP_O_WRONLY | PSP_O_APPEND | PSP_O_CREAT, 0644);
             if (fd >= 0) {
                 const char *msg = "[CRITICAL] s_font is NULL in ui_draw_text — falling back to BMF\n";

@@ -2,7 +2,7 @@
  * config.c - Configuration persistence implementation for PSP Moonlight
  *
  * Implements INI-style config file reading/writing using PSP sceIo* functions.
- * Stores configuration on Memory Stick at ms0:/moonlight/config.ini
+ * Stores configuration on Memory Stick at ms0:/PSP/SAVEDATA/Moonlight/config.ini
  */
 
 #include <pspkernel.h>
@@ -477,7 +477,7 @@ int saveConfig(const PspConfig *config)
     diag_log_write("CONFIG", "Saving config - Theme Index: %d\n", config->uiThemeIndex);
 
     /* Create directory if it doesn't exist */
-    sceIoMkdir(CONFIG_DIR_PATH, 0777);
+    moonlight_storage_ensure_data_dir();
 
     /* Open file for writing (create if doesn't exist, truncate if exists) */
     fd = sceIoOpen(CONFIG_FILE_PATH,

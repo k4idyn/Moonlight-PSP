@@ -60,7 +60,7 @@ If a later paired-host request fails because the host-side device entry is stale
 
 ## Certificate Storage
 
-Client identity files are stored in the Moonlight folder on the Memory Stick:
+Client identity files are stored under `ms0:/PSP/SAVEDATA/Moonlight/`:
 
 - `client.crt` - client certificate
 - `client.key` - client private key

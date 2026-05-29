@@ -13,6 +13,7 @@
 #define POWER_HANDLER_H
 
 #include <psptypes.h>
+#include "storage_paths.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,10 +24,10 @@ extern "C" {
  *--------------------------------------------------------------------------*/
 
 /* Session token cache file path on Memory Stick */
-#define SESSION_TOKEN_CACHE_PATH    "ms0:/moonlight/session_token.bin"
+#define SESSION_TOKEN_CACHE_PATH    MOONLIGHT_SAVE_DIR "/session_token.bin"
 
 /* Session info cache file path */
-#define SESSION_INFO_CACHE_PATH     "ms0:/moonlight/session_info.bin"
+#define SESSION_INFO_CACHE_PATH     MOONLIGHT_SAVE_DIR "/session_info.bin"
 
 /* Quick reconnect timeout in seconds */
 #define QUICK_RECONNECT_TIMEOUT_SEC 5
@@ -135,7 +136,7 @@ int power_handler_is_suspended(void);
  * power_handler_cache_session_token - Cache current session for quick reconnect
  *
  * Saves authentication token, server info, and stream configuration
- * to ms0:/moonlight/session_token.bin for use after resume.
+ * to ms0:/PSP/SAVEDATA/Moonlight/session_token.bin for use after resume.
  *
  * Returns: 0 on success, negative on error
  */
@@ -145,7 +146,7 @@ int power_handler_cache_session_token(void);
  * power_handler_quick_reconnect - Attempt quick reconnection after resume
  *
  * Uses cached session token to reconnect without re-pairing:
- * 1. Loads cached session token from ms0:/
+ * 1. Loads cached session token from savedata
  * 2. Creates TCP socket and connects to RTSP port with 5-second timeout
  * 3. Sends RTSP PLAY command to resume stream
  * 4. Restarts network receive thread

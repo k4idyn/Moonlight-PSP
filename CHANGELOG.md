@@ -8,6 +8,23 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ---
 
+## [1.3.0] - 2026-05-29
+
+### Memory Stick Layout
+- Moved runtime writes to `ms0:/PSP/SAVEDATA/Moonlight/`, including config, button map, pairing certificate/key, client ID, TLS pins, icon cache, logs, app-list dumps, raw/IDR debug dumps, session caches, and safety-buffer fallback files.
+- Added shared storage path helpers so new runtime writes create the savedata directory instead of recreating root-level or install-folder clutter.
+- Updaters can delete stale old-build folders/files such as `ms0:/moonlight/`, old root-level Moonlight logs/dumps, and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying v1.3. Pair again after the clean install.
+
+### Remote and Pairing
+- Remote/hotspot launches now keep the user-selected public IP for RTSP when Sunshine returns a private LAN address in `sessionUrl`.
+- Pairing now persists the paired host after authenticated pairing succeeds, including manual public-IP pairing paths.
+
+### XMB and Exit
+- Added PSP-safe `ICON0.PNG` and `PIC1.PNG` artwork to the EBOOT build so the XMB icon and background render correctly.
+- HOME/XMB exit now routes through the unified app cleanup path, aborts the idle Wi-Fi helper without waiting, disconnects networking, shuts down input/UI/display resources, and includes a `module_stop()` fallback for shell-driven exits.
+
+---
+
 ## [1.2.0] - 2026-05-18
 
 ### Streaming Presets

@@ -123,7 +123,7 @@ extern PspConfig g_psp_config;
 #define RTSP_CONNECT_MAX_RETRIES         2
 #define RTSP_POST_SETUP_CONNECT_MAX_RETRIES 2
 #define RTSP_CONNECT_RETRY_DELAY_MS      500
-#define TLS_PIN_DIR         "ms0:/PSP/GAME/Moonlight/tls_pins"
+#define TLS_PIN_DIR         MOONLIGHT_SAVE_TLS_PIN_DIR
 #define HTTPS_CONNECT_TIMEOUT_US    (5 * 1000 * 1000)
 #define HTTPS_HANDSHAKE_TIMEOUT_US  (8 * 1000 * 1000)
 #define HTTPS_IO_TIMEOUT_US         (6 * 1000 * 1000)
@@ -198,6 +198,77 @@ static char s_retry_title[64] = "";
 static int g_rtsp_port = SUNSHINE_RTSP_PORT_PRIMARY;
 static char g_rtsp_connect_host[64] = DEFAULT_SUNSHINE_HOST;
 static char g_rtsp_host_header[96] = DEFAULT_SUNSHINE_HOST;
+
+static int parse_ipv4_literal(const char *ip,
+                              unsigned int *a,
+                              unsigned int *b,
+                              unsigned int *c,
+                              unsigned int *d)
+{
+    char tail;
+
+    if (!ip || !a || !b || !c || !d) {
+        return -1;
+    }
+
+    if (sscanf(ip, "%u.%u.%u.%u%c", a, b, c, d, &tail) != 4) {
+        return -1;
+    }
+
+    if (*a > 255 || *b > 255 || *c > 255 || *d > 255) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ipv4_is_private_or_unroutable(const char *ip)
+{
+    unsigned int a, b, c, d;
+
+    if (parse_ipv4_literal(ip, &a, &b, &c, &d) < 0) {
+        return 0;
+    }
+
+    if (a == 0 || a == 10 || a == 127 || (a == 169 && b == 254)) {
+        return 1;
+    }
+
+    if (a == 192 && b == 168) {
+        return 1;
+    }
+
+    if (a == 172 && b >= 16 && b <= 31) {
+        return 1;
+    }
+
+    if (a == 100 && b >= 64 && b <= 127) {
+        return 1;
+    }
+
+    if (a >= 224 || (a == 255 && b == 255 && c == 255 && d == 255)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int ipv4_is_public_literal(const char *ip)
+{
+    unsigned int a, b, c, d;
+
+    if (parse_ipv4_literal(ip, &a, &b, &c, &d) < 0) {
+        return 0;
+    }
+
+    return !ipv4_is_private_or_unroutable(ip);
+}
+
+static int rtsp_should_force_selected_host(const char *session_host)
+{
+    return ipv4_is_public_literal(g_sunshine_host) &&
+           ipv4_is_private_or_unroutable(session_host);
+}
 
 void network_connect_clear_retry_app(void)
 {
@@ -446,6 +517,15 @@ static void rtsp_set_target_from_session_url(const char *session_url)
     }
 
     if (authority[0]) {
+        if (rtsp_should_force_selected_host(authority)) {
+            pair_log("[RTSP] sessionUrl host %s is not reachable from selected remote host %s; using selected host\n",
+                     authority, g_sunshine_host);
+            strncpy(g_rtsp_connect_host, g_sunshine_host, sizeof(g_rtsp_connect_host) - 1);
+            g_rtsp_connect_host[sizeof(g_rtsp_connect_host) - 1] = '\0';
+            rtsp_rewrite_target_authority(g_rtsp_connect_host, g_rtsp_port);
+            return;
+        }
+
         strncpy(g_rtsp_connect_host, authority, sizeof(g_rtsp_connect_host) - 1);
         g_rtsp_connect_host[sizeof(g_rtsp_connect_host) - 1] = '\0';
     }
@@ -621,10 +701,7 @@ static int tls_verify_or_store_pin(const char *host, mbedtls_ssl_context *ssl)
     mbedtls_sha256(peer->raw.p, peer->raw.len, digest, 0);
     sha256_hex_upper(digest, pin_hex);
 
-    sceIoMkdir("ms0:/PSP", 0777);
-    sceIoMkdir("ms0:/PSP/GAME", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/Moonlight", 0777);
-    sceIoMkdir(TLS_PIN_DIR, 0777);
+    moonlight_storage_ensure_tls_pin_dir();
 
     sanitize_host_for_filename(host, safe_host, sizeof(safe_host));
     snprintf(pin_path, sizeof(pin_path), "%s/%s.sha256", TLS_PIN_DIR, safe_host);
@@ -3867,7 +3944,7 @@ typedef struct {
     volatile int  result;     /* 0 = success, negative = error */
 } PairingThreadArgs;
 
-/* Debug log helper for pairing thread (writes to ms0:/moonlight_debug.log) */
+/* Debug log helper for pairing thread (writes to savedata moonlight_debug.log) */
 #include "diag_log.h"
 #define pair_log(fmt, ...) diag_log_write("NET", fmt, ##__VA_ARGS__)
 
@@ -4478,6 +4555,13 @@ static int pairing_thread_func(SceSize args, void *argp)
     pairing_success = 1;
     *(ta->is_paired) = 1;
     ta->result = 0;
+    strncpy(g_last_paired_host, host, sizeof(g_last_paired_host) - 1);
+    g_last_paired_host[sizeof(g_last_paired_host) - 1] = '\0';
+    if (config_add_paired_host(&g_psp_config, host) < 0) {
+        pair_log("[PAIR] WARNING: failed to persist paired host %s\n", host);
+    } else {
+        pair_log("[PAIR] persisted paired host %s\n", host);
+    }
 
 done:
     if (!pairing_success) {

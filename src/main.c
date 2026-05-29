@@ -49,7 +49,7 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_MAIN_THREAD_STACK_SIZE_KB(256);
 PSP_HEAP_SIZE_KB(12 * 1024);
 
-/* All logging unified into ms0:/moonlight.log */
+/* All logging unified into savedata moonlight.log */
 
 PspConfig g_psp_config;
 SharedState g_shared;
@@ -87,6 +87,7 @@ extern void wifi_disconnect(void);
 extern void wifi_launch_disable_power_save(void);
 extern void wifi_keepalive_start(void);
 extern void wifi_keepalive_stop(void);
+extern void wifi_keepalive_abort(void);
 extern int  network_connect_all(void);
 extern void network_set_target_host(const char *host_ip);
 extern void network_restore_paired_host(const char *paired_ip);
@@ -1194,16 +1195,36 @@ host_select_loop:
         }
     }
 
-    wifi_keepalive_stop();
-    network_me_shutdown(); control_stream_stop(); audio_thread_shutdown();
-    rtsp_session_close();
-    sw_decoder_thread_shutdown();
-    sceKernelExitGame(); return 0;
+    exit_to_xmb();
+    return 0;
 }
 
 static int exit_callback(int arg1, int arg2, void *common) {
-    g_running = 0; me_running = 0; wifi_keepalive_stop(); network_me_abort(); control_stream_abort(); rtsp_session_close();
-    sceKernelDelayThread(500000); sceKernelExitGame(); return 0;
+    (void)arg1;
+    (void)arg2;
+    (void)common;
+    g_running = 0;
+    g_remote_buttons = 0;
+    g_remote_analog_active = 0;
+    g_remote_exit_request = 0;
+    exit_to_xmb();
+    return 0;
+}
+
+int module_stop(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    g_running = 0;
+    me_running = 0;
+    g_stream_status = 0;
+    g_remote_buttons = 0;
+    g_remote_analog_active = 0;
+    g_remote_exit_request = 0;
+    wifi_keepalive_abort();
+    network_me_abort();
+    control_stream_abort();
+    return 0;
 }
 static int callback_thread(SceSize args, void *argp) {
     int cbid = sceKernelCreateCallback("Exit Callback", exit_callback, NULL);

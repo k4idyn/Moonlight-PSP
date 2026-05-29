@@ -39,6 +39,7 @@
 #include "decode_flags.h"
 #include "safety_buffer.h"
 #include "runtime_telemetry.h"
+#include "storage_paths.h"
 
 extern PspConfig g_psp_config;
 
@@ -472,18 +473,19 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
     }
 
 #ifdef MOONLIGHT_DEBUG_DUMP
-    /* Debug-only raw dump: first frame >5KB (likely IDR) to ms0:/raw_dump.h264.
+    /* Debug-only raw dump: first frame >5KB (likely IDR) to savedata raw_dump.h264.
      * This captures data BEFORE CAVLC parsing so we can hex-inspect the full
      * frame even if SPS/PPS detection fails. */
     {
         static int raw_dumped = 0;
         if (!raw_dumped && nal_len > 5000) {
-            SceUID fd = sceIoOpen("ms0:/raw_dump.h264",
+            moonlight_storage_ensure_data_dir();
+            SceUID fd = sceIoOpen(MOONLIGHT_SAVE_RAW_DUMP_PATH,
                                   PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
             if (fd >= 0) {
                 sceIoWrite(fd, nal_data, nal_len);
                 sceIoClose(fd);
-                dec_log("RAW DUMP: saved %d bytes to ms0:/raw_dump.h264\n", nal_len);
+                dec_log("RAW DUMP: saved %d bytes to %s\n", nal_len, MOONLIGHT_SAVE_RAW_DUMP_PATH);
             }
             raw_dumped = 1;
         }

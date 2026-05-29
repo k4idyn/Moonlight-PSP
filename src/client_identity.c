@@ -4,7 +4,7 @@
  * On first launch, generates a persistent client identity:
  *   1. 16-char uppercase hex unique ID (stored in config.ini)
  *   2. Self-signed RSA-2048 certificate and private key
- *      (stored in ms0:/PSP/GAME/Moonlight/client.crt and client.key)
+ *      (stored in ms0:/PSP/SAVEDATA/Moonlight/client.crt and client.key)
  *
  * Uses PSP RNG (sceKernelUtilsMt19937) and mbedTLS for RSA/X.509.
  */
@@ -52,7 +52,7 @@ static char s_uuid[CLIENT_UUID_LEN];
 static int s_loaded = 0;
 
 /* Persisted UID path */
-#define CLIENT_UID_PATH "ms0:/PSP/GAME/Moonlight/client.uid"
+#define CLIENT_UID_PATH MOONLIGHT_SAVE_DIR "/client.uid"
 
 /* Legacy UID used by older builds that generated fixed identity values. */
 #define LEGACY_UID_VALUE "0123456789ABCDEF"
@@ -328,9 +328,7 @@ static int generate_cert_and_key(const char *uid)
     }
 
     /* Ensure directory exists */
-    sceIoMkdir("ms0:/PSP", 0777);
-    sceIoMkdir("ms0:/PSP/GAME", 0777);
-    sceIoMkdir(CLIENT_DIR_PATH, 0777);
+    moonlight_storage_ensure_data_dir();
 
     /* Save certificate PEM */
     ret = write_file_full(CLIENT_CERT_PATH, (const char *)cert_buf,
@@ -351,7 +349,7 @@ static int generate_cert_and_key(const char *uid)
     /* Save UID string to its own file so it persists exactly matching the certificate */
     write_file_full(CLIENT_UID_PATH, uid, strlen(uid));
 
-    id_log("[IDENTITY] Certificate, key, and UID saved to ms0:\n");
+    id_log("[IDENTITY] Certificate, key, and UID saved to savedata\n");
     ret = 0;
 
 cleanup:

@@ -20,8 +20,12 @@ TARGET          = moonlight
 PSP_EBOOT_TITLE = PSP Moonlight
 BUILD_PRX       = 1
 PSP_FW_VERSION  = 660
+PSP_EBOOT_ICON  = ICON0.PNG
+PSP_EBOOT_PIC1  = PIC1.PNG
 EXTRA_TARGETS   = EBOOT.PBP
 .DEFAULT_GOAL   = all
+
+EBOOT.PBP: ICON0.PNG PIC1.PNG
 
 # ============================================================================
 # Source Files

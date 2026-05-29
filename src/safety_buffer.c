@@ -433,6 +433,7 @@ void safety_buffer_store_nal(u8 *nal_data, u32 nal_len, u64 pts, u8 is_keyframe)
             /* RAM pool exhausted - switch to fallback */
             pspDebugScreenPrintf("safety_buf: RAM full, switching to fallback\n");
             
+            moonlight_storage_ensure_data_dir();
             g_safety_buffer.fallback_fd = sceIoOpen(
                 SAFETY_BUFFER_FALLBACK_PATH,
                 PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
@@ -652,6 +653,7 @@ void safety_buffer_clear(void)
     /* Clear fallback file if using it */
     if (g_safety_buffer.using_fallback && g_safety_buffer.fallback_fd >= 0) {
         sceIoClose(g_safety_buffer.fallback_fd);
+        moonlight_storage_ensure_data_dir();
         g_safety_buffer.fallback_fd = sceIoOpen(
             SAFETY_BUFFER_FALLBACK_PATH,
             PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,

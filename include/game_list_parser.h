@@ -5,13 +5,14 @@
  * Parses the XML response to extract game ID, title, and box art URL.
  * Downloads game icons (144x80 PNG) to local cache directory.
  *
- * Cache location: ms0:/PSP/GAME/Moonlight/cache/
+ * Cache location: ms0:/PSP/SAVEDATA/Moonlight/cache/
  */
 
 #ifndef GAME_LIST_PARSER_H
 #define GAME_LIST_PARSER_H
 
 #include <psptypes.h>
+#include "storage_paths.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,8 +36,8 @@ extern "C" {
 #define ICON_DATA_SIZE          (ICON_PIXEL_COUNT * 2)  /* RGB565 */
 
 /* Cache directory path on PSP memory stick */
-#define CACHE_DIR               "ms0:/PSP/GAME/Moonlight/cache/"
-#define CACHE_DIR_LENGTH        48
+#define CACHE_DIR               MOONLIGHT_SAVE_CACHE_DIR "/"
+#define CACHE_DIR_LENGTH        64
 
 /* HTTP buffer size for receiving app metadata. Box-art PNG downloads use a
  * separate statically bounded buffer in game_list_parser.c. */
@@ -123,7 +124,7 @@ int game_list_parse_xml(GameList *gameList, const char *xmlData, int xmlSize);
  * @gameList: Pointer to GameList with games to download icons for
  *
  * Downloads 144x80 PNG icons for each game to the cache directory.
- * Icons are saved as ms0:/PSP/GAME/Moonlight/cache/[GAME_ID].png
+ * Icons are saved as ms0:/PSP/SAVEDATA/Moonlight/cache/[GAME_ID].raw
  *
  * Returns: 0 on success, negative on error
  */
@@ -161,7 +162,7 @@ int game_list_load_cached_icon(GameInfo *game);
  * @game: Pointer to GameInfo with icon data to save
  *
  * Saves the RGBA8888 icon data to cache directory.
- * Filename: ms0:/PSP/GAME/Moonlight/cache/[GAME_ID].raw
+ * Filename: ms0:/PSP/SAVEDATA/Moonlight/cache/[GAME_ID].raw
  *
  * Returns: 0 on success, negative on error
  */

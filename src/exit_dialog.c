@@ -64,16 +64,11 @@ int exit_dialog_run(void)
         int circle = (pad.Buttons & PSP_CTRL_CIRCLE) && !(prev_pad.Buttons & PSP_CTRL_CIRCLE);
 
         if (cross) {
-            /* ---- Ordered shutdown ---- */
-            /* Stop HUD first (safe even if not initialised) */
-            hud_shutdown();
-            /* Shut down stream session (network/ME/sockets/decoder/display).
-             * end_stream_session() calls sceKernelExitGame() internally.     */
-            end_stream_session();
+            /* exit_to_xmb() handles active-stream cleanup when needed. */
+            exit_to_xmb();
             /* Should not reach here — end_stream_session exits the process.
              * Belt-and-suspenders fallback: */
             sceKernelExitGame();
-            /* Not reached */
             return 0;
         }
 

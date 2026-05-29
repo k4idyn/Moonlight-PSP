@@ -1,4 +1,4 @@
-# Installation Guide - PSP Moonlight v1.2.0
+# Installation Guide - PSP Moonlight v1.3.0
 
 ## Prerequisites
 
@@ -48,6 +48,25 @@ ms0:/
 5. Safely eject the Memory Stick or disconnect USB.
 
 Both files must be in the same folder. The app loads `moonlight_me_helper.prx` at startup to initialize Media Engine conversion.
+
+Runtime settings, pairing identity, logs, and icon cache are stored separately under `ms0:/PSP/SAVEDATA/Moonlight/`.
+
+### Updating From v1.2 or Older
+
+For a clean upgrade, remove stale old-build Moonlight clutter before copying the new files. Do not delete the Memory Stick root itself; only remove old Moonlight files and folders if they exist.
+
+1. Delete old root-level Moonlight folders/files such as:
+   - `ms0:/moonlight/`
+   - `ms0:/moonlight.log`
+   - `ms0:/moonlight_debug.log`
+   - `ms0:/diag.log`
+   - `ms0:/net.log`
+   - `ms0:/applist_dump.xml`
+   - `ms0:/raw_dump.h264`
+   - `ms0:/idr_dump.h264`
+2. Delete the old install folder: `ms0:/PSP/GAME/Moonlight/`.
+3. Recreate `ms0:/PSP/GAME/Moonlight/` and copy the v1.3 `EBOOT.PBP` and `moonlight_me_helper.prx` into it.
+4. Pair again in Sunshine. v1.3 stores the new client identity under `ms0:/PSP/SAVEDATA/Moonlight/`.
 
 ---
 
@@ -166,13 +185,15 @@ This is expected. Performance disables local PSP audio decode and playback to sp
 
 Delete `ms0:/PSP/GAME/Moonlight/`.
 
-Moonlight may also create:
+Moonlight stores runtime data here:
 
-- `ms0:/PSP/GAME/Moonlight/config.ini` - settings
-- `ms0:/PSP/GAME/Moonlight/cache/` - icon cache
-- `ms0:/PSP/GAME/Moonlight/client.crt` - pairing client certificate
-- `ms0:/PSP/GAME/Moonlight/client.key` - pairing private key
-- `ms0:/PSP/GAME/Moonlight/client.uid` - stable client ID
-- `ms0:/PSP/GAME/Moonlight/tls_pins/` - HTTPS host certificate pins
+- `ms0:/PSP/SAVEDATA/Moonlight/config.ini` - settings
+- `ms0:/PSP/SAVEDATA/Moonlight/map.cfg` - button mapper settings
+- `ms0:/PSP/SAVEDATA/Moonlight/cache/` - icon cache
+- `ms0:/PSP/SAVEDATA/Moonlight/client.crt` - pairing client certificate
+- `ms0:/PSP/SAVEDATA/Moonlight/client.key` - pairing private key
+- `ms0:/PSP/SAVEDATA/Moonlight/client.uid` - stable client ID
+- `ms0:/PSP/SAVEDATA/Moonlight/tls_pins/` - HTTPS host certificate pins
+- `ms0:/PSP/SAVEDATA/Moonlight/moonlight.log` - diagnostics log in debug builds
 
-Delete those too for a clean removal.
+Delete `ms0:/PSP/SAVEDATA/Moonlight/` too for a clean removal.

@@ -24,6 +24,7 @@
 #include "diag_log.h"
 #include "settings_menu.h"
 #include "input.h"
+#include "storage_paths.h"
 
 /* ------------------------------------------------------------------ *
  * Moonlight controller button bit-flags (u16 bitmask)
@@ -51,7 +52,7 @@
 #define RSTICK_ANALOG_DEADZONE  3200
 
 /* Map config path on Memory Stick */
-#define MAP_CFG_PATH        "ms0:/moonlight/map.cfg"
+#define MAP_CFG_PATH        MOONLIGHT_SAVE_DIR "/map.cfg"
 
 typedef struct {
     uint32_t l2_button;
@@ -320,7 +321,7 @@ void input_save_mapping(void)
     SceUID fd;
     g_mapping.version = BUTTON_MAPPING_VERSION;
     sanitize_mapping();
-    sceIoMkdir("ms0:/moonlight", 0777);
+    moonlight_storage_ensure_data_dir();
     fd = sceIoOpen(MAP_CFG_PATH,
                    PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd < 0) return;

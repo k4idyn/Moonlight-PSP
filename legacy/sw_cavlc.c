@@ -30,6 +30,7 @@
 #include <pspthreadman.h>
 #include "sw_decode_pipeline.h"
 #include "diag_log.h"
+#include "storage_paths.h"
 
 /* Per-block verbose logging — set by frame decode around failure zone */
 static int g_cavlc_blk_verbose = 0;
@@ -1791,12 +1792,13 @@ int cavlc_decode_frame(const u8 *annexb_data, int annexb_len,
         if (idr_dump_enable && !idr_dumped) {
             for (int nd = 0; nd < nal_count; nd++) {
                 if (nals[nd].type == SW_NAL_IDR) {
-                    SceUID fd = sceIoOpen("ms0:/idr_dump.h264",
+                    moonlight_storage_ensure_data_dir();
+                    SceUID fd = sceIoOpen(MOONLIGHT_SAVE_IDR_DUMP_PATH,
                                           PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
                     if (fd >= 0) {
                         sceIoWrite(fd, annexb_data, annexb_len);
                         sceIoClose(fd);
-                        cavlc_log("IDR DUMP: saved %d bytes to ms0:/idr_dump.h264\n", annexb_len);
+                        cavlc_log("IDR DUMP: saved %d bytes to %s\n", annexb_len, MOONLIGHT_SAVE_IDR_DUMP_PATH);
                     } else {
                         cavlc_log("IDR DUMP: failed to open file (err=%d)\n", fd);
                     }

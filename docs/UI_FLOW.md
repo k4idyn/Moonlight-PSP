@@ -1,6 +1,6 @@
 # UI Flow Reference
 
-This document describes the implemented UI flow of PSP Moonlight v1.2.0.
+This document describes the implemented UI flow of PSP Moonlight v1.3.0.
 
 All screen coordinates are in native PSP resolution: 480x272.
 
@@ -160,7 +160,7 @@ Selecting Yes shuts down active threads, network sockets, and the ME worker befo
 
 ## Error Handling
 
-Major errors are logged to `ms0:/moonlight_debug.log`. Fatal stream errors display an error modal, then cleanly return to the host or game screen after acknowledgement.
+Major errors are logged to `ms0:/PSP/SAVEDATA/Moonlight/moonlight_debug.log`. Fatal stream errors display an error modal, then cleanly return to the host or game screen after acknowledgement.
 
 ---
 

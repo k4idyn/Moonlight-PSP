@@ -2,12 +2,14 @@
  * icon_cache.h - Box art icon cache invalidation and management
  *
  * Stores icon metadata (source URL hash, fetch timestamp) alongside
- * cached RGB565 icon files on ms0:/PSP/GAME/Moonlight/cache/.
+ * cached RGB565 icon files on ms0:/PSP/SAVEDATA/Moonlight/cache/.
  * Validates freshness on each /applist fetch and re-downloads stale art.
  */
 
 #ifndef ICON_CACHE_H
 #define ICON_CACHE_H
+
+#include "storage_paths.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,7 +19,7 @@ extern "C" {
 #define ICON_CACHE_MAX_AGE_DAYS     7
 
 /* Cache index file */
-#define ICON_CACHE_INDEX_PATH       "ms0:/PSP/GAME/Moonlight/cache/cache_index.ini"
+#define ICON_CACHE_INDEX_PATH       MOONLIGHT_SAVE_CACHE_DIR "/cache_index.ini"
 
 /*
  * icon_cache_needs_update - Check if a cached icon is stale.

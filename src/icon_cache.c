@@ -117,10 +117,7 @@ static void save_index(void)
                         s_entries[i].fetch_day);
     }
 
-    sceIoMkdir("ms0:/PSP", 0777);
-    sceIoMkdir("ms0:/PSP/GAME", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/Moonlight", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/Moonlight/cache", 0777);
+    moonlight_storage_ensure_cache_dir();
 
     fd = sceIoOpen(ICON_CACHE_INDEX_PATH,
                    PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
@@ -214,7 +211,7 @@ int icon_cache_clear_all(void)
     /* Delete cached icon files */
     for (i = 0; i < s_count; i++) {
         snprintf(path, sizeof(path),
-                 "ms0:/PSP/GAME/Moonlight/cache/%d.raw", s_entries[i].app_id);
+                 MOONLIGHT_SAVE_CACHE_DIR "/%d.raw", s_entries[i].app_id);
         sceIoRemove(path);
     }
 

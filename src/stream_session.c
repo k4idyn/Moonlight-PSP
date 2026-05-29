@@ -20,6 +20,7 @@
 #include "audio_thread.h"
 #include "control_stream.h"
 #include "diag_log.h"
+#include "ui_manager.h"
 
 /*============================================================================
  * External Variable and Function Declarations
@@ -31,8 +32,17 @@ extern void rtsp_session_close(void);
 extern void LiStopConnection(void);
 extern void input_shutdown(void);
 extern void network_wait_for_cancel_thread(void);
+extern void wifi_keepalive_stop(void);
+extern void wifi_keepalive_abort(void);
+extern void wifi_disconnect(void);
+extern void display_shutdown(void);
+extern volatile int g_stream_status;
 
 #define LOG_SESSION(fmt, ...) diag_log_write("SESSION", fmt, ##__VA_ARGS__)
+
+static volatile int s_xmb_exit_in_progress = 0;
+
+void exit_to_xmb(void);
 
 /*============================================================================
  * Public API
@@ -90,6 +100,7 @@ void abort_stream_to_menu(void)
     LOG_SESSION("TEARDOWN COMPLETE. Returning to host discovery menu.\n");
     diag_log_flush();
     sceKernelDelayThread(50000); /* 50ms settling delay */
+    g_stream_status = 0;
 }
 
 static int g_stream_input_socket = -1;
@@ -97,13 +108,48 @@ void stream_session_set_input_socket(int sock) { g_stream_input_socket = sock; }
 
 void end_stream_session(void)
 {
-    LOG_SESSION("end_stream_session: PERFORMING FULL SYSTEM SHUTDOWN CLEANUP\n");
-    abort_stream_to_menu();
+    exit_to_xmb();
+}
+
+void exit_to_xmb(void)
+{
+    if (s_xmb_exit_in_progress) {
+        sceKernelExitGame();
+        return;
+    }
+
+    s_xmb_exit_in_progress = 1;
+    LOG_SESSION("exit_to_xmb: requested (me_running=%d stream_status=%d)\n",
+                me_running, g_stream_status);
+
+    if (me_running || g_stream_status != 0) {
+        LOG_SESSION("exit_to_xmb: active stream detected; running stream teardown\n");
+        abort_stream_to_menu();
+    } else {
+        LOG_SESSION("exit_to_xmb: no active stream; skipping stream teardown\n");
+        hud_shutdown();
+        power_handler_shutdown();
+        signal_strength_shutdown();
+        rtsp_session_close();
+    }
+
+    input_shutdown();
+
+    /* App exit should not wait on the idle Wi-Fi monitor. HOME exits happen
+     * under the XMB "Please wait" overlay, so force-stop the helper before
+     * tearing down APCTL/INET. */
+    wifi_keepalive_abort();
+
+    wifi_disconnect();
+
+    ui_manager_shutdown();
+    display_shutdown();
 
     /* Final hardware power down */
     scePowerSetClockFrequency(222, 222, 111);
 
     LOG_SESSION("EXITING TO XMB...\n");
-    sceKernelDelayThread(200000);
+    diag_log_flush();
+    sceKernelDelayThread(50000);
     sceKernelExitGame();
 }

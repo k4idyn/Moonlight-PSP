@@ -121,10 +121,7 @@ static int assign_fallback_icon(GameInfo *game)
 
 static void ensure_cache_dir(void)
 {
-    sceIoMkdir("ms0:/PSP", 0777);
-    sceIoMkdir("ms0:/PSP/GAME", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/Moonlight", 0777);
-    sceIoMkdir("ms0:/PSP/GAME/Moonlight/cache", 0777);
+    moonlight_storage_ensure_cache_dir();
 }
 
 typedef struct {
@@ -508,7 +505,8 @@ int game_list_fetch(GameList *gameList)
 
         /* DUMP THE EXACT RAW XML DIRECTLY TO THE LOG SO WE CAN PROVE WHAT APOLLO SENT */
 #ifndef RETAIL_BUILD
-        SceUID dump_fd = sceIoOpen("ms0:/applist_dump.xml", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+        moonlight_storage_ensure_data_dir();
+        SceUID dump_fd = sceIoOpen(MOONLIGHT_SAVE_APPLIST_DUMP_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
         if (dump_fd >= 0) {
             sceIoWrite(dump_fd, recv_buf, xml_len);
             sceIoClose(dump_fd);

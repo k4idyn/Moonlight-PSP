@@ -73,7 +73,7 @@ static int save_session_token(void)
     SceUID fd;
     int ret;
     
-    sceIoMkdir("ms0:/moonlight", 0777);
+    moonlight_storage_ensure_data_dir();
     
     fd = sceIoOpen(SESSION_TOKEN_CACHE_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd < 0) return -1;

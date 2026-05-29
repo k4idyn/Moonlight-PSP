@@ -15,7 +15,7 @@ Network Packets → RTP Reassembly → Safety Buffer → Decoder → Display
 ## Key Features
 
 1. **Circular Buffer in RAM**: Stores the last 2 seconds of H.264 NAL units
-2. **Memory Stick Fallback**: If RAM is full, automatically falls back to `ms0:/__temp_stream`
+2. **Memory Stick Fallback**: If RAM is full, automatically falls back to `ms0:/PSP/SAVEDATA/Moonlight/__temp_stream`
 3. **Async Writer Thread**: File I/O runs in background without blocking decode
 4. **Keyframe Detection**: Identifies IDR frames for safe rewind points
 5. **State Machine**: Tracks buffering, idle, rewind, and paused states
@@ -103,7 +103,7 @@ void safety_buffer_get_stats(u32 *out_total_nals, u32 *out_total_bytes,
 | `SAFETY_BUFFER_SIZE_BYTES` | 512000 | RAM pool size (500 KB) |
 | `SAFETY_BUFFER_MAX_NAL_SIZE` | 262144 | Maximum NAL size (256 KB) |
 | `SAFETY_BUFFER_SLOTS` | 128 | Number of circular buffer slots |
-| `SAFETY_BUFFER_FALLBACK_PATH` | "ms0:/__temp_stream" | Fallback file path |
+| `SAFETY_BUFFER_FALLBACK_PATH` | "ms0:/PSP/SAVEDATA/Moonlight/__temp_stream" | Fallback file path |
 
 ## State Machine
 
@@ -172,6 +172,6 @@ if (hud_should_show_rewind_icon()) {
 
 ## Known Limitations
 
-- RAM-only mode is the common path. Memory Stick fallback (`ms0:/__temp_stream`) is only used when RAM allocation fails, which is uncommon on PSP-2000/3000.
+- RAM-only mode is the common path. Memory Stick fallback (`ms0:/PSP/SAVEDATA/Moonlight/__temp_stream`) is only used when RAM allocation fails, which is uncommon on PSP-2000/3000.
 - Rewind resumes from the last IDR frame. At low bitrates or high frame rates, the keyframe interval may be several seconds, causing a visible seek on recovery.
 - The rewind icon duration is 2 seconds regardless of actual recovery time. Persistent packet loss will retrigger it repeatedly.

@@ -12,14 +12,16 @@
 #ifndef CLIENT_IDENTITY_H
 #define CLIENT_IDENTITY_H
 
+#include "storage_paths.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* File paths for certificate and key on Memory Stick */
-#define CLIENT_CERT_PATH    "ms0:/PSP/GAME/Moonlight/client.crt"
-#define CLIENT_KEY_PATH     "ms0:/PSP/GAME/Moonlight/client.key"
-#define CLIENT_DIR_PATH     "ms0:/PSP/GAME/Moonlight"
+#define CLIENT_CERT_PATH    MOONLIGHT_SAVE_DIR "/client.crt"
+#define CLIENT_KEY_PATH     MOONLIGHT_SAVE_DIR "/client.key"
+#define CLIENT_DIR_PATH     MOONLIGHT_SAVE_DIR
 
 /* Maximum length of the unique ID string (16 hex chars + null) */
 #define CLIENT_UID_LEN      17

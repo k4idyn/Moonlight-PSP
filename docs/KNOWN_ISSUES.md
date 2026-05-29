@@ -1,6 +1,6 @@
 # Known Issues
 
-_PSP Moonlight v1.2.0_
+_PSP Moonlight v1.3.0_
 
 This document lists user-facing limitations, compatibility notes, and practical guidance for stable PSP streaming.
 
@@ -46,7 +46,7 @@ This document lists user-facing limitations, compatibility notes, and practical 
 
 **Impact:** Game-library icons use Sunshine box-art paths with static PNG decode and raw RGB565 cache files.
 
-**Guidance:** If icons appear stale or missing, clear `ms0:/PSP/GAME/Moonlight/cache/` and refresh the game library.
+**Guidance:** If icons appear stale or missing, clear `ms0:/PSP/SAVEDATA/Moonlight/cache/` and refresh the game library.
 
 ### Power-switch resume is limited
 

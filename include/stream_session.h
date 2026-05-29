@@ -44,4 +44,12 @@ void abort_stream_to_menu(void);
  */
 void end_stream_session(void);
 
+/*
+ * exit_to_xmb - Exit the app to the PSP shell.
+ *
+ * Performs stream cleanup only when a stream is active, then stops background
+ * helpers before calling sceKernelExitGame().
+ */
+void exit_to_xmb(void);
+
 #endif /* STREAM_SESSION_H */

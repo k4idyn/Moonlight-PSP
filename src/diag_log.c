@@ -1,8 +1,8 @@
 /*
  * diag_log.c — Diagnostic logger for PSP Moonlight
  *
- * Writes every log line to BOTH ms0: and host0: simultaneously so logs
- * are always available regardless of which path the tool reads from.
+ * Writes every log line to savedata; host0: is kept only as a legacy cleanup
+ * target because live host0 writes can block under PSPLink.
  * Also mirrors every line to Kprintf (UsbKprintf → pspsh console).
  *
  * Thread safety: PSP kernel semaphore protects the shared buffer.
@@ -17,6 +17,7 @@
 
 #define DIAG_LOG_IMPLEMENTATION
 #include "diag_log.h"
+#include "storage_paths.h"
 
 /* ---------- debug/retail toggle ---------- */
 #ifdef RETAIL_BUILD
@@ -38,7 +39,7 @@ void diag_log_set_debug(int enable)
 #ifndef RETAIL_BUILD
 
 /* ---------- paths ---------- */
-#define LOG_PATH_MS    "ms0:/moonlight.log"
+#define LOG_PATH_MS    MOONLIGHT_SAVE_LOG_PATH
 #define LOG_PATH_HOST  "host0:/moonlight.log"
 
 /* ---------- buffer ---------- */
@@ -70,6 +71,7 @@ static void ensure_init(void)
 #ifndef RETAIL_BUILD
 static void write_to_path(const char *path)
 {
+    SceUID fd;
     int flags = PSP_O_WRONLY | PSP_O_CREAT;
     if (s_first_write) {
         flags |= PSP_O_TRUNC;
@@ -77,7 +79,10 @@ static void write_to_path(const char *path)
     } else {
         flags |= PSP_O_APPEND;
     }
-    SceUID fd = sceIoOpen(path, flags, 0777);
+    if (strcmp(path, LOG_PATH_MS) == 0) {
+        moonlight_storage_ensure_data_dir();
+    }
+    fd = sceIoOpen(path, flags, 0777);
     if (fd >= 0) {
         sceIoWrite(fd, s_buf, (SceSize)s_buf_pos);
         sceIoClose(fd);
@@ -140,7 +145,7 @@ void diag_log_write(const char *tag, const char *fmt, ...)
     /* Mirror to Kprintf (shows in pspsh console via UsbKprintf).
      * DISABLED: printf/Kprintf goes through USB and can block indefinitely
      * if pspsh console buffer is full, hanging the calling thread.
-     * ms0: log is sufficient for diagnostics. */
+     * savedata log is sufficient for diagnostics. */
     /* printf("%s", line); */
 
     if (sceKernelWaitSema(s_sem, 1, NULL) < 0) return;
@@ -153,7 +158,7 @@ void diag_log_write(const char *tag, const char *fmt, ...)
     memcpy(s_buf + s_buf_pos, line, (size_t)len);
     s_buf_pos += len;
 
-    /* Threshold flush: keep logs flowing without per-write ms0: I/O.
+    /* Threshold flush: keep logs flowing without per-write Memory Stick I/O.
      * Per-write flushing caused catastrophic WiFi/ms0: DMA contention
      * on PSP — TCP SYN-ACK packets were missed, adding 5+ second
      * delays to RTSP connects and causing PLAY timeouts.
@@ -201,11 +206,11 @@ void diag_log_clear(void)
     sceIoRemove(LOG_PATH_HOST);
     /* legacy cleanup */
     sceIoRemove("host0:/moonlight_live.log");
-    sceIoRemove("ms0:/diag.log");
-    sceIoRemove("ms0:/net.log");
-    sceIoRemove("ms0:/moonlight_debug.log");
-    sceIoRemove("ms0:/hello_test.txt");
-    sceIoRemove("ms0:/applist_dump.xml");
+    sceIoRemove(MOONLIGHT_SAVE_DIR "/diag.log");
+    sceIoRemove(MOONLIGHT_SAVE_DIR "/net.log");
+    sceIoRemove(MOONLIGHT_SAVE_DEBUG_LOG_PATH);
+    sceIoRemove(MOONLIGHT_SAVE_DIR "/hello_test.txt");
+    sceIoRemove(MOONLIGHT_SAVE_APPLIST_DUMP_PATH);
 #endif
 
     sceKernelSignalSema(s_sem, 1);

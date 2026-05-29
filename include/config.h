@@ -10,6 +10,7 @@
 
 #include <psptypes.h>
 #include "settings_menu.h"
+#include "storage_paths.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,8 +19,8 @@ extern "C" {
 /*--------------------------------------------------------------------------
  * Configuration File Path
  *--------------------------------------------------------------------------*/
-#define CONFIG_FILE_PATH        "ms0:/moonlight/config.ini"
-#define CONFIG_DIR_PATH         "ms0:/moonlight"
+#define CONFIG_FILE_PATH        MOONLIGHT_SAVE_DIR "/config.ini"
+#define CONFIG_DIR_PATH         MOONLIGHT_SAVE_DIR
 #define MAX_MANUAL_HOSTS        8
 
 typedef struct {
@@ -97,7 +98,7 @@ typedef struct {
  *
  * @config: Pointer to PspConfig structure to populate
  *
- * Reads configuration from "ms0:/moonlight/config.ini" file.
+ * Reads configuration from "ms0:/PSP/SAVEDATA/Moonlight/config.ini" file.
  * If the file doesn't exist or is corrupted, initializes with defaults:
  * - 300x170
  * - 30 FPS
@@ -113,7 +114,7 @@ int loadConfig(PspConfig *config);
  *
  * @config: Pointer to PspConfig structure to save
  *
- * Writes current configuration to "ms0:/moonlight/config.ini".
+ * Writes current configuration to "ms0:/PSP/SAVEDATA/Moonlight/config.ini".
  * Creates the directory and file if they don't exist.
  *
  * Returns: 0 on success, -1 on error
