@@ -1,6 +1,6 @@
 <div align="center">
 
-# PSP Moonlight
+# Moonlight PSP
 
 **v1.3.0 - PSP-native H.264 Game Streaming Client**
 
@@ -14,7 +14,7 @@
 
 ---
 
-PSP Moonlight is a Moonlight-compatible game-streaming client for Sony PSP systems, designed around a custom PSP-native networking, decode, audio, input, and rendering stack.
+Moonlight PSP is a Moonlight-compatible game-streaming client for Sony PSP systems, designed around a custom PSP-native networking, decode, audio, input, and rendering stack.
 
 The project streams H.264 video from a host PC running Sunshine, decodes video on the PSP main CPU, and uses the Media Engine for accelerated YUV-to-RGBA conversion.
 
