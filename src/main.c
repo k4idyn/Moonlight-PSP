@@ -693,7 +693,14 @@ settings_menu_entry:
         if (apctl_state != 4) {
             ret = netconf_ui_run();
             diag_log_write("UI", "NETCONF returned %d\n", ret);
-            if (ret < 0) { halt_with_error("Wi-Fi", -1); return -1; }
+            if (ret == -1) {
+                /* User cancelled the Wi-Fi setup; return to settings menu */
+                goto settings_menu_entry;
+            }
+            if (ret < 0) {
+                halt_with_error("Wi-Fi", ret);
+                return -1;
+            }
         } else {
             diag_log_write("UI", "WiFi already connected, skipping netconf\n");
         }
