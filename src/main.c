@@ -359,6 +359,9 @@ static int s_entry_display_copy_bytes = 0;
 static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((aligned(16)));
 static int s_mbedtls_heap_ready = 0;
 
+/* Dynamic application directory resolved from argv[0] */
+char g_app_dir[512] = "ms0:/PSP/GAME/Moonlight";
+
 static void LOG(const char *fmt, ...) {
 #ifdef RETAIL_BUILD
     (void)fmt;
@@ -433,6 +436,7 @@ static void moonlight_promote_main_present_thread(void)
 {
     SceUID tid = sceKernelGetThreadId();
     int ret = sceKernelChangeThreadPriority(tid, MAIN_PRESENT_THREAD_PRIORITY);
+    (void)ret;
     diag_log_write("MAIN", "main presentation priority set tid=0x%08X priority=0x%02X ret=0x%08X\n",
                    (unsigned)tid,
                    MAIN_PRESENT_THREAD_PRIORITY,
@@ -494,6 +498,7 @@ static void moonlight_main_shutdown_exit_callback_thread(void)
 
     if (wait_ret < 0) {
         int term_ret = sceKernelTerminateDeleteThread(tid);
+        (void)term_ret;
         diag_log_write("MAIN", "process-exit callback thread forced stop tid=0x%08X wake=0x%08X wait=0x%08X term=0x%08X\n",
                        (unsigned)tid,
                        (unsigned)wake_ret,
@@ -559,6 +564,7 @@ static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
 static int moonlight_main_exit_to_psplink(const char *reason)
 {
     const char *why = reason ? reason : "unspecified";
+    (void)why;
 
     diag_log_write("MAIN", "top-level process exit begin reason=%s\n", why);
     diag_log_flush();
@@ -622,6 +628,19 @@ static void setup_callbacks(void);
 int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
+    
+    /* Resolve absolute application directory from argv[0] */
+    if (argc > 0 && argv[0] != NULL) {
+        char *last_slash = strrchr(argv[0], '/');
+        if (last_slash != NULL) {
+            size_t len = last_slash - argv[0];
+            if (len < sizeof(g_app_dir)) {
+                memcpy(g_app_dir, argv[0], len);
+                g_app_dir[len] = '\0';
+            }
+        }
+    }
+
     diag_log_clear();
     moonlight_main_capture_entry_display();
     if (!s_mbedtls_heap_ready) {

@@ -24,6 +24,9 @@
 #include "stream_connect_ui.h"
 #include "ui_manager.h"
 
+extern void wifi_disconnect(void);
+extern void display_shutdown(void);
+
 extern volatile int me_running;
 extern void sw_decoder_thread_shutdown(void);
 extern void network_me_shutdown(void);
@@ -127,6 +130,9 @@ int moonlight_prepare_process_exit(void)
     diag_log_flush();
     stream_connect_stop();
     wifi_keepalive_abort();
+    wifi_disconnect();
+    ui_manager_shutdown();
+    display_shutdown();
     scePowerSetClockFrequency(222, 222, 111);
 
     g_stream_status = 0;

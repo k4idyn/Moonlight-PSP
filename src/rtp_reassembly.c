@@ -137,6 +137,7 @@ static void rtp_request_idr_force_for_mode(void)
     }
 }
 
+static const char *rtp_recovery_label(void) __attribute__((unused));
 static const char *rtp_recovery_label(void)
 {
     if (g_psp_config.cabacTestMode) {

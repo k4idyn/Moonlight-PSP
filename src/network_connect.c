@@ -3241,6 +3241,7 @@ static int rtsp_announce(int sock, int enc_enabled)
             stream_fps <= 10 &&
             launch_bitrate_kbps > 192) {
             int old_launch = launch_bitrate_kbps;
+            (void)old_launch;
             launch_bitrate_kbps = 192;
             transport_bitrate_kbps = launch_bitrate_kbps;
             configured_bitrate_kbps = launch_bitrate_kbps;
@@ -3603,6 +3604,7 @@ void rtsp_session_close(void)
                                                 len,
                                                 "TEARDOWN",
                                                 &sent);
+                (void)ret;
                 pair_log("[RTSP] TEARDOWN sent ret=%d bytes=%d/%d\n",
                          ret, sent, len);
             }

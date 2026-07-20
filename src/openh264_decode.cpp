@@ -35,6 +35,7 @@ extern "C" {
 #include <psprtc.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "sw_decode_pipeline.h"
 #include "stream_resolution.h"
@@ -555,8 +556,14 @@ extern "C" int oh264_pipeline_init(void)
     g_me_rgba_out  = NULL;
 
     /* Load ME helper PRX if not already resident */
+    int me_helper_loaded = 0;
     {
-        static const char *me_paths[] = {
+        extern char g_app_dir[512];
+        char dynamic_helper_path[512];
+        snprintf(dynamic_helper_path, sizeof(dynamic_helper_path), "%s/moonlight_me_helper.prx", g_app_dir);
+
+        const char *me_paths[] = {
+            dynamic_helper_path,
             "ms0:/PSP/GAME/Moonlight/moonlight_me_helper.prx",
             "moonlight_me_helper.prx",
             NULL
@@ -566,10 +573,14 @@ extern "C" int oh264_pipeline_init(void)
             me_prx_id = sceKernelLoadModule(me_paths[pi], 0, NULL);
             if (me_prx_id >= 0) {
                 diag_log_write("OH264", "ME helper loaded from %s", me_paths[pi]);
+                me_helper_loaded = 1;
                 break;
             }
             if (me_prx_id == (SceUID)0x80020139 ||
-                me_prx_id == (SceUID)0x8002032C) break;
+                me_prx_id == (SceUID)0x8002032C) {
+                me_helper_loaded = 1;
+                break;
+            }
         }
         if (me_prx_id >= 0) {
             int status = 0;
@@ -593,7 +604,7 @@ extern "C" int oh264_pipeline_init(void)
     g_me_ctrl_cached = (volatile struct me_struct *)&g_me_ctrl_storage;
     g_me_params      = &g_me_params_storage;
 
-    if (g_me_ctrl_cached && g_me_params) {
+    if (me_helper_loaded && g_me_ctrl_cached && g_me_params) {
         g_me_ctrl = (volatile struct me_struct *)((u32)g_me_ctrl_cached | 0x40000000u);
         memset((void *)g_me_ctrl_cached, 0, sizeof(struct me_struct));
         memset(g_me_params, 0, sizeof(MeYuv2RgbaParams));
@@ -619,7 +630,7 @@ extern "C" int oh264_pipeline_init(void)
             diag_log_write("OH264", "ME InitME failed %d — CPU fallback", me_ret);
         }
     } else {
-        diag_log_write("OH264", "ME alloc failed — CPU fallback");
+        diag_log_write("OH264", "ME helper not loaded or alloc failed — CPU fallback");
         g_me_ctrl = NULL;
     }
 
@@ -650,11 +661,9 @@ extern "C" void oh264_pipeline_shutdown(void)
         g_me_pending = 0;
     }
     if (g_me_available && g_me_ctrl) {
-        if (g_me_ctrl_cached) {
-            ((volatile struct me_struct *)g_me_ctrl_cached)->init = 0;
-        }
+        KillME(g_me_ctrl);
         g_me_available = 0;
-        diag_log_write("OH264", "Media Engine left resident for process exit");
+        diag_log_write("OH264", "Media Engine shut down");
     }
     g_me_ctrl_cached = NULL;
     g_me_ctrl = NULL;

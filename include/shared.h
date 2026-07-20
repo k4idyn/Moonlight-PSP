@@ -85,4 +85,7 @@ extern SharedState g_shared;
 /* Stream session status: 0=Running, 1=Stopped, 2=Paused */
 extern volatile int g_stream_status;
 
+/* Dynamic application directory resolved from argv[0] */
+extern char g_app_dir[512];
+
 #endif /* SHARED_H */
