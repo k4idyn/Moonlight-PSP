@@ -243,6 +243,7 @@ void abort_stream_to_menu(void)
 
     LOG_SESSION("TEARDOWN COMPLETE. Returning to host discovery menu\n");
     diag_log_flush();
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 0x20);
     sceKernelDelayThread(50000);
 }
 

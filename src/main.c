@@ -661,7 +661,6 @@ int main(int argc, char *argv[]) {
     /* No-op legacy log_open removed */
     sceDisplaySetMode(0, 480, 272);
     display_init(); g_gu_active = 1;
-    moonlight_promote_main_present_thread();
     ret = ui_manager_init();
     if (ret < 0) { LOG("[STEP 0d] ui_manager_init() failed\n"); halt_with_error("UI Manager", ret); return ret; }
     LOG("[PROTO] generation=%d, clientVersion=%d\n", MOONLIGHT_PROTOCOL_GENERATION, MOONLIGHT_CLIENT_VERSION);
@@ -876,6 +875,7 @@ host_select_loop:
 
     diag_log_write("MAIN", "Control stream started. Entering main loop.\n");
     diag_log_flush();  /* Flush all handshake/setup logs to disk */
+    moonlight_promote_main_present_thread();
     safety_buffer_init();
     hud_init();
     telemetry_reset();
