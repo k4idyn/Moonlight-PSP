@@ -27,6 +27,24 @@ void stream_session_set_input_socket(int sock);
 void abort_stream_to_menu(void);
 
 /*
+ * moonlight_exit_process_now - Stop the stream and prepare app close.
+ *
+ * Returns non-zero only after cleanup is complete and the main thread may
+ * perform the final PSPLink PRX self-unload handoff.
+ */
+int moonlight_exit_process_now(void);
+
+/*
+ * moonlight_prepare_process_exit - Idempotent app-side process cleanup.
+ */
+int moonlight_prepare_process_exit(void);
+
+/*
+ * moonlight_process_exit_in_progress - true while app close is active.
+ */
+int moonlight_process_exit_in_progress(void);
+
+/*
  * end_stream_session - Gracefully end the current streaming session
  *
  * This function:
@@ -47,9 +65,9 @@ void end_stream_session(void);
 /*
  * exit_to_xmb - Exit the app to the PSP shell.
  *
- * Performs stream cleanup only when a stream is active, then stops background
- * helpers before calling sceKernelExitGame().
+ * Performs stream cleanup only when a stream is active, then prepares main
+ * for the final PSPLink PRX self-unload handoff.
  */
-void exit_to_xmb(void);
+int exit_to_xmb(void);
 
 #endif /* STREAM_SESSION_H */

@@ -672,6 +672,62 @@ static int audio_rtp_payload_offset(const u8 *packet, int *packet_len)
     return data_offset;
 }
 
+int audio_thread_queue_external_rtp(const void *packet, int len)
+{
+    const u8 *pkt = (const u8 *)packet;
+    int packet_len = len;
+    int data_offset;
+    const RtpHeader *hdr;
+    u8 pt;
+    int ret;
+    static u32 s_external_audio_queued = 0;
+    static u32 s_external_audio_dropped = 0;
+
+    if (!pkt || len <= (int)RTP_HDR_SIZE || len > AUDIO_MAX_RTP_SIZE) {
+        return -1;
+    }
+
+    data_offset = audio_rtp_payload_offset(pkt, &packet_len);
+    if (data_offset < 0) {
+        return -1;
+    }
+
+    hdr = (const RtpHeader *)pkt;
+    pt = hdr->marker_pt & 0x7F;
+    if (pt == RTP_PT_AUDIO_OPUS) {
+        s_last_audio_data_packet_us = sceKernelGetSystemTimeLow();
+        telemetry_accum_audio_rx((u32)len);
+        telemetry_accum_audio_data((u32)packet_len);
+        audio_rtp_fec_cache_data(hdr, pkt + data_offset,
+                                 packet_len - data_offset);
+    } else if (pt == RTP_PT_AUDIO_FEC) {
+        telemetry_accum_audio_rx((u32)len);
+        telemetry_accum_audio_fec((u32)packet_len);
+        audio_rtp_fec_cache_parity(pkt + data_offset,
+                                   packet_len - data_offset);
+    } else {
+        return -1;
+    }
+
+    ret = audio_pending_push(pkt, len);
+    if (ret == 0) {
+        s_external_audio_queued++;
+        if (s_external_audio_queued <= 8 ||
+            (s_external_audio_queued % 128) == 0) {
+            audio_log("[AUDIO ROUTE] queued PT=%d len=%d from video socket [#%u]\n",
+                      pt, len, (unsigned)s_external_audio_queued);
+        }
+    } else {
+        s_external_audio_dropped++;
+        if (s_external_audio_dropped <= 8 ||
+            (s_external_audio_dropped % 128) == 0) {
+            audio_log("[AUDIO ROUTE] queue full PT=%d len=%d drops=%u\n",
+                      pt, len, (unsigned)s_external_audio_dropped);
+        }
+    }
+    return ret;
+}
+
 static int audio_reorder_drain_for_fec(int *post_audio_fec_seen)
 {
     u8 late_buf[AUDIO_MAX_RTP_SIZE];
@@ -782,6 +838,13 @@ static int audio_pending_pop(u8 *out, int *out_len)
     (void)out;
     (void)out_len;
     return 0;
+}
+
+int audio_thread_queue_external_rtp(const void *packet, int len)
+{
+    (void)packet;
+    (void)len;
+    return -1;
 }
 
 static int audio_reorder_drain_for_fec(int *post_audio_fec_seen)

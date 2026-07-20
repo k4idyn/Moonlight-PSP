@@ -1,4 +1,4 @@
-# Installation Guide - PSP Moonlight v1.3.0
+# Installation Guide - PSP Moonlight v1.4.0
 
 ## Prerequisites
 
@@ -65,8 +65,8 @@ For a clean upgrade, remove stale old-build Moonlight clutter before copying the
    - `ms0:/raw_dump.h264`
    - `ms0:/idr_dump.h264`
 2. Delete the old install folder: `ms0:/PSP/GAME/Moonlight/`.
-3. Recreate `ms0:/PSP/GAME/Moonlight/` and copy the v1.3 `EBOOT.PBP` and `moonlight_me_helper.prx` into it.
-4. Pair again in Sunshine. v1.3 stores the new client identity under `ms0:/PSP/SAVEDATA/Moonlight/`.
+3. Recreate `ms0:/PSP/GAME/Moonlight/` and copy the v1.4 `EBOOT.PBP` and `moonlight_me_helper.prx` into it.
+4. Pair again in Sunshine. v1.4 stores the client identity under `ms0:/PSP/SAVEDATA/Moonlight/`.
 
 ---
 
@@ -80,7 +80,7 @@ PSP Moonlight streams from Sunshine. Configure the host for low-latency H.264 ou
 |---|---|---|
 | Video Codec | H.264 | Only codec supported by this PSP client |
 | Encoder Profile | Baseline | Lowest PSP decode cost |
-| Entropy Coding | CAVLC | Faster to decode than CABAC on PSP |
+| Entropy Coding | CAVLC / CABAC | CAVLC is recommended for lower CPU overhead, but CABAC is fully supported and optimized in v1.4.0 (ideal for AMD hosts) |
 | Rate Control | Low latency / bandwidth limited | Reduces burst pressure on PSP Wi-Fi |
 | FEC | 35 percent starting point | Adds recovery data for lossy 802.11b links |
 
@@ -94,11 +94,11 @@ PSP Moonlight streams from Sunshine. Configure the host for low-latency H.264 ou
 
 Start with Performance on PSP-1000 or weak Wi-Fi. Use Balanced when input, audio, and playback stay stable. Use Quality when you specifically want native 480x272 output.
 
-### Changing Entropy Coding to CAVLC
+### Choosing Entropy Coding (CAVLC vs CABAC)
 
-Sunshine may default to CABAC entropy coding. CABAC is more efficient per bit, but it is more expensive for the PSP to decode. Use CAVLC for normal PSP playback.
+In v1.4.0, client-side CABAC decoding has been fully optimized. However, CAVLC remains recommended if configurable, as it consumes slightly less PSP CPU power. For AMD host encoders (which often force CABAC and ignore CAVLC requests), CABAC can be used directly without performance penalties.
 
-In Sunshine's web UI:
+To configure CAVLC in Sunshine's web UI:
 
 1. Open Sunshine in a browser, usually `https://localhost:47990` or `https://<your-PC-IP>:47990`.
 2. Open Configuration.

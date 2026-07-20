@@ -104,6 +104,7 @@ uint32_t DeblockingBSliceBsMarginalMBAvcbase (PDqLayer pCurDqLayer, int32_t iEdg
 int32_t DeblockingAvailableNoInterlayer (PDqLayer pCurDqLayer, int32_t iFilterIdc);
 
 void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag);
+void WelsDeblockingMbNoBSlice (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag);
 
 inline int8_t* GetPNzc (PDqLayer pCurDqLayer, int32_t iMbXy) {
   if (pCurDqLayer->pDec != NULL && pCurDqLayer->pDec->pNzc != NULL) {
@@ -115,4 +116,3 @@ inline int8_t* GetPNzc (PDqLayer pCurDqLayer, int32_t iMbXy) {
 } // namespace WelsDec
 
 #endif //WELS_DEBLOCKING_H__
-

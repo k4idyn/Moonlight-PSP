@@ -50,6 +50,8 @@ namespace WelsDec {
 #define LEFT_FLAG_MASK 0x01
 #define TOP_FLAG_MASK 0x02
 
+#define PSP_CABAC_PERF_MAX_MB_COUNT 210
+
 #define SAME_MB_DIFF_REFIDX
 #define g_kuiAlphaTable(x) g_kuiAlphaTable[(x)+12]
 #define g_kiBetaTable(x)  g_kiBetaTable[(x)+12]
@@ -898,6 +900,12 @@ static void DeblockingInterMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter,
   pDestY  = pFilter->pCsData[0] + ((iMbY * iLineSize + iMbX) << 4);
   pDestCb = pFilter->pCsData[1] + ((iMbY * iLineSizeUV + iMbX) << 3);
   pDestCr = pFilter->pCsData[2] + ((iMbY * iLineSizeUV + iMbX) << 3);
+#ifdef PSP_CABAC_LUMA_ONLY_DEBLOCK
+  PSliceHeader pSliceHeader = &pCurDqLayer->sLayerInfo.sSliceInLayer.sSliceHeaderExt.sSliceHeader;
+  const bool bCabacLumaOnly = pSliceHeader->pPps != NULL && pSliceHeader->pPps->bEntropyCodingModeFlag;
+#else
+  const bool bCabacLumaOnly = false;
+#endif
 
   //Vertical margin
   if (iBoundryFlag & LEFT_FLAG_MASK) {
@@ -908,11 +916,15 @@ static void DeblockingInterMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter,
     }
     if (nBS[0][0][0] == 0x04) {
       FilteringEdgeLumaIntraV (pFilter, pDestY, iLineSize, NULL);
-      FilteringEdgeChromaIntraV (pFilter, pDestCb, pDestCr, iLineSizeUV, NULL);
+      if (!bCabacLumaOnly) {
+        FilteringEdgeChromaIntraV (pFilter, pDestCb, pDestCr, iLineSizeUV, NULL);
+      }
     } else {
       if (* (uint32_t*)nBS[0][0] != 0) {
         FilteringEdgeLumaV (pFilter, pDestY, iLineSize, nBS[0][0]);
-        FilteringEdgeChromaV (pFilter, pDestCb, pDestCr, iLineSizeUV, nBS[0][0]);
+        if (!bCabacLumaOnly) {
+          FilteringEdgeChromaV (pFilter, pDestCb, pDestCr, iLineSizeUV, nBS[0][0]);
+        }
       }
     }
   }
@@ -927,7 +939,9 @@ static void DeblockingInterMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter,
 
   if (* (uint32_t*)nBS[0][2] != 0) {
     FilteringEdgeLumaV (pFilter, &pDestY[2 << 2], iLineSize, nBS[0][2]);
-    FilteringEdgeChromaV (pFilter, &pDestCb[2 << 1], &pDestCr[2 << 1], iLineSizeUV, nBS[0][2]);
+    if (!bCabacLumaOnly) {
+      FilteringEdgeChromaV (pFilter, &pDestCb[2 << 1], &pDestCr[2 << 1], iLineSizeUV, nBS[0][2]);
+    }
   }
 
   if (* (uint32_t*)nBS[0][3] != 0  && !pCurDqLayer->pTransformSize8x8Flag[iMbXyIndex]) {
@@ -943,11 +957,15 @@ static void DeblockingInterMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter,
 
     if (nBS[1][0][0] == 0x04) {
       FilteringEdgeLumaIntraH (pFilter, pDestY, iLineSize, NULL);
-      FilteringEdgeChromaIntraH (pFilter, pDestCb, pDestCr, iLineSizeUV, NULL);
+      if (!bCabacLumaOnly) {
+        FilteringEdgeChromaIntraH (pFilter, pDestCb, pDestCr, iLineSizeUV, NULL);
+      }
     } else {
       if (* (uint32_t*)nBS[1][0] != 0) {
         FilteringEdgeLumaH (pFilter, pDestY, iLineSize, nBS[1][0]);
-        FilteringEdgeChromaH (pFilter, pDestCb, pDestCr, iLineSizeUV, nBS[1][0]);
+        if (!bCabacLumaOnly) {
+          FilteringEdgeChromaH (pFilter, pDestCb, pDestCr, iLineSizeUV, nBS[1][0]);
+        }
       }
     }
   }
@@ -962,8 +980,10 @@ static void DeblockingInterMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter,
 
   if (* (uint32_t*)nBS[1][2] != 0) {
     FilteringEdgeLumaH (pFilter, &pDestY[ (2 << 2)*iLineSize], iLineSize, nBS[1][2]);
-    FilteringEdgeChromaH (pFilter, &pDestCb[ (2 << 1)*iLineSizeUV], &pDestCr[ (2 << 1)*iLineSizeUV], iLineSizeUV,
-                          nBS[1][2]);
+    if (!bCabacLumaOnly) {
+      FilteringEdgeChromaH (pFilter, &pDestCb[ (2 << 1)*iLineSizeUV], &pDestCr[ (2 << 1)*iLineSizeUV], iLineSizeUV,
+                            nBS[1][2]);
+    }
   }
 
   if (* (uint32_t*)nBS[1][3] != 0  && !pCurDqLayer->pTransformSize8x8Flag[iMbXyIndex]) {
@@ -1128,10 +1148,17 @@ void FilteringEdgeChromaHV (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, in
 // merge h&v lookup table operation to save performance
 static void DeblockingIntraMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag) {
   FilteringEdgeLumaHV (pCurDqLayer, pFilter, iBoundryFlag);
+#ifdef PSP_CABAC_LUMA_ONLY_DEBLOCK
+  PSliceHeader pSliceHeader = &pCurDqLayer->sLayerInfo.sSliceInLayer.sSliceHeaderExt.sSliceHeader;
+  if (pSliceHeader->pPps != NULL && pSliceHeader->pPps->bEntropyCodingModeFlag) {
+    return;
+  }
+#endif
   FilteringEdgeChromaHV (pCurDqLayer, pFilter, iBoundryFlag);
 }
 
-void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag) {
+static void WelsDeblockingMbInternal (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag,
+                                      bool bAllowBSlice) {
   uint8_t nBS[2][4][4] = {{{ 0 }}};
 
   int32_t iMbXyIndex  = pCurDqLayer->iMbXyIndex;
@@ -1141,7 +1168,14 @@ void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t
 
   PSlice pSlice = &pCurDqLayer->sLayerInfo.sSliceInLayer;
   PSliceHeader pSliceHeader = &pSlice->sSliceHeaderExt.sSliceHeader;
-  bool bBSlice = pSliceHeader->eSliceType == B_SLICE;
+  bool bBSlice = bAllowBSlice && pSliceHeader->eSliceType == B_SLICE;
+#ifdef PSP_CABAC_PERF_BOUNDARY_DEBLOCK
+  bool bBoundaryOnly = pSliceHeader->pPps != NULL && pSliceHeader->pPps->bEntropyCodingModeFlag &&
+                       pSliceHeader->pSps != NULL &&
+                       pSliceHeader->pSps->uiTotalMbCount <= PSP_CABAC_PERF_MAX_MB_COUNT;
+#else
+  bool bBoundaryOnly = false;
+#endif
 
   switch (iCurMbType) {
   case MB_TYPE_INTRA4x4:
@@ -1184,6 +1218,9 @@ void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t
     if (IS_SKIP (iCurMbType)) {
       * (uint32_t*)nBS[0][1] = * (uint32_t*)nBS[0][2] = * (uint32_t*)nBS[0][3] =
                                  * (uint32_t*)nBS[1][1] = * (uint32_t*)nBS[1][2] = * (uint32_t*)nBS[1][3] = 0;
+    } else if (bBoundaryOnly) {
+      * (uint32_t*)nBS[0][1] = * (uint32_t*)nBS[0][2] = * (uint32_t*)nBS[0][3] =
+                                 * (uint32_t*)nBS[1][1] = * (uint32_t*)nBS[1][2] = * (uint32_t*)nBS[1][3] = 0;
     } else {
       if (IS_INTER_16x16 (iCurMbType)) {
         if (!pCurDqLayer->pTransformSize8x8Flag[pCurDqLayer->iMbXyIndex]) {
@@ -1203,6 +1240,14 @@ void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t
     DeblockingInterMb (pCurDqLayer, pFilter, nBS, iBoundryFlag);
     break;
   }
+}
+
+void WelsDeblockingMb (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag) {
+  WelsDeblockingMbInternal (pCurDqLayer, pFilter, iBoundryFlag, true);
+}
+
+void WelsDeblockingMbNoBSlice (PDqLayer pCurDqLayer, PDeblockingFilter  pFilter, int32_t iBoundryFlag) {
+  WelsDeblockingMbInternal (pCurDqLayer, pFilter, iBoundryFlag, false);
 }
 
 /*!

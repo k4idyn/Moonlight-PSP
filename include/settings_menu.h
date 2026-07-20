@@ -117,7 +117,7 @@ typedef struct {
     char localBindIp[16];       /* Source IP for UDP sockets, or "" = INADDR_ANY */
     int uiThemeIndex;           /* Selected UI accent color index */
     int cabacTestMode;          /* 1 = request Main profile + CABAC in SDP (test only) */
-    int audioEnabled;           /* 1 = stream/decode audio, 0 = drain/drop RTP only */
+    int audioEnabled;           /* 1 = stream/decode audio, 0 = ping-only host audio */
     int disableEncryption;      /* 1 = disable AV encryption; keep RTSP/control compatibility */
 } PspConfig;
 

@@ -43,6 +43,15 @@ int control_stream_request_idr(void);
 int control_stream_request_idr_force(void);
 
 /*
+ * control_stream_request_idr_recovery_fast - Request IDR on a shorter
+ * recovery cadence while the RTP depacketizer is already protecting refs.
+ *
+ * This is for CABAC Performance loss recovery only; normal watchdog and
+ * decoder-reset callers should keep using control_stream_request_idr_force().
+ */
+int control_stream_request_idr_recovery_fast(void);
+
+/*
  * control_stream_request_idr_startup - Request IDR while no reference exists.
  *
  * Startup is special: if the first SPS/IDR was missed, every P-frame is

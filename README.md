@@ -2,13 +2,13 @@
 
 # Moonlight PSP
 
-**v1.3.0 - PSP-native H.264 Game Streaming Client**
+**v1.4.0 - PSP-native H.264 Game Streaming Client**
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)](#known-limitations)
-[![Release](https://img.shields.io/badge/release-v1.3.0-blue)](#version-history)
+[![Release](https://img.shields.io/badge/release-v1.4.0-blue)](#version-history)
 
 </div>
 
@@ -18,14 +18,12 @@ Moonlight PSP is a Moonlight-compatible game-streaming client for Sony PSP syste
 
 The project streams H.264 video from a host PC running Sunshine, decodes video on the PSP main CPU, and uses the Media Engine for accelerated YUV-to-RGBA conversion.
 
-## New in v1.3
+## New in v1.4
 
-- Runtime data now lives under `ms0:/PSP/SAVEDATA/Moonlight/` so settings, pairing identity, logs, TLS pins, icon cache, and temporary stream files no longer clutter the Memory Stick root or the XMB app folder.
-- Updaters can delete stale old-build clutter such as `ms0:/moonlight/`, old root-level Moonlight logs/dumps, and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying the v1.3 files. Pair again in Sunshine after the clean install.
-- Remote/hotspot launches keep using the selected public IP when Sunshine returns a private LAN address in the RTSP session URL.
-- Pairing now persists the paired host after the authenticated confirm step, including manual public-IP pairing paths.
-- HOME/XMB exit now runs the same cleanup path as app exit, including stream teardown, Wi-Fi helper abort, network disconnect, UI shutdown, and a module-stop fallback for shell exits.
-- The EBOOT includes PSP-safe `ICON0.PNG` and `PIC1.PNG` artwork for the XMB icon and background.
+- **Full H.264 CABAC Stream Support**: Delivers optimized, hardware-accelerated software decoding for CABAC H.264 streams on the PSP. Perfect for hosts using AMD AMF encoders which default to CABAC.
+- **3-Slot Decoder Buffer Ring**: Prevents frame pointer contention and stalls between the OpenH264/Media Engine threads and the presenter.
+- **Tighter Teardown & Safe Process Exit**: Gracefully cleans up lingering thread contexts, exit callback structures, and Wi-Fi networks before PRX self-unloads, preventing physical black screen hangs.
+- **Integrated DNS Resolution**: Uses PSP net resolver to resolve DDNS/hostnames via `gethostbyname()` with IP fallback, fixing remote/external connectivity (Issue #8).
 
 ## Highlights
 
@@ -124,14 +122,14 @@ ms0:/PSP/GAME/Moonlight/
 
 Runtime data is written to `ms0:/PSP/SAVEDATA/Moonlight/`, not the install folder.
 
-When updating from an older build, delete stale old-build files/folders such as `ms0:/moonlight/` and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying v1.3, then pair again in Sunshine.
+When updating from an older build, delete stale old-build files/folders such as `ms0:/moonlight/` and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying v1.4, then pair again in Sunshine.
 
 For full setup, pairing flow, and troubleshooting, see [INSTALL.md](INSTALL.md).
 
 ## Known Limitations
 
 - The PSP Wi-Fi radio is 2.4 GHz only and remains the main practical bottleneck.
-- H.264 CAVLC is required for normal playback; CABAC is not recommended for PSP use.
+- H.264 CAVLC is recommended for lower decode latency, but CABAC is fully supported and optimized in v1.4.0.
 - High resolutions above the native PSP display are outside the intended operating range.
 - Some fast-motion content can still expose the PSP display and network limits.
 
@@ -158,6 +156,7 @@ Detailed notes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
 
 ## Version History
 
+- v1.4.0: H.264 CABAC stream decoding support, 3-slot decoder ring buffer, safe self-module exit teardown, and Net Resolver DNS hostname support.
 - v1.3.0: Savedata runtime layout, remote public-IP launch fix, pairing persistence, XMB artwork, and safer HOME/XMB exit cleanup.
 - v1.2.0: PSP preset ladder, packet-size setting, pairing confirm, controller-map overhaul, Browser input cleanup, and transition-buffer fixes.
 - v1.1.0: Network controller refinements and retail artifact publication.

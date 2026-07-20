@@ -24,9 +24,8 @@
  *   - No internal frame reordering (B-frames disabled at encoder)
  *   - Direct I420 plane access — zero memcpy to ME dispatch
  *
- * OpenH264 supports BOTH CAVLC and CABAC — CABAC detection is now
- * informational only (no hard block needed, but the warning screen
- * still fires from sw_decoder_thread.c's check_nal_for_cabac()).
+ * OpenH264 supports both CAVLC and CABAC. CABAC detection is telemetry-only;
+ * playback quality is handled by the pacing, transport, and decode path.
  */
 
 extern "C" {
@@ -34,6 +33,7 @@ extern "C" {
 #include <pspthreadman.h>
 #include <pspsdk.h>
 #include <psprtc.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "sw_decode_pipeline.h"
@@ -58,11 +58,21 @@ extern int control_stream_request_idr(void);
 
 static ISVCDecoder *g_decoder = NULL;
 
-/* RGBA double-buffer — sized from g_stream_res at init */
-static u8 *g_rgba_buf[2] = {NULL, NULL};
+/* RGBA output ring. Use 3 slots for CABAC Performance zero-copy presentation
+ * pacing to prevent frame-id gap pacing stalls, otherwise use 2 slots. */
+#define OH264_RGBA_BUFFER_COUNT 3
+static u8 *g_rgba_buf[OH264_RGBA_BUFFER_COUNT] = {NULL, NULL, NULL};
 static int  g_rgba_idx   = 0;
+static int  g_rgba_count = 2;
+static int  g_rgba_me_clean[OH264_RGBA_BUFFER_COUNT] = {0, 0, 0};
 #define OH264_MAX_RGBA_SIZE (FRAME_STRIDE * FRAME_HEIGHT * PIXEL_SIZE)
-static u8 g_rgba_static[2][OH264_MAX_RGBA_SIZE] __attribute__((aligned(64)));
+static u8 g_rgba_static[OH264_RGBA_BUFFER_COUNT][OH264_MAX_RGBA_SIZE] __attribute__((aligned(64)));
+#define OH264_MAX_Y_SIZE    (FRAME_WIDTH * FRAME_HEIGHT)
+#define OH264_MAX_UV_SIZE   ((FRAME_WIDTH / 2) * (FRAME_HEIGHT / 2))
+static u8 g_y_stage[2][OH264_MAX_Y_SIZE] __attribute__((aligned(64)));
+static u8 g_u_stage[2][OH264_MAX_UV_SIZE] __attribute__((aligned(64)));
+static u8 g_v_stage[2][OH264_MAX_UV_SIZE] __attribute__((aligned(64)));
+static int g_yuv_stage_idx = 0;
 
 /* Statistics */
 static int g_frames_decoded = 0;
@@ -132,6 +142,13 @@ static inline int graded_luma_term(int y, int row, int col)
     return 76 * yy;
 }
 
+static inline int plain_luma_term(int y)
+{
+    int yy = y - 16;
+    if (yy < 0) yy = 0;
+    return 76 * yy;
+}
+
 static inline u32 pack_video_pixel(int c, int rv, int guv, int bu)
 {
     return (u32)clamp8_fast((c + rv) >> 6)
@@ -152,7 +169,8 @@ static void yuv420_to_rgba_2x2(const u8 *y_plane, int y_stride,
                                 const u8 *u_plane, int u_stride,
                                 const u8 *v_plane, int v_stride,
                                 u8 *rgba_out, int rgba_stride_pixels,
-                                int width, int height)
+                                int width, int height,
+                                int plain_luma)
 {
     const int w2 = width & ~1;
     const int h2 = height & ~1;
@@ -174,21 +192,31 @@ static void yuv420_to_rgba_2x2(const u8 *y_plane, int y_stride,
             int guv = -25 * uu - 52 * vv;
             int bu  =  129 * uu;
 
-            /* Top-left pixel (row, col) */
-            int c = graded_luma_term((int)yp0[col], row, col);
-            dst0[col] = pack_video_pixel(c, rv, guv, bu);
+            if (plain_luma) {
+                int c = plain_luma_term((int)yp0[col]);
+                dst0[col] = pack_video_pixel(c, rv, guv, bu);
 
-            /* Top-right pixel (row, col+1) */
-            c = graded_luma_term((int)yp0[col + 1], row, col + 1);
-            dst0[col + 1] = pack_video_pixel(c, rv, guv, bu);
+                c = plain_luma_term((int)yp0[col + 1]);
+                dst0[col + 1] = pack_video_pixel(c, rv, guv, bu);
 
-            /* Bottom-left pixel (row+1, col) */
-            c = graded_luma_term((int)yp1[col], row + 1, col);
-            dst1[col] = pack_video_pixel(c, rv, guv, bu);
+                c = plain_luma_term((int)yp1[col]);
+                dst1[col] = pack_video_pixel(c, rv, guv, bu);
 
-            /* Bottom-right pixel (row+1, col+1) */
-            c = graded_luma_term((int)yp1[col + 1], row + 1, col + 1);
-            dst1[col + 1] = pack_video_pixel(c, rv, guv, bu);
+                c = plain_luma_term((int)yp1[col + 1]);
+                dst1[col + 1] = pack_video_pixel(c, rv, guv, bu);
+            } else {
+                int c = graded_luma_term((int)yp0[col], row, col);
+                dst0[col] = pack_video_pixel(c, rv, guv, bu);
+
+                c = graded_luma_term((int)yp0[col + 1], row, col + 1);
+                dst0[col + 1] = pack_video_pixel(c, rv, guv, bu);
+
+                c = graded_luma_term((int)yp1[col], row + 1, col);
+                dst1[col] = pack_video_pixel(c, rv, guv, bu);
+
+                c = graded_luma_term((int)yp1[col + 1], row + 1, col + 1);
+                dst1[col + 1] = pack_video_pixel(c, rv, guv, bu);
+            }
         }
     }
 }
@@ -208,6 +236,7 @@ typedef struct {
     int rgba_stride_pixels;
     int width;
     int height;
+    int plain_luma;
 } __attribute__((aligned(64))) MeYuv2RgbaParams;
 
 static volatile struct me_struct *g_me_ctrl        = NULL;
@@ -218,9 +247,11 @@ static MeYuv2RgbaParams           g_me_params_storage __attribute__((aligned(64)
 static int  g_me_available = 0;
 static int  g_me_pending   = 0;
 static int  g_me_pending_clean = 0;
+static int  g_me_pending_staged = 0;
 static u8  *g_me_rgba_out  = NULL;
 static u8  *g_last_rgba    = NULL;
 static u32  g_me_dispatch_us = 0;
+static int  g_plain_luma_mode = 0;
 
 /* Zero-delay mode waits for ME conversion before returning a frame. That saves
  * one frame of latency, but serializes CPU decode with ME color conversion.
@@ -230,6 +261,48 @@ static int  g_zero_delay_mode = 0;
 #define ZERO_DELAY_PIXEL_THRESHOLD  (256 * 144)
 #define ZERO_DELAY_MAX_FPS          15
 
+static int rgba_slot_for_pointer(const void *frame)
+{
+    uintptr_t frame_addr;
+
+    if (!frame) {
+        return -1;
+    }
+
+    frame_addr = ((uintptr_t)frame) & 0x1FFFFFFFu;
+    for (int i = 0; i < g_rgba_count && i < OH264_RGBA_BUFFER_COUNT; i++) {
+        if (g_rgba_buf[i] &&
+            ((((uintptr_t)g_rgba_buf[i]) & 0x1FFFFFFFu) == frame_addr)) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void mark_rgba_me_clean(u8 *frame, int clean)
+{
+    int slot = rgba_slot_for_pointer(frame);
+
+    if (slot >= 0) {
+        g_rgba_me_clean[slot] = clean ? 1 : 0;
+    }
+}
+
+static void clear_rgba_me_clean_tags(void)
+{
+    for (int i = 0; i < OH264_RGBA_BUFFER_COUNT; i++) {
+        g_rgba_me_clean[i] = 0;
+    }
+}
+
+extern "C" int oh264_frame_is_me_clean(const void *frame)
+{
+    int slot = rgba_slot_for_pointer(frame);
+
+    return (slot >= 0 && g_rgba_me_clean[slot]) ? 1 : 0;
+}
+
 static int me_yuv420_to_rgba_entry(int param)
 {
     MeYuv2RgbaParams *p = (MeYuv2RgbaParams *)(unsigned int)param;
@@ -237,8 +310,119 @@ static int me_yuv420_to_rgba_entry(int param)
                        p->u_plane, p->u_stride,
                        p->v_plane, p->v_stride,
                        p->rgba_out, p->rgba_stride_pixels,
-                       p->width, p->height);
+                       p->width, p->height, p->plain_luma);
     return 0;
+}
+
+static int stage_yuv_for_me(unsigned char *pData[3],
+                            int y_stride, int uv_stride,
+                            int width, int height,
+                            const u8 **out_y, const u8 **out_u, const u8 **out_v,
+                            int *out_y_stride, int *out_uv_stride)
+{
+    int idx;
+    int uv_w;
+    int uv_h;
+
+    if (!pData || !pData[0] || !pData[1] || !pData[2] ||
+        width <= 0 || height <= 0 ||
+        y_stride <= 0 || uv_stride <= 0 ||
+        width > FRAME_WIDTH || height > FRAME_HEIGHT) {
+        return 0;
+    }
+
+    uv_w = width >> 1;
+    uv_h = height >> 1;
+    if (uv_w <= 0 || uv_h <= 0 ||
+        (width * height) > OH264_MAX_Y_SIZE ||
+        (uv_w * uv_h) > OH264_MAX_UV_SIZE) {
+        return 0;
+    }
+
+    idx = g_yuv_stage_idx;
+    for (int row = 0; row < height; row++) {
+        memcpy(g_y_stage[idx] + row * width,
+               pData[0] + row * y_stride,
+               (size_t)width);
+    }
+    for (int row = 0; row < uv_h; row++) {
+        memcpy(g_u_stage[idx] + row * uv_w,
+               pData[1] + row * uv_stride,
+               (size_t)uv_w);
+        memcpy(g_v_stage[idx] + row * uv_w,
+               pData[2] + row * uv_stride,
+               (size_t)uv_w);
+    }
+
+    g_yuv_stage_idx = 1 - g_yuv_stage_idx;
+    *out_y = g_y_stage[idx];
+    *out_u = g_u_stage[idx];
+    *out_v = g_v_stage[idx];
+    *out_y_stride = width;
+    *out_uv_stride = uv_w;
+    return 1;
+}
+
+static void collect_pending_me_frame(int block, int *collected_me_frame)
+{
+    int loops = 0;
+    u32 me_wait_start_us;
+
+    if (!g_me_available || !g_me_pending || !g_me_ctrl) {
+        return;
+    }
+
+    if (!block && !CheckME(g_me_ctrl)) {
+        return;
+    }
+
+    me_wait_start_us = sceKernelGetSystemTimeLow();
+    while (!CheckME(g_me_ctrl) && loops < 5000000) {
+        loops++;
+        if ((loops & 63) == 0) {
+            sceKernelDelayThread(0);
+        }
+    }
+    g_oh264_me_wait_us += sceKernelGetSystemTimeLow() - me_wait_start_us;
+
+    if (loops >= 5000000) {
+        if (g_me_dispatch_us != 0) {
+            telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+            g_me_dispatch_us = 0;
+        }
+        diag_log_write("OH264", "ME TIMEOUT -- resetting");
+        KillME(g_me_ctrl);
+        memset((void *)g_me_ctrl_cached, 0, sizeof(struct me_struct));
+        sceKernelDcacheWritebackInvalidateAll();
+        if (InitME(g_me_ctrl) == 0) {
+            int rl = 0;
+            sceKernelDcacheWritebackInvalidateAll();
+            while (!g_me_ctrl->done && rl < 2000000) rl++;
+            sceKernelDcacheWritebackInvalidateAll();
+            if (!g_me_ctrl->done) {
+                g_me_available = 0;
+            }
+        } else {
+            g_me_available = 0;
+        }
+    } else {
+        if (g_me_dispatch_us != 0) {
+            telemetry_accum_me(sceKernelGetSystemTimeLow() - g_me_dispatch_us);
+            g_me_dispatch_us = 0;
+        }
+        sceKernelDcacheInvalidateRange(g_me_rgba_out, g_stream_res.rgba_size);
+        if (g_me_pending_clean) {
+            g_last_rgba = g_me_rgba_out;
+            mark_rgba_me_clean(g_last_rgba, 1);
+            if (collected_me_frame) {
+                *collected_me_frame = 1;
+            }
+        }
+    }
+
+    g_me_pending = 0;
+    g_me_pending_clean = 0;
+    g_me_pending_staged = 0;
 }
 
 /* ============================================================================
@@ -303,8 +487,8 @@ extern "C" int oh264_pipeline_init(void)
     }
     diag_log_write("OH264", "OpenH264 decoder initialized (threads=0, trace=off, ec=off)");
 
-    /* RGBA double-buffer. Fixed static storage keeps the stream path out of
-     * the heap; g_stream_res.rgba_size is validated against the PSP LCD max. */
+    /* Fixed static RGBA storage keeps the stream path out of the heap;
+     * g_stream_res.rgba_size is validated against the PSP LCD max. */
     if (g_stream_res.rgba_size > OH264_MAX_RGBA_SIZE) {
         diag_log_write("OH264", "RGBA static buffer too small (%d > %d)",
                        g_stream_res.rgba_size, OH264_MAX_RGBA_SIZE);
@@ -315,7 +499,8 @@ extern "C" int oh264_pipeline_init(void)
     }
     g_rgba_buf[0] = g_rgba_static[0];
     g_rgba_buf[1] = g_rgba_static[1];
-    if (!g_rgba_buf[0] || !g_rgba_buf[1]) {
+    g_rgba_buf[2] = g_rgba_static[2];
+    if (!g_rgba_buf[0] || !g_rgba_buf[1] || !g_rgba_buf[2]) {
         diag_log_write("OH264", "RGBA static buffer unavailable (%d bytes each)",
                        g_stream_res.rgba_size);
         g_decoder->Uninitialize();
@@ -323,9 +508,13 @@ extern "C" int oh264_pipeline_init(void)
         g_decoder = NULL;
         return -3;
     }
-    memset(g_rgba_buf[0], 0, g_stream_res.rgba_size);
-    memset(g_rgba_buf[1], 0, g_stream_res.rgba_size);
+    for (int i = 0; i < OH264_RGBA_BUFFER_COUNT; i++) {
+        memset(g_rgba_buf[i], 0, g_stream_res.rgba_size);
+    }
     g_rgba_idx = 0;
+    g_rgba_count = 2;
+    clear_rgba_me_clean_tags();
+    g_yuv_stage_idx = 0;
 
     /* Release presets pipeline ME work so CPU decode can overlap colorspace.
      * Keep synchronous zero-delay only for tiny low-FPS streams. */
@@ -335,17 +524,33 @@ extern "C" int oh264_pipeline_init(void)
         g_zero_delay_mode =
             (target_fps <= ZERO_DELAY_MAX_FPS &&
              pixels <= ZERO_DELAY_PIXEL_THRESHOLD) ? 1 : 0;
+        int cabac_perf_video_only =
+            (g_psp_config.cabacTestMode &&
+             !g_psp_config.audioEnabled &&
+             target_fps >= 30 &&
+             g_stream_res.width <= 320 &&
+             g_stream_res.height <= 180) ? 1 : 0;
+        int cabac_quality_audio =
+            (g_psp_config.cabacTestMode &&
+             g_psp_config.audioEnabled &&
+             g_stream_res.width == 480 &&
+             g_stream_res.height == 272 &&
+             target_fps <= 10) ? 1 : 0;
+        g_plain_luma_mode = (cabac_perf_video_only || cabac_quality_audio) ? 1 : 0;
+        g_rgba_count = cabac_perf_video_only ? 3 : 2;
         diag_log_write("OH264",
-                       "ME pipeline mode: %s (res=%dx%d fps=%d zero_limit=%dpx@%dfps)",
+                       "ME pipeline mode: %s (res=%dx%d fps=%d zero_limit=%dpx@%dfps plain_luma=%d rgba_slots=%d)",
                        g_zero_delay_mode ? "zero-delay" : "async",
                        g_stream_res.width, g_stream_res.height, target_fps,
-                       ZERO_DELAY_PIXEL_THRESHOLD, ZERO_DELAY_MAX_FPS);
+                       ZERO_DELAY_PIXEL_THRESHOLD, ZERO_DELAY_MAX_FPS,
+                       g_plain_luma_mode, g_rgba_count);
     }
 
     /* Initialize Media Engine */
     g_me_available = 0;
     g_me_pending   = 0;
     g_me_pending_clean = 0;
+    g_me_pending_staged = 0;
     g_last_rgba    = NULL;
     g_me_rgba_out  = NULL;
 
@@ -424,8 +629,9 @@ extern "C" int oh264_pipeline_init(void)
     g_idr_fully_decoded = 0;
     g_refs_corrupted    = 0;
 
-    diag_log_write("OH264", "OpenH264 pipeline ready (RGBA=%dKB each) ME=%d ZeroDL=%d",
-                   g_stream_res.rgba_size / 1024, g_me_available, g_zero_delay_mode);
+    diag_log_write("OH264", "OpenH264 pipeline ready (RGBA=%dKB each slots=%d) ME=%d ZeroDL=%d",
+                   g_stream_res.rgba_size / 1024, g_rgba_count,
+                   g_me_available, g_zero_delay_mode);
     return 0;
 }
 
@@ -444,18 +650,22 @@ extern "C" void oh264_pipeline_shutdown(void)
         g_me_pending = 0;
     }
     if (g_me_available && g_me_ctrl) {
-        KillME(g_me_ctrl);
+        if (g_me_ctrl_cached) {
+            ((volatile struct me_struct *)g_me_ctrl_cached)->init = 0;
+        }
         g_me_available = 0;
-        diag_log_write("OH264", "Media Engine shut down");
+        diag_log_write("OH264", "Media Engine left resident for process exit");
     }
     g_me_ctrl_cached = NULL;
     g_me_ctrl = NULL;
     g_me_params = NULL;
     g_me_pending  = 0;
     g_me_pending_clean = 0;
+    g_me_pending_staged = 0;
     g_me_dispatch_us = 0;
     g_last_rgba   = NULL;
     g_me_rgba_out = NULL;
+    clear_rgba_me_clean_tags();
 
     if (g_decoder) {
         g_decoder->Uninitialize();
@@ -463,9 +673,13 @@ extern "C" void oh264_pipeline_shutdown(void)
         g_decoder = NULL;
     }
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < OH264_RGBA_BUFFER_COUNT; i++) {
         g_rgba_buf[i] = NULL;
     }
+    g_rgba_count = 2;
+    clear_rgba_me_clean_tags();
+
+    diag_log_write("OH264", "OpenH264 pipeline shutdown complete");
 }
 
 /* ============================================================================
@@ -481,9 +695,12 @@ extern "C" void oh264_pipeline_abandon(void)
 
     /* Static RGBA buffers are retained; display thread sees g_last_rgba go
      * NULL below so it won't dereference stale contents during reinit. */
-    g_rgba_buf[0] = NULL;
-    g_rgba_buf[1] = NULL;
+    for (int i = 0; i < OH264_RGBA_BUFFER_COUNT; i++) {
+        g_rgba_buf[i] = NULL;
+    }
     g_rgba_idx    = 0;
+    g_rgba_count  = 2;
+    clear_rgba_me_clean_tags();
 
     /* Decoder thread is terminated before abandon; release decoder resources
      * to prevent watchdog-restart heap growth. */
@@ -500,6 +717,7 @@ extern "C" void oh264_pipeline_abandon(void)
     g_me_available   = 0;
     g_me_pending     = 0;
     g_me_pending_clean = 0;
+    g_me_pending_staged = 0;
     g_me_dispatch_us = 0;
     g_last_rgba      = NULL;
     g_me_rgba_out    = NULL;
@@ -553,6 +771,7 @@ extern "C" int oh264_pipeline_reset_codec(void)
         }
         g_me_pending = 0;
         g_me_pending_clean = 0;
+        g_me_pending_staged = 0;
     }
 
     if (g_decoder) {
@@ -589,6 +808,7 @@ extern "C" int oh264_pipeline_reset_codec(void)
     g_last_rgba = NULL;
     g_me_rgba_out = NULL;
     g_me_pending_clean = 0;
+    g_me_pending_staged = 0;
     g_saw_first_idr = 0;
     g_idr_fully_decoded = 0;
     g_refs_corrupted = 1;
@@ -629,8 +849,14 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     /* Clear per-frame corruption flag (snapshot not needed here) */
     g_current_frame_is_corrupt = 0;
 
+    if (!g_zero_delay_mode && g_me_available && g_me_pending && g_me_ctrl &&
+        g_me_pending_staged) {
+        collect_pending_me_frame(0, &collected_me_frame);
+    }
+
     /* --- Collect previous ME frame (only in pipelined async mode) --------- */
-    if (!g_zero_delay_mode && g_me_available && g_me_pending && g_me_ctrl) {
+    if (!g_zero_delay_mode && g_me_available && g_me_pending && g_me_ctrl &&
+        !g_me_pending_staged) {
         int loops = 0;
         u32 me_wait_start_us = sceKernelGetSystemTimeLow();
         while (!CheckME(g_me_ctrl) && loops < 5000000) {
@@ -665,6 +891,7 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             sceKernelDcacheInvalidateRange(g_me_rgba_out, g_stream_res.rgba_size);
             if (g_me_pending_clean) {
                 g_last_rgba = g_me_rgba_out;
+                mark_rgba_me_clean(g_last_rgba, 1);
                 collected_me_frame = 1;
             }
         }
@@ -708,6 +935,11 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
         } else {
             ds = (DECODING_STATE)(ds1 | ds2);
         }
+    }
+
+    if (!g_zero_delay_mode && g_me_available && g_me_pending && g_me_ctrl &&
+        g_me_pending_staged) {
+        collect_pending_me_frame(0, &collected_me_frame);
     }
 
     /* OpenH264 DECODING_STATE is a bitmask:
@@ -850,6 +1082,12 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     int src_h      = info.UsrData.sSystemBuffer.iHeight;
     int y_stride   = info.UsrData.sSystemBuffer.iStride[0];
     int uv_stride  = info.UsrData.sSystemBuffer.iStride[1];
+    const u8 *me_y_plane;
+    const u8 *me_u_plane;
+    const u8 *me_v_plane;
+    int me_y_stride;
+    int me_uv_stride;
+    int me_uses_staged_yuv = 0;
 
     /* Clamp to stream_res in case OpenH264 reports slightly different dimensions */
     if (src_w <= 0 || src_h <= 0) {
@@ -859,9 +1097,16 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
     if (y_stride <= 0)  y_stride  = src_w;
     if (uv_stride <= 0) uv_stride = src_w / 2;
 
+    me_y_plane = pData[0];
+    me_u_plane = pData[1];
+    me_v_plane = pData[2];
+    me_y_stride = y_stride;
+    me_uv_stride = uv_stride;
+
     /* Choose output RGBA buffer */
     u8 *rgba_out = g_rgba_buf[g_rgba_idx];
-    g_rgba_idx   = 1 - g_rgba_idx;
+    g_rgba_idx   = (g_rgba_idx + 1) % g_rgba_count;
+    mark_rgba_me_clean(rgba_out, 0);
 
     /* --- Dispatch YUV→RGBA to ME (or CPU fallback) ------------------------
      *
@@ -876,27 +1121,38 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
      *   costs one frame of latency, but keeps CPU and ME overlapped.
      * ----------------------------------------------------------------------- */
     if (g_me_available && g_me_ctrl && g_me_params) {
-        g_me_params->y_plane            = pData[0];
-        g_me_params->y_stride           = y_stride;
-        g_me_params->u_plane            = pData[1];
-        g_me_params->u_stride           = uv_stride;
-        g_me_params->v_plane            = pData[2];
-        g_me_params->v_stride           = uv_stride;
+        if (!g_zero_delay_mode) {
+            me_uses_staged_yuv = stage_yuv_for_me(pData, y_stride, uv_stride,
+                                                  src_w, src_h,
+                                                  &me_y_plane, &me_u_plane, &me_v_plane,
+                                                  &me_y_stride, &me_uv_stride);
+            if (g_me_pending) {
+                collect_pending_me_frame(1, &collected_me_frame);
+            }
+        }
+
+        g_me_params->y_plane            = me_y_plane;
+        g_me_params->y_stride           = me_y_stride;
+        g_me_params->u_plane            = me_u_plane;
+        g_me_params->u_stride           = me_uv_stride;
+        g_me_params->v_plane            = me_v_plane;
+        g_me_params->v_stride           = me_uv_stride;
         g_me_params->rgba_out           = rgba_out;
         g_me_params->rgba_stride_pixels = g_stream_res.stride;
         g_me_params->width              = src_w;
         g_me_params->height             = src_h;
+        g_me_params->plain_luma         = g_plain_luma_mode;
 
         /* Targeted dcache flush: only flush the YUV input planes and ME params,
          * NOT the entire cache.  At 256x144, Y=36KB + UV=18KB + params=64B.
          * vs sceKernelDcacheWritebackInvalidateAll() which flushes all 16KB L1
          * + any L2 state — evicting hot decode data and ring buffer metadata. */
-        sceKernelDcacheWritebackRange((const void *)pData[0],
-                                      y_stride * src_h);
-        sceKernelDcacheWritebackRange((const void *)pData[1],
-                                      uv_stride * (src_h >> 1));
-        sceKernelDcacheWritebackRange((const void *)pData[2],
-                                      uv_stride * (src_h >> 1));
+        sceKernelDcacheWritebackRange((const void *)me_y_plane,
+                                      me_y_stride * src_h);
+        sceKernelDcacheWritebackRange((const void *)me_u_plane,
+                                      me_uv_stride * (src_h >> 1));
+        sceKernelDcacheWritebackRange((const void *)me_v_plane,
+                                      me_uv_stride * (src_h >> 1));
         sceKernelDcacheWritebackRange((const void *)g_me_params,
                                       sizeof(MeYuv2RgbaParams));
 
@@ -907,6 +1163,7 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
         g_me_rgba_out = rgba_out;
         g_me_pending  = 1;
         g_me_pending_clean = 1;
+        g_me_pending_staged = me_uses_staged_yuv;
 
         if (g_zero_delay_mode) {
             /* ZERO-DELAY: wait for ME synchronously, return current frame.
@@ -927,8 +1184,10 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
             }
             sceKernelDcacheInvalidateRange(rgba_out, g_stream_res.rgba_size);
             g_last_rgba  = rgba_out;
+            mark_rgba_me_clean(g_last_rgba, 1);
             g_me_pending = 0;
             g_me_pending_clean = 0;
+            g_me_pending_staged = 0;
             *out_rgba = rgba_out;
             g_frames_decoded++;
             return 0;
@@ -955,8 +1214,10 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
         }
         sceKernelDcacheInvalidateRange(rgba_out, g_stream_res.rgba_size);
         g_last_rgba  = rgba_out;
+        mark_rgba_me_clean(g_last_rgba, 1);
         g_me_pending = 0;
         g_me_pending_clean = 0;
+        g_me_pending_staged = 0;
         *out_rgba = g_last_rgba;
         g_frames_decoded++;
         return 0;
@@ -967,9 +1228,10 @@ extern "C" int oh264_pipeline_decode_frame(const u8 *nal_data, int nal_len, u8 *
                        pData[1], uv_stride,
                        pData[2], uv_stride,
                        rgba_out, g_stream_res.stride,
-                       src_w, src_h);
+                       src_w, src_h, g_plain_luma_mode);
 
     g_last_rgba = rgba_out;
+    mark_rgba_me_clean(g_last_rgba, 0);
     *out_rgba   = rgba_out;
     g_frames_decoded++;
     return 0;

@@ -1,6 +1,6 @@
 # Known Issues
 
-_PSP Moonlight v1.3.0_
+_PSP Moonlight v1.4.0_
 
 This document lists user-facing limitations, compatibility notes, and practical guidance for stable PSP streaming.
 
@@ -8,11 +8,11 @@ This document lists user-facing limitations, compatibility notes, and practical 
 
 ## Current Limitations
 
-### CAVLC host output is required for normal playback
+### CABAC is supported, but CAVLC is still recommended for lower CPU overhead
 
-**Impact:** CABAC can be too expensive for PSP playback and may cause stalls or heavy jitter.
+**Impact:** CABAC is now fully supported and optimized (highly recommended for AMD encoders which force CABAC and ignore CAVLC requests). However, CAVLC still requires slightly less CPU/ME power.
 
-**Guidance:** Configure Sunshine entropy coding to CAVLC:
+**Guidance:** Configure Sunshine entropy coding to CAVLC if your GPU/encoder supports it, to save battery and reduce heat on the PSP:
 
 - NVIDIA: `nvenc_h264_cavlc = enabled`
 - AMD: `amd_coder = cavlc`
@@ -28,7 +28,7 @@ This document lists user-facing limitations, compatibility notes, and practical 
 
 **Impact:** Performance mode prioritizes video and input responsiveness by skipping local Opus decode and audio playback on the PSP.
 
-**Guidance:** Switch Audio to Enabled, or use Balanced/Quality, if you need sound. Audio Disabled is client-side and does not require changing Sunshine settings.
+**Guidance:** Switch Audio to Enabled, or use Balanced/Quality, if you need sound. Audio Disabled keeps only the host audio liveness ping and skips local PSP audio receive/decode/playback.
 
 ### Native resolution costs more decode time
 

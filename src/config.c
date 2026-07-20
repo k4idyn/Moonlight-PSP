@@ -175,7 +175,8 @@ void configSetDefaults(PspConfig *config)
     config->presetIndex = 2;                 /* Performance step-ladder preset */
     config->resolutionIndex = 2;             /* 300x170 resolution row */
     config->fpsIndex = 3;                    /* 30 FPS */
-    config->audioEnabled = 0;                /* Performance default: client-side audio drain/drop only */
+    config->audioEnabled = 0;                /* Performance default: audio ping-only, no local drain/decode */
+    config->cabacTestMode = 0;               /* Release default: CAVLC; CABAC is test-only */
     config->disableEncryption = 1;           /* No AV encryption; RTSP/control stay compatible */
 
     /* Pairing persistence */

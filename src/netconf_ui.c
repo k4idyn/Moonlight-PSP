@@ -16,6 +16,7 @@
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
+#include <pspnet_resolver.h>
 #include <pspdisplay.h>
 #include <pspgu.h>
 #include <string.h>
@@ -49,6 +50,7 @@ int netconf_ui_run(void)
     int net_inited = 0;
     int inet_inited = 0;
     int apctl_inited = 0;
+    int resolver_inited = 0;
 
     diag_log_write("NET", "[NETCONF] start\n");
 
@@ -71,6 +73,9 @@ int netconf_ui_run(void)
     ret = sceNetApctlInit(0x2000, 42);
     diag_log_write("NET", "[NETCONF] sceNetApctlInit ret=0x%08X\n", (unsigned)ret);
     if (ret >= 0) apctl_inited = 1;
+    ret = sceNetResolverInit();
+    diag_log_write("NET", "[NETCONF] sceNetResolverInit ret=0x%08X\n", (unsigned)ret);
+    if (ret >= 0) resolver_inited = 1;
 
     /* Build the dialog parameters ---------------------------------------- */
     memset(&netconf, 0, sizeof(netconf));
@@ -182,6 +187,9 @@ int netconf_ui_run(void)
 fail:
     diag_log_write("NET", "[NETCONF] failed ret=0x%08X\n", (unsigned)ret);
     if (ret < 0) {
+        if (resolver_inited) {
+            sceNetResolverTerm();
+        }
         if (apctl_inited) {
             sceNetApctlTerm();
         }

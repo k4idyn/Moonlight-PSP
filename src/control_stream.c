@@ -61,6 +61,7 @@ static u32 s_quality_prev_decoded       = 0;
 static u32 s_quality_prev_time_us       = 0;
 
 /* Phase 5.9: Quality-based BW report scaling (100=normal, 50=halve) */
+#define IDR_FAST_RECOVERY_MIN_US 500000U
 static int s_quality_bw_scale_pct = 100;
 static u64 s_last_idr_tick = 0;
 static int s_idr_count = 0;
@@ -1776,6 +1777,25 @@ int control_stream_request_idr_force(void)
     return control_stream_request_idr();
 }
 
+int control_stream_request_idr_recovery_fast(void)
+{
+    u64 now;
+
+    sceRtcGetCurrentTick(&now);
+    if (s_last_idr_tick != 0 &&
+        (now - s_last_idr_tick) < IDR_FAST_RECOVERY_MIN_US) {
+        ctrl_log("[IDR BACKOFF] fast recovery coalesced (last=%ums ago count=%d)\n",
+                 (u32)((now - s_last_idr_tick) / 1000), s_idr_count);
+        return 0;
+    }
+
+    s_idr_count = 0;
+    s_idr_backoff_us = IDR_FAST_RECOVERY_MIN_US;
+    ctrl_log("[IDR BACKOFF] fast recovery request cadence=%ums\n",
+             IDR_FAST_RECOVERY_MIN_US / 1000);
+    return control_stream_request_idr();
+}
+
 int control_stream_request_idr_startup(void)
 {
     if (g_idr_fully_decoded || g_last_good_frame != 0) {
@@ -2053,7 +2073,11 @@ int control_stream_start(void)
             if (parse_verify_connect(recv_buf, ret, &recv_sent_time) == 0)
                 break;
         } else {
-            ctrl_log("[CTRL] recv timeout (attempt %d)\n", attempt + 1);
+            if (attempt < 4) {
+                ctrl_log("[CTRL] recv idle (attempt %d)\n", attempt + 1);
+            } else {
+                ctrl_log("[CTRL] recv timeout (attempt %d)\n", attempt + 1);
+            }
         }
     }
 

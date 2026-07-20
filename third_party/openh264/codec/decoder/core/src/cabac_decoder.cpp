@@ -30,6 +30,7 @@
  *
  *      cabac_decoder.cpp:      deals with cabac state transition and related functions
  */
+#define WELS_CABAC_DECODER_NO_ALIAS
 #include "cabac_decoder.h"
 namespace WelsDec {
 static const int16_t g_kMvdBinPos2Ctx [8] = {0, 1, 2, 3, 3, 3, 3, 3};

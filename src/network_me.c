@@ -37,11 +37,15 @@
 #include "rtp_fec.h"
 #include "runtime_telemetry.h"
 #include "network_me_stats.h"
+#include "audio_thread.h"
+#include "settings_menu.h"
 
 /* RTP packet parsing constants (for SPS detection in ring overflow handling) */
 #define NET_RTP_FIXED_HEADER_SIZE 12
 #define NET_RTP_FLAG_EXTENSION    0x10
 #define NET_NV_VIDEO_PKT_SIZE     16
+#define NET_RTP_PT_AUDIO_OPUS     97
+#define NET_RTP_PT_AUDIO_FEC      127
 
 static int net_rtp_nv_offset(const u8 *packet, int packet_len)
 {
@@ -71,6 +75,8 @@ extern volatile int me_running;
 extern char g_video_server_ip[64];     /* Sunshine IP, e.g. "10.0.0.73" */
 extern int  g_video_server_port;       /* Sunshine video UDP port, default 47998 */
 extern char g_video_ping_payload[17];  /* X-SS-Ping-Payload (16 chars) from SETUP */
+extern int  g_audio_server_port;       /* Sunshine audio UDP port, default 48000 */
+extern PspConfig g_psp_config;
 
 /* NIC IP filled by network_connect.c (diagnostic only). */
 extern char g_nic_ip[16];
@@ -1755,6 +1761,53 @@ static int network_recv_thread(SceSize args, void *argp)
         if ((u32)n > MAX_PACKET_SIZE)
             continue;
 
+        if (n >= NET_RTP_FIXED_HEADER_SIZE &&
+            ntohs(from_addr.sin_port) == (unsigned short)g_audio_server_port &&
+            ((recv_buf[0] >> 6) & 0x03) == 2) {
+            u8 pt = recv_buf[1] & 0x7F;
+            if (pt == NET_RTP_PT_AUDIO_OPUS ||
+                pt == NET_RTP_PT_AUDIO_FEC) {
+                static u32 s_audio_reroute_count = 0;
+                static u32 s_audio_disabled_drop_count = 0;
+                static u32 s_audio_reroute_drop_count = 0;
+
+                if (!g_psp_config.audioEnabled) {
+                    u32 payload_len = ((u32)n > NET_RTP_FIXED_HEADER_SIZE)
+                        ? ((u32)n - NET_RTP_FIXED_HEADER_SIZE) : 0;
+                    telemetry_accum_audio_rx((u32)n);
+                    if (pt == NET_RTP_PT_AUDIO_OPUS) {
+                        telemetry_accum_audio_data(payload_len);
+                    } else {
+                        telemetry_accum_audio_fec(payload_len);
+                    }
+                    s_audio_disabled_drop_count++;
+                    if (s_audio_disabled_drop_count <= 8 ||
+                        (s_audio_disabled_drop_count % 128) == 0) {
+                        net_log("[NET] dropped disabled-audio RTP PT=%d len=%d from video socket [#%u]\n",
+                                pt, (int)n, (unsigned)s_audio_disabled_drop_count);
+                    }
+                    continue;
+                }
+
+                if (audio_thread_queue_external_rtp(recv_buf, (int)n) == 0) {
+                    s_audio_reroute_count++;
+                    if (s_audio_reroute_count <= 8 ||
+                        (s_audio_reroute_count % 128) == 0) {
+                        net_log("[NET] rerouted audio RTP PT=%d len=%d from video socket [#%u]\n",
+                                pt, (int)n, (unsigned)s_audio_reroute_count);
+                    }
+                } else {
+                    s_audio_reroute_drop_count++;
+                    if (s_audio_reroute_drop_count <= 8 ||
+                        (s_audio_reroute_drop_count % 128) == 0) {
+                        net_log("[NET] dropped unroutable audio RTP PT=%d len=%d from video socket [#%u]\n",
+                                pt, (int)n, (unsigned)s_audio_reroute_drop_count);
+                    }
+                }
+                continue;
+            }
+        }
+
         telemetry_accum_video_rx((u32)n);
 
         /* Phase 4: Jitter tracking — measure inter-packet arrival times */
@@ -1950,7 +2003,8 @@ static int network_recv_thread(SceSize args, void *argp)
  *--------------------------------------------------------------------------*/
 void network_me_shutdown(void)
 {
-    SceUInt timeout_us = 2000000; /* 2 seconds max wait per thread */
+    const unsigned int PSP_THREAD_ALREADY_GONE = 0x80020198u;
+    SceUInt timeout_us = 350000; /* bounded app-exit wait per thread */
 
     network_me_stop_preplay_pings();
 
@@ -1971,14 +2025,30 @@ void network_me_shutdown(void)
     }
 
     if (ping_thread_id >= 0) {
-        sceKernelWaitThreadEnd(ping_thread_id, &timeout_us);
-        sceKernelDeleteThread(ping_thread_id);
+        int wait_ret = sceKernelWaitThreadEnd(ping_thread_id, &timeout_us);
+        if (wait_ret < 0) {
+            int del_ret = sceKernelTerminateDeleteThread(ping_thread_id);
+            if (del_ret < 0 && (unsigned)del_ret != PSP_THREAD_ALREADY_GONE) {
+                net_log("[NET SHUTDOWN] ping terminate-delete failed 0x%08X\n",
+                        (unsigned)del_ret);
+            }
+        } else {
+            sceKernelDeleteThread(ping_thread_id);
+        }
         ping_thread_id = -1;
     }
 
     if (net_thread_id >= 0) {
-        sceKernelWaitThreadEnd(net_thread_id, &timeout_us);
-        sceKernelDeleteThread(net_thread_id);
+        int wait_ret = sceKernelWaitThreadEnd(net_thread_id, &timeout_us);
+        if (wait_ret < 0) {
+            int del_ret = sceKernelTerminateDeleteThread(net_thread_id);
+            if (del_ret < 0 && (unsigned)del_ret != PSP_THREAD_ALREADY_GONE) {
+                net_log("[NET SHUTDOWN] recv terminate-delete failed 0x%08X\n",
+                        (unsigned)del_ret);
+            }
+        } else {
+            sceKernelDeleteThread(net_thread_id);
+        }
         net_thread_id = -1;
     }
 

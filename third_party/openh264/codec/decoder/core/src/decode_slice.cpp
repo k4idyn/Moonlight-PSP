@@ -93,7 +93,8 @@ int32_t WelsTargetSliceConstruction (PWelsDecoderContext pCtx) {
 
   int32_t iTotalNumMb = pCurSlice->iTotalMbInCurSlice;
   int32_t iCountNumMb = 0;
-  PDeblockingFilterMbFunc pDeblockMb = WelsDeblockingMb;
+  PDeblockingFilterMbFunc pDeblockMb =
+    pCurSlice->eSliceType == B_SLICE ? WelsDeblockingMb : WelsDeblockingMbNoBSlice;
 
   if (!pCtx->sSpsPpsCtx.bAvcBasedFlag && iCurLayerWidth != pCtx->iCurSeqIntervalMaxPicWidth) {
     return ERR_INFO_WIDTH_MISMATCH;
@@ -1698,7 +1699,8 @@ int32_t WelsDecodeAndConstructSlice (PWelsDecoderContext pCtx) {
   pCurDqLayer->iMbY = iMbY;
   pCurDqLayer->iMbXyIndex = iNextMbXyIndex;
 
-  PDeblockingFilterMbFunc pDeblockMb = WelsDeblockingMb;
+  PDeblockingFilterMbFunc pDeblockMb =
+    pSliceHeader->eSliceType == B_SLICE ? WelsDeblockingMb : WelsDeblockingMbNoBSlice;
 
   SDeblockingFilter pFilter;
   int32_t iFilterIdc = 1;

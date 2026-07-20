@@ -195,6 +195,8 @@ me_helper:
 	$(MAKE) -C moonlight_me_helper
 	@cp -f moonlight_me_helper/moonlight_me_helper.prx .
 
+moonlight_me_helper/MediaEngine.o: me_helper
+
 $(MBEDTLS_OBJS): mbedtls_%.o: $(MBEDTLS_LIBDIR)/%.c
 	$(CC) -std=gnu99 $(CFLAGS) -c -o $@ $<
 

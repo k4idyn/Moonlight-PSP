@@ -13,6 +13,8 @@
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
+#include <pspnet_resolver.h>
+#include <netdb.h>
 #include <psputility.h>
 #include <psputility_netmodules.h>
 #include <netinet/in.h>
@@ -79,6 +81,26 @@ extern void network_me_shutdown(void);
 #define SUNSHINE_RTSP_PORT_FALLBACK  MOONLIGHT_RTSP_PORT_LEGACY
 #define CLIENT_UNIQUE_ID    client_identity_get_uid() /* 16-char unique device ID   */
 
+static struct in_addr resolve_host(const char *host)
+{
+    struct in_addr addr;
+    struct hostent *he;
+
+#ifndef INADDR_NONE
+#define INADDR_NONE 0xFFFFFFFF
+#endif
+
+    memset(&addr, 0, sizeof(addr));
+    addr.s_addr = inet_addr(host);
+    if (addr.s_addr == INADDR_NONE) {
+        he = gethostbyname(host);
+        if (he) {
+            addr = *(struct in_addr *)he->h_addr;
+        }
+    }
+    return addr;
+}
+
 #ifndef PSP_VIDEO_FEC_PERCENT
 #define PSP_VIDEO_FEC_PERCENT 35
 #endif
@@ -141,7 +163,7 @@ char g_video_ping_payload[17]   = {0};   /* X-SS-Ping-Payload from video SETUP (
 /* Audio stream parameters — for audio ping thread */
 int  g_audio_server_port        = 48000;
 char g_audio_ping_payload[17]   = {0};
-int  g_audio_rtsp_ok            = 0;   /* set to 1 when RTSP SETUP audio succeeds */
+int  g_audio_rtsp_ok            = 0;   /* set when audio RTSP SETUP/ping path succeeds */
 
 /* Control stream parameters — for ENet handshake */
 int  g_control_server_port      = 47999;
@@ -198,6 +220,26 @@ static char s_retry_title[64] = "";
 static int g_rtsp_port = SUNSHINE_RTSP_PORT_PRIMARY;
 static char g_rtsp_connect_host[64] = DEFAULT_SUNSHINE_HOST;
 static char g_rtsp_host_header[96] = DEFAULT_SUNSHINE_HOST;
+
+static int network_video_slices_per_frame(int cabac_mode,
+                                          int audio_enabled,
+                                          int width,
+                                          int height,
+                                          int fps)
+{
+    if (cabac_mode &&
+        !audio_enabled &&
+        width <= 320 &&
+        height <= 180 &&
+        fps >= 30) {
+        /* Four slices drove packet/FEC burst pressure high enough to trigger
+         * CABAC RFI/IDR churn on the current PSP host contract. Two slices
+         * remains the measured middle ground for this decoder. */
+        return 2;
+    }
+
+    return 1;
+}
 
 static int parse_ipv4_literal(const char *ip,
                               unsigned int *a,
@@ -903,7 +945,7 @@ int https_launch_get(const char *host, int port,
     addr.sin_len         = (unsigned char)sizeof(addr);
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((unsigned short)port);
-    addr.sin_addr.s_addr = inet_addr(host);
+    addr.sin_addr = resolve_host(host);
 
     /* Non-blocking connect with select()-based wait */
     nb = 1;
@@ -1221,7 +1263,7 @@ int https_launch_get_binary(const char *host, int port,
     addr.sin_len         = (unsigned char)sizeof(addr);
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((unsigned short)port);
-    addr.sin_addr.s_addr = inet_addr(host);
+    addr.sin_addr = resolve_host(host);
 
     nb = 1;
     sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
@@ -1698,7 +1740,7 @@ static int sunshine_launch_session(int target_appid)
                      ri_key_hex, rikeyid, surround_audio_info);
             pair_log("[RESUME] audioEnabled=%d surroundAudioInfo=%d continuousAudio=0%s\n",
                      g_psp_config.audioEnabled, surround_audio_info,
-                     g_psp_config.audioEnabled ? "" : " (client drain/drop only)");
+                     g_psp_config.audioEnabled ? "" : " (audio ping-only)");
             pair_log("[RESUME] GET https://%s:%d%s\n",
                      g_sunshine_host, SUNSHINE_HTTPS_PORT, path);
 
@@ -1830,21 +1872,28 @@ static int sunshine_launch_session(int target_appid)
             int sops_flag = (g_psp_config.controlMode == CONTROL_MODE_XBOX) ? 1 : 0;
             int rtsp_corever = g_psp_config.disableEncryption ? 0 : 1;
             int surround_audio_info = AUDIO_STREAM_SURROUND_INFO;
+            int video_slices_per_frame =
+                network_video_slices_per_frame(g_psp_config.cabacTestMode,
+                                               g_psp_config.audioEnabled,
+                                               g_psp_config.width,
+                                               g_psp_config.height,
+                                               g_psp_config.fps > 0 ? g_psp_config.fps : 30);
             snprintf(path, sizeof(path),
                      "/launch?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d&sops=%d"
                      "&rikey=%s&rikeyid=%d&localAudioPlayMode=0&additionalStates=0"
                     "&surroundAudioInfo=%d&remoteControllersBitmap=1&gcmap=1"
                     "&continuousAudio=0&corever=%d&supportedVideoFormats=1&videoCapabilities=2"
-                     "&videoEncoderSlicesPerFrame=1",
+                     "&videoEncoderSlicesPerFrame=%d",
                      CLIENT_UNIQUE_ID, client_identity_get_uuid(),
                      target_appid, g_psp_config.width, g_psp_config.height, g_psp_config.fps,
                      sops_flag, ri_key_hex, rikeyid, surround_audio_info,
-                     rtsp_corever);
-            pair_log("[LAUNCH] rtsp corever=%d disableAVEncryption=%d audioEnabled=%d surroundAudioInfo=%d continuousAudio=0%s%s\n",
+                     rtsp_corever, video_slices_per_frame);
+            pair_log("[LAUNCH] rtsp corever=%d disableAVEncryption=%d audioEnabled=%d surroundAudioInfo=%d continuousAudio=0 slices=%d%s%s\n",
                      rtsp_corever, g_psp_config.disableEncryption,
                      g_psp_config.audioEnabled, surround_audio_info,
+                     video_slices_per_frame,
                      g_psp_config.disableEncryption ? " (plaintext RTSP)" : "",
-                     g_psp_config.audioEnabled ? "" : " (client drain/drop only)");
+                     g_psp_config.audioEnabled ? "" : " (audio ping-only)");
         }
 
         pair_log("[LAUNCH] GET https://%s:%d%s\n",
@@ -2023,11 +2072,18 @@ int wifi_connect(void)
         return ret;
     }
 
+    ret = sceNetResolverInit();
+    if (ret < 0 && ret != (int)0x80411101)
+    {
+        pspDebugScreenPrintf("wifi: sceNetResolverInit failed (0x%08X)\n", ret);
+    }
+
     /*--- Connect to access point slot 1 -------------------------------------*/
     ret = sceNetApctlConnect(1);
     if (ret < 0)
     {
         pspDebugScreenPrintf("wifi: sceNetApctlConnect(1) failed (0x%08X)\n", ret);
+        sceNetResolverTerm();
         sceNetApctlTerm();
         sceNetInetTerm();
         sceNetTerm();
@@ -2081,6 +2137,7 @@ int wifi_connect(void)
     /* Timeout */
     pspDebugScreenPrintf("wifi: connection timeout after 30 seconds\n");
     sceNetApctlDisconnect();
+    sceNetResolverTerm();
     sceNetApctlTerm();
     sceNetInetTerm();
     sceNetTerm();
@@ -2094,6 +2151,7 @@ void wifi_disconnect(void)
 {
     wifi_launch_restore_power_save();
     sceNetApctlDisconnect();
+    sceNetResolverTerm();
     sceNetApctlTerm();
     sceNetInetTerm();
     sceNetTerm();
@@ -2600,7 +2658,7 @@ static int rtsp_connect_port(const char *host, int port, int timeout_ms)
     server_addr.sin_len    = (unsigned char)sizeof(server_addr);
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = inet_addr(host);
+    server_addr.sin_addr = resolve_host(host);
 
     ret = sceNetInetConnect(sock, (struct sockaddr *)&server_addr,
                             sizeof(server_addr));
@@ -3069,7 +3127,7 @@ static int rtsp_setup_stream(int sock, const char *stream_id)
  * rtsp_announce - Send RTSP ANNOUNCE with SDP video configuration
  *
  * Tells Sunshine what resolution/FPS/bitrate/codec to stream.
- * Must be sent after all three SETUP requests.
+ * Must be sent after the required SETUP requests.
  * Target is "streamid=control/13/0" (GFE version 7+ / Sunshine).
  *
  * Returns: 0 on success, negative on error
@@ -3177,14 +3235,26 @@ static int rtsp_announce(int sock, int enc_enabled)
              * unrecoverable/gap event to four, with no release-grade visual
              * improvement. Keep the default enabled unless build-forced. */
         }
+        if (g_psp_config.cabacTestMode &&
+            g_psp_config.audioEnabled &&
+            stream_w == 480 && stream_h == 272 &&
+            stream_fps <= 10 &&
+            launch_bitrate_kbps > 192) {
+            int old_launch = launch_bitrate_kbps;
+            launch_bitrate_kbps = 192;
+            transport_bitrate_kbps = launch_bitrate_kbps;
+            configured_bitrate_kbps = launch_bitrate_kbps;
+            minimum_bitrate_kbps =
+                signal_strength_get_adaptive_floor_kbps(transport_bitrate_kbps);
+            pair_log("[RTSP] CABAC quality survival cap: %d -> %d kbps (audio=%d)\n",
+                     old_launch, launch_bitrate_kbps,
+                     g_psp_config.audioEnabled ? 1 : 0);
+        }
         if (!g_psp_config.audioEnabled && configured_bitrate_kbps > 0) {
-            /* There is no official client-side GameStream/Sunshine control
-             * that stops audio RTP while leaving the host config untouched.
-             * Audio Disabled is a local PSP work saver: keep audio SETUP/ping
-             * for liveness, drain/drop RTP, and skip Opus/SRC/playback. Do
-             * not add back audio budget here because the host may still send
-             * the low-audio RTP stream. */
-            pair_log("[RTSP] audio disabled: client drains/drops audio RTP; no video-budget addback\n");
+            /* Sunshine/Apollo still starts an audio liveness thread for normal
+             * sessions. Keep audio SETUP/ping alive, but do not add video
+             * budget back because the host may still send low-audio RTP. */
+            pair_log("[RTSP] audio disabled: keeping audio SETUP/ping only; no video-budget addback\n");
         } else if (stream_w * stream_h <= 256 * 144 && stream_fps <= 30 &&
                    configured_bitrate_kbps > 0 && g_psp_config.audioEnabled) {
             int low_audio_add_kbps =
@@ -3213,6 +3283,20 @@ static int rtsp_announce(int sock, int enc_enabled)
         if (!video_fec_enabled) {
             fec_min_required_packets = 0;
         }
+        if (g_psp_config.cabacTestMode &&
+            g_psp_config.audioEnabled &&
+            stream_w == 480 && stream_h == 272 &&
+            stream_fps <= 10 &&
+            video_fec_enabled) {
+            if (requested_fec_percent < 35) {
+                requested_fec_percent = 35;
+            }
+            if (fec_min_required_packets < 1) {
+                fec_min_required_packets = 1;
+            }
+            pair_log("[RTSP] CABAC quality FEC budget: repair=%d fecMin=%d\n",
+                     requested_fec_percent, fec_min_required_packets);
+        }
         if (PSP_AUDIO_PACKET_DURATION_MS > 0) {
             int override_ms = PSP_AUDIO_PACKET_DURATION_MS;
             if (override_ms == 5 || override_ms == 10 ||
@@ -3230,6 +3314,7 @@ static int rtsp_announce(int sock, int enc_enabled)
             intra_refresh_enabled = PSP_VIDEO_INTRA_REFRESH ? 1 : 0;
             pair_log("[RTSP] build override intraRefresh=%d\n",
                      intra_refresh_enabled);
+
         }
         if (client_refresh_x100 < 100) {
             client_refresh_x100 = 100;
@@ -3318,10 +3403,29 @@ static int rtsp_announce(int sock, int enc_enabled)
             {
             int h264_profile = g_psp_config.cabacTestMode ? 77 : 66;
             int entropy_mode = g_psp_config.cabacTestMode ? 1 : 0;
+            int video_slices_per_frame =
+                network_video_slices_per_frame(g_psp_config.cabacTestMode,
+                                               g_psp_config.audioEnabled,
+                                               stream_w,
+                                               stream_h,
+                                               stream_fps);
+            int feature_flags = ML_FF_SESSION_ID_V1;
             const char *profile_level_id = g_psp_config.cabacTestMode ? "4de015" : "42e015";
 
-            if (g_psp_config.cabacTestMode)
-                pair_log("[SDP] CABAC test mode: profile=%d entropy=%d\n", h264_profile, entropy_mode);
+            if (video_fec_enabled) {
+                feature_flags |= ML_FF_FEC_STATUS;
+            } else {
+                pair_log("[SDP] video FEC disabled: clearing FEC status feature flag\n");
+            }
+            if (g_psp_config.cabacTestMode) {
+                pair_log("[SDP] CABAC test mode: profile=%d entropy=%d slices=%d\n",
+                         h264_profile, entropy_mode, video_slices_per_frame);
+            } else {
+                /* The host owns the encoder decision. Keep this request in
+                 * the log so a host-side negotiation failure is unambiguous. */
+                pair_log("[SDP] CAVLC contract requested: profile=%d entropy=%d slices=%d\n",
+                         h264_profile, entropy_mode, video_slices_per_frame);
+            }
 
             memset(sdp_payload, 0, sizeof(sdp_payload));
             sdp_len = snprintf(sdp_payload, sizeof(sdp_payload),
@@ -3357,7 +3461,7 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "a=x-ss-video[0].chromaSamplingType:0\r\n"
                 "a=x-ss-video[0].intraRefresh:%d\r\n"
                 /* --- Encoder constraints: profile + entropy coding --- */
-                "a=x-nv-video[0].videoEncoderSlicesPerFrame:1\r\n"
+                "a=x-nv-video[0].videoEncoderSlicesPerFrame:%d\r\n"
                 "a=x-nv-vqos[0].bitStreamFormat:0\r\n"
                 "a=x-nv-video[0].maxNumReferenceFrames:1\r\n"
                 "a=x-nv-video[0].h264Profile:%d\r\n"
@@ -3398,9 +3502,10 @@ static int rtsp_announce(int sock, int enc_enabled)
                 video_fec_enabled,
                 requested_fec_percent,
                 fec_min_required_packets,
-                (ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1),
+                feature_flags,
                 enc_enabled,
                 intra_refresh_enabled,
+                video_slices_per_frame,
                 h264_profile, entropy_mode,
                 client_refresh_x100,
                 transport_bitrate_kbps, transport_bitrate_kbps,
@@ -3477,17 +3582,42 @@ void rtsp_session_close(void)
     upnp_remove_stream_mappings();
 
     if (g_rtsp_persistent_sock >= 0) {
-        /* Optional: send TEARDOWN before closing if the server is still there. */
+        if (g_rtsp_session_id[0]) {
+            char teardown[384];
+            int sent = 0;
+            int len = snprintf(teardown, sizeof(teardown),
+                               "TEARDOWN / RTSP/1.0\r\n"
+                               "CSeq: %d\r\n"
+                               "User-Agent: psp-moonlight\r\n"
+                               "X-GS-ClientVersion: %d\r\n"
+                               "Host: %s\r\n"
+                               "Session: %s\r\n"
+                               "\r\n",
+                               rtsp_cseq++,
+                               CLIENT_VERSION,
+                               g_rtsp_host_header,
+                               g_rtsp_session_id);
+            if (len > 0 && len < (int)sizeof(teardown)) {
+                int ret = rtsp_send_all_timeout(g_rtsp_persistent_sock,
+                                                teardown,
+                                                len,
+                                                "TEARDOWN",
+                                                &sent);
+                pair_log("[RTSP] TEARDOWN sent ret=%d bytes=%d/%d\n",
+                         ret, sent, len);
+            }
+        }
         sceNetInetClose(g_rtsp_persistent_sock);
         g_rtsp_persistent_sock = -1;
     }
+    g_rtsp_session_id[0] = '\0';
 }
 
 /*
  * rtsp_play - Send RTSP PLAY to start the stream
  *
  * Uses "/" as the target (GFE 3.22+/Sunshine single-PLAY format).
- * Session header is always included (set by SETUP audio).
+ * Session header is always included after the first successful media SETUP.
  *
  * Returns: 0 on success, negative on error
  */
@@ -3684,13 +3814,13 @@ int rtsp_session(void)
     pair_log("[RTSP] DESCRIBE done, delaying 100ms before SETUP...\n");
     sceKernelDelayThread(100 * 1000);
 
-    /* 3a. SETUP audio. Sunshine still requires an audio SS_PING to keep the
-     * session alive. With Audio Disabled, this remains a client-side low-work
-     * path: the PSP performs audio SETUP/ping, drains/drops audio RTP, and
-     * skips Opus/SRC/playback. */
+    /* 3a. SETUP audio. Sunshine/Apollo starts an audio liveness thread for
+     * normal sessions even when the PSP does not play audio. With Audio
+     * Disabled, keep only SETUP/ping alive so the server does not disconnect,
+     * and skip local receive/decode/playback later in main.c. */
     g_audio_rtsp_ok = 0;
     pair_log("[RTSP] connecting for SETUP audio%s...\n",
-             g_psp_config.audioEnabled ? "" : " (keepalive-only)");
+             g_psp_config.audioEnabled ? "" : " (ping-only)");
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_VIDEO);
     sock = rtsp_connect_post_setup("SETUP audio");
     if (sock < 0) {
@@ -3712,7 +3842,7 @@ int rtsp_session(void)
             rtsp_seed_media_server_ip();
             if (audio_thread_start_ping_only() == 0) {
                 pair_log("[RTSP] early audio ping started before SETUP video%s\n",
-                         g_psp_config.audioEnabled ? "" : " (keepalive-only)");
+                         g_psp_config.audioEnabled ? "" : " (ping-only)");
             } else {
                 pair_log("[RTSP] WARN: early audio ping failed before SETUP video\n");
             }
@@ -3845,9 +3975,9 @@ int rtsp_session(void)
 
     /* Sunshine/Apollo creates the stream session from ANNOUNCE and immediately
      * starts waiting for SS_PING. Keep one low-cost video prime before PLAY,
-     * then follow the common-c order and issue PLAY immediately. The audio
-     * ping thread is already running here; for Audio Disabled it exists only
-     * to satisfy Sunshine's session liveness check. */
+     * then follow the common-c order and issue PLAY immediately. For Audio
+     * Disabled, the audio ping thread remains ping-only to satisfy host
+     * liveness without starting the PSP RTP drain/decode path. */
     rtsp_prime_video_endpoint("pre-PLAY", 100 * 1000);
 
     /* Apollo/AMF has historically been sensitive to low-res refresh-mode
@@ -3876,10 +4006,10 @@ int rtsp_session(void)
     sock = -1;
 
     /* Keep the video endpoint fresh after PLAY returns. The audio SS_PING
-     * thread is already running from SETUP audio; sending an extra 3-ping
-     * audio burst here pulls audio+audio-FEC into the PSP before the first
-     * video IDR has settled, which increases startup packet pressure on
-     * PSP-1000 WiFi. */
+     * thread is already running from SETUP audio for audio-enabled streams.
+     * Sending an extra 3-ping audio burst here pulls audio+audio-FEC into the
+     * PSP before the first video IDR has settled, which increases startup
+     * packet pressure on PSP-1000 WiFi. */
     rtsp_prime_video_endpoint("post-PLAY", 0);
 
     stream_connect_draw(game_grid_ui_get_selected_title(), STREAM_PHASE_READY);
@@ -4021,7 +4151,7 @@ static int http_pair_get(const char *url, char *resp, int resp_size)
     addr.sin_len         = (unsigned char)sizeof(addr);
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((unsigned short)port);
-    addr.sin_addr.s_addr = inet_addr(host);
+    addr.sin_addr = resolve_host(host);
 
     nb = 1;
     sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
@@ -4892,7 +5022,7 @@ void network_cancel_stream_session(void)
 
     g_cancel_tid = sceKernelCreateThread("cancel_th",
                                         cancel_thread_func,
-                                        0x18,
+                                        0x28,
                                         0x8000,
                                         0,
                                         NULL);
@@ -4901,12 +5031,42 @@ void network_cancel_stream_session(void)
     }
 }
 
-void network_wait_for_cancel_thread(void)
+int network_wait_for_cancel_thread(void)
 {
     if (g_cancel_tid >= 0) {
-        SceUInt timeout = 3000000; /* 3s */
-        sceKernelWaitThreadEnd(g_cancel_tid, &timeout);
-        sceKernelDeleteThread(g_cancel_tid);
+        const unsigned int PSP_THREAD_ALREADY_GONE = 0x80020198u;
+        SceUInt timeout = 250000;
+        int wait_ret;
+        int delete_ret;
+
+        pair_log("[NET] [CANCEL-THREAD] waiting for tid=0x%08X\n",
+                 (unsigned)g_cancel_tid);
+        wait_ret = sceKernelWaitThreadEnd(g_cancel_tid, &timeout);
+        if (wait_ret < 0) {
+            if ((unsigned int)wait_ret == PSP_THREAD_ALREADY_GONE) {
+                pair_log("[NET] [CANCEL-THREAD] already exited/deleted (0x%08X)\n",
+                         (unsigned)wait_ret);
+            } else if (wait_ret == (int)0x800201A8) {
+                pair_log("[NET] [CANCEL-THREAD] wait timed out; force terminate-delete for module-safe teardown\n");
+            } else {
+                pair_log("[NET] [CANCEL-THREAD] wait failed 0x%08X; force terminate-delete for module-safe teardown\n",
+                         (unsigned)wait_ret);
+            }
+            delete_ret = sceKernelTerminateDeleteThread(g_cancel_tid);
+            if (delete_ret < 0 &&
+                (unsigned int)delete_ret != PSP_THREAD_ALREADY_GONE) {
+                pair_log("[NET] [CANCEL-THREAD] terminate-delete failed 0x%08X\n",
+                         (unsigned)delete_ret);
+            }
+        } else {
+            delete_ret = sceKernelDeleteThread(g_cancel_tid);
+            if (delete_ret < 0 &&
+                (unsigned int)delete_ret != PSP_THREAD_ALREADY_GONE) {
+                pair_log("[NET] [CANCEL-THREAD] delete after wait returned 0x%08X\n",
+                         (unsigned)delete_ret);
+            }
+        }
         g_cancel_tid = -1;
     }
+    return 1;
 }

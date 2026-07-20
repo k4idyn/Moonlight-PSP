@@ -53,6 +53,8 @@
 #define CLIENT_UNIQUE_ID     client_identity_get_uid()
 #define SCAN_CONNECT_TIMEOUT_US 15000    /* 15ms per host (LAN SYN-ACK < 2ms) */
 
+extern volatile unsigned int g_remote_app_exit_request;
+
 static HostPC g_hosts[MAX_HOSTS];
 static int g_host_count = 0;
 static int g_selected_index = 0;
@@ -892,12 +894,26 @@ int renderHostDiscoveryList(void)
     sceCtrlPeekBufferPositive(&pad, 1);
     { extern volatile unsigned int g_remote_buttons;
       pad.Buttons |= g_remote_buttons; g_remote_buttons = 0; }
+    if (g_remote_app_exit_request) {
+        diag_log_write("UI", "HOST remote app-exit request t=%u\n",
+                       sceKernelGetSystemTimeLow() / 1000);
+        diag_log_flush();
+        return -4;
+    }
     {
         u32 pressed = pad.Buttons & ~g_prev_buttons;
         if (pressed) {
             diag_log_write("UI", "HOST btn=0x%04X t=%u\n",
                            (unsigned)pressed, sceKernelGetSystemTimeLow() / 1000);
         }
+    }
+
+    if ((pad.Buttons & PSP_CTRL_START) && (pad.Buttons & PSP_CTRL_SELECT)) {
+        diag_log_write("UI", "HOST suppressing Start+Select fallback edge t=%u\n",
+                       sceKernelGetSystemTimeLow() / 1000);
+        diag_log_flush();
+        g_prev_buttons = pad.Buttons;
+        return -1;
     }
 
     /* Auto-select DISABLED — manual navigation only via RemoteJoy */
@@ -1025,7 +1041,9 @@ int renderHostDiscoveryList(void)
     }
 
     if ((pad.Buttons & PSP_CTRL_START) && !(g_prev_buttons & PSP_CTRL_START)) {
-        exit_dialog_run();
+        if (exit_dialog_run()) {
+            return -4;
+        }
     }
 
     /* Circle: go back to settings menu */

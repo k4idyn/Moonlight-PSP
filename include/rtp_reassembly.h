@@ -63,6 +63,11 @@ void rtp_reassembly_flush_partial_frame(void);
 /* Clear stale partial state before FEC resubmits a recovered frame. */
 void rtp_reassembly_prepare_fec_frame(u32 frame_id);
 
+/* FEC consumes parity packets instead of submitting them to reassembly.
+ * Align the sequence tracker after a FEC-managed frame so parity packets do
+ * not look like a transport gap at the next frame boundary. */
+void rtp_reassembly_note_fec_frame_complete(u16 next_seq_after_fec);
+
 /* Host processing latency extracted from Sunshine frame headers (microseconds).
  * Updated per-frame when Sunshine type-0x01 headers are present. */
 extern volatile u32 g_host_processing_us;

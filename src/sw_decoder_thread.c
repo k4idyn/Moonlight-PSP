@@ -25,6 +25,7 @@
 #include <pspthreadman.h>
 #include <pspsdk.h>
 #include <psprtc.h>
+#include <pspctrl.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -42,6 +43,10 @@
 #include "storage_paths.h"
 
 extern PspConfig g_psp_config;
+extern volatile unsigned int g_remote_buttons;
+extern volatile unsigned int g_remote_exit_request;
+extern volatile unsigned int g_remote_app_exit_request;
+extern volatile int me_running;
 
 /* OpenH264-based decode pipeline (native low-latency H.264 decoder) */
 extern int  oh264_pipeline_init(void);
@@ -73,15 +78,28 @@ volatile int g_cabac_dialog_active = 0;
 #define FRAME_BUF_SIZE      (PSP_LCD_STRIDE * PSP_LCD_HEIGHT * PIXEL_SIZE)
 
 #define PACKET_BACKLOG_PSKIP_CAVLC     192u
+#define PACKET_BACKLOG_PSKIP_DISABLED  0xFFFFFFFFu
 #define PACKET_BACKLOG_PSKIP_CABAC      96u
+#define PACKET_BACKLOG_TRIM_CAVLC_PERF  20u
+#define PACKET_BACKLOG_TRIM_CABAC       56u
+#define PACKET_BACKLOG_FLUSH_CAVLC_PERF 160u
 #define PACKET_BACKLOG_FLUSH_CAVLC     384u
 #define PACKET_BACKLOG_FLUSH_CABAC     224u
 #define DECODER_DRAIN_BATCH_LIMIT      128
-#define SW_DECODER_THREAD_PRIORITY     0x21
+#define SW_DECODER_THREAD_PRIORITY_DEFAULT       0x21
+#define SW_DECODER_THREAD_PRIORITY_CABAC_PERF    0x1B
 #define OH264_RET_PENDING_NO_OUTPUT    (-5)
 #define OH264_RET_REF_LOST_NO_OUTPUT   (-7)
+#define REMOTE_EXIT_DECODER_YIELD_US   2000
 #define REF_LOSS_RFI_SPAN_MIN          4u
 #define REF_LOSS_RFI_SPAN_MAX          8u
+#define LIVE_TRIM_RTP_HEADER_SIZE      12
+#define LIVE_TRIM_RTP_EXTENSION_FLAG   0x10
+#define LIVE_TRIM_NV_PACKET_SIZE       16
+#define LIVE_TRIM_NV_FLAG_PIC          0x01
+#define LIVE_TRIM_NV_FLAG_EOF          0x02
+#define LIVE_TRIM_NV_FLAG_SOF          0x04
+#define LIVE_TRIM_FRAME_SPAN_MAX       120u
 
 #define dec_log(fmt, ...) diag_log_write("DEC", fmt, ##__VA_ARGS__)
 
@@ -105,10 +123,42 @@ static int              g_frames_dropped = 0;
 static FrameRingBuffer *g_frame_rb = NULL;
 static PacketRingBuffer *g_packet_rb = NULL;
 
+static int decoder_thread_priority_for_mode(void)
+{
+    if (g_psp_config.cabacTestMode &&
+        !g_psp_config.audioEnabled &&
+        g_psp_config.fps >= 30 &&
+        g_psp_config.width > 0 &&
+        g_psp_config.width <= 320 &&
+        g_psp_config.height > 0 &&
+        g_psp_config.height <= 180) {
+        return SW_DECODER_THREAD_PRIORITY_CABAC_PERF;
+    }
+
+    return SW_DECODER_THREAD_PRIORITY_DEFAULT;
+}
+
+static int decoder_is_cavlc_performance_mode(void)
+{
+    return !g_cabac_detected &&
+           !g_psp_config.cabacTestMode &&
+           g_psp_config.fps >= 30 &&
+           g_psp_config.width <= 320 &&
+           g_psp_config.height <= 180;
+}
+
 static unsigned int ref_loss_rfi_span_limit(void)
 {
     unsigned int fps = (g_psp_config.fps > 0) ? (unsigned int)g_psp_config.fps : 20u;
     unsigned int limit = fps / 3u;
+
+    if (decoder_is_cavlc_performance_mode()) {
+        limit = fps;
+        if (limit > 24u) {
+            limit = 24u;
+        }
+        return limit;
+    }
 
     if (limit < REF_LOSS_RFI_SPAN_MIN) {
         limit = REF_LOSS_RFI_SPAN_MIN;
@@ -217,14 +267,159 @@ static void nal_scan_headers(const u8 *nal_data, int nal_len,
 
 static u32 decoder_pskip_threshold_packets(void)
 {
+    if (decoder_is_cavlc_performance_mode()) {
+        return PACKET_BACKLOG_PSKIP_DISABLED;
+    }
+
     return g_cabac_detected ? PACKET_BACKLOG_PSKIP_CABAC
                             : PACKET_BACKLOG_PSKIP_CAVLC;
 }
 
 static u32 decoder_flush_threshold_packets(void)
 {
+    if (decoder_is_cavlc_performance_mode()) {
+        return PACKET_BACKLOG_FLUSH_CAVLC_PERF;
+    }
+
     return g_cabac_detected ? PACKET_BACKLOG_FLUSH_CABAC
                             : PACKET_BACKLOG_FLUSH_CAVLC;
+}
+
+static int decoder_packet_sof_frame_id(const u8 *packet, u16 packet_len, u32 *out_frame_id)
+{
+    int data_offset = LIVE_TRIM_RTP_HEADER_SIZE;
+    const u8 *nv;
+    u8 flags;
+    u8 fec_block_num;
+
+    if (!packet || packet_len < LIVE_TRIM_RTP_HEADER_SIZE + LIVE_TRIM_NV_PACKET_SIZE) {
+        return 0;
+    }
+    if (((packet[0] >> 6) & 0x03) != 2) {
+        return 0;
+    }
+
+    if (packet[0] & LIVE_TRIM_RTP_EXTENSION_FLAG) {
+        data_offset += 4;
+    }
+    if (packet_len < (u16)(data_offset + LIVE_TRIM_NV_PACKET_SIZE)) {
+        return 0;
+    }
+
+    nv = packet + data_offset;
+    flags = nv[8];
+    fec_block_num = (nv[11] >> 4) & 0x03;
+    if (flags & ~(LIVE_TRIM_NV_FLAG_PIC |
+                  LIVE_TRIM_NV_FLAG_EOF |
+                  LIVE_TRIM_NV_FLAG_SOF)) {
+        return 0;
+    }
+    if ((flags & LIVE_TRIM_NV_FLAG_PIC) == 0) {
+        return 0;
+    }
+    if ((flags & LIVE_TRIM_NV_FLAG_SOF) == 0 || fec_block_num != 0) {
+        return 0;
+    }
+
+    if (out_frame_id) {
+        *out_frame_id = (u32)nv[4] |
+                        ((u32)nv[5] << 8) |
+                        ((u32)nv[6] << 16) |
+                        ((u32)nv[7] << 24);
+    }
+    return 1;
+}
+
+static int decoder_trim_live_queue(u32 queued, u32 trim_threshold, const char *site)
+{
+    static u32 s_live_trim_count = 0;
+    u32 head;
+    u32 idx;
+    u32 scan;
+    u32 sof_idx = 0;
+    u32 sof_frame_id = 0;
+    u32 keep;
+    u32 dropped;
+    int found_sof = 0;
+
+    if (!g_packet_rb || queued <= trim_threshold) {
+        return 1;
+    }
+    if (!g_saw_first_idr || g_last_good_frame == 0) {
+        return 0;
+    }
+
+    head = g_packet_rb->head;
+    for (scan = 1; scan <= queued && scan < RING_BUFFER_SLOTS; scan++) {
+        idx = (head + RING_BUFFER_SLOTS - scan) % RING_BUFFER_SLOTS;
+        if (decoder_packet_sof_frame_id(g_packet_rb->slots[idx],
+                                        g_packet_rb->slot_length[idx],
+                                        &sof_frame_id)) {
+            s32 frame_delta = (s32)(sof_frame_id - g_last_good_frame);
+            if (frame_delta <= 0 ||
+                (u32)frame_delta > LIVE_TRIM_FRAME_SPAN_MAX) {
+                continue;
+            }
+            sof_idx = idx;
+            found_sof = 1;
+            break;
+        }
+    }
+
+    if (!found_sof) {
+        return 0;
+    }
+
+    keep = (head + RING_BUFFER_SLOTS - sof_idx) % RING_BUFFER_SLOTS;
+    if (keep == 0 || keep >= queued) {
+        return 1;
+    }
+
+    dropped = queued - keep;
+    s_live_trim_count++;
+    if (s_live_trim_count <= 8 || (s_live_trim_count % 30) == 0) {
+        dec_log("LIVE-TRIM: %s q=%u keep=%u drop=%u sof_fid=%u lgf=%u count=%u\n",
+                site ? site : "unknown", (unsigned)queued, (unsigned)keep,
+                (unsigned)dropped, (unsigned)sof_frame_id,
+                (unsigned)g_last_good_frame, (unsigned)s_live_trim_count);
+    }
+
+    g_packet_rb->tail = sof_idx;
+    rtp_reassembly_reset();
+    rtp_fec_reset();
+
+    if ((s32)(sof_frame_id - g_last_good_frame) > 1) {
+        u32 loss_start = g_last_good_frame + 1;
+        u32 loss_end = sof_frame_id - 1;
+        rtp_reassembly_note_frame_loss(loss_start, loss_end);
+        control_stream_request_rfi(loss_start, loss_end);
+    }
+
+    return 1;
+}
+
+static void decoder_force_live_latency_flush(u32 queued, u32 threshold, const char *site)
+{
+    static u32 s_live_flush_count = 0;
+
+    if (!g_packet_rb) {
+        return;
+    }
+
+    s_live_flush_count++;
+    dec_log("LIVE-FLUSH: %s q=%u>%u count=%u; dropping stale packets and forcing IDR\n",
+            site ? site : "unknown", (unsigned)queued, (unsigned)threshold,
+            (unsigned)s_live_flush_count);
+
+    g_packet_rb->tail = g_packet_rb->head;
+    rtp_reassembly_reset();
+    rtp_fec_reset();
+    oh264_pipeline_flush_buffers();
+    g_last_good_frame = 0;
+    g_refs_corrupted = 1;
+    g_idr_fully_decoded = 0;
+    g_current_frame_is_corrupt = 0;
+    control_stream_request_idr_force();
 }
 
 /* Timestamp of last decoded frame — read by main loop for latency display */
@@ -254,11 +449,10 @@ static void push_sw_frame(u8 *rgba_frame)
 {
     if (!g_frame_rb || !rgba_frame) return;
 
-    /* Zero-copy: push orchestrator's RGBA double-buffer pointer directly.
-     * The orchestrator alternates g_rgba_buf[0]/[1], so the previous
-     * frame's buffer stays valid until the next-next decode (~186ms).
-     * display_frame() writes back the active texture range before the
-     * GU blit, ensuring coherency without a whole-cache flush.
+    /* Zero-copy: push orchestrator RGBA buffer pointers directly.
+     * The OpenH264/ME path alternates two buffers. ME-produced frames are
+     * tagged clean by the decoder wrapper so display_frame() can skip the
+     * redundant texture writeback; CPU-owned fallback/copy frames still flush.
      *
      * Presentation policy mirrors the handheld clients that keep latency
      * bounded by preserving the newest frame. If the display ring is full,
@@ -278,7 +472,9 @@ static void push_sw_frame(u8 *rgba_frame)
         g_frame_rb->frame_ready = 1;
         g_last_frame_decode_us = sceKernelGetSystemTimeLow();
         s_replace_count++;
-        if (s_replace_count <= 5 || (s_replace_count % 120) == 0) {
+        if (me_running &&
+            !g_remote_exit_request && !g_remote_app_exit_request &&
+            (s_replace_count <= 5 || (s_replace_count % 120) == 0)) {
             dec_log("RING_FULL keep-latest=%d h=%u t=%u replace=%u\n",
                     s_replace_count, (unsigned)h,
                     (unsigned)g_frame_rb->tail, (unsigned)replace);
@@ -603,7 +799,7 @@ void rtp_frame_complete_callback(const u8 *nal_data, int nal_len)
                           - g_packet_rb->tail) % RING_BUFFER_SLOTS;
             u32 flush_threshold = decoder_flush_threshold_packets();
 
-            if (queued > flush_threshold) {
+            if (queued > flush_threshold && !decoder_is_cavlc_performance_mode()) {
                 dec_log("queue overrun: %u stale packets (>%u), flushing\n",
                         (unsigned)queued, (unsigned)flush_threshold);
                 g_packet_rb->tail = g_packet_rb->head;
@@ -802,6 +998,15 @@ static int sw_decoder_thread(SceSize args, void *argp)
         int batch = 0;
         loop_count++;
 
+        if ((g_remote_buttons & (PSP_CTRL_START | PSP_CTRL_SELECT)) ==
+            (PSP_CTRL_START | PSP_CTRL_SELECT)) {
+            g_remote_exit_request = 1;
+        }
+        if (g_remote_exit_request || g_remote_app_exit_request) {
+            sceKernelDelayThread(REMOTE_EXIT_DECODER_YIELD_US);
+            continue;
+        }
+
         /* Heartbeat every ~5 seconds */
         {
             u32 now = sceKernelGetSystemTimeLow() / 1000000;
@@ -858,7 +1063,21 @@ static int sw_decoder_thread(SceSize args, void *argp)
                           - g_packet_rb->tail) % RING_BUFFER_SLOTS;
             u32 flush_threshold = decoder_flush_threshold_packets();
 
-            if (queued > flush_threshold) {
+            if (decoder_is_cavlc_performance_mode()) {
+                if (queued > PACKET_BACKLOG_TRIM_CAVLC_PERF) {
+                    if (!decoder_trim_live_queue(queued, PACKET_BACKLOG_TRIM_CAVLC_PERF, "drain-loop") &&
+                        queued > flush_threshold) {
+                        decoder_force_live_latency_flush(queued, flush_threshold, "drain-loop");
+                    }
+                }
+            } else if (g_cabac_detected && g_psp_config.cabacTestMode) {
+                if (queued > PACKET_BACKLOG_TRIM_CABAC) {
+                    if (!decoder_trim_live_queue(queued, PACKET_BACKLOG_TRIM_CABAC, "cabac-drain-loop") &&
+                        queued > flush_threshold) {
+                        decoder_force_live_latency_flush(queued, flush_threshold, "cabac-drain-loop");
+                    }
+                }
+            } else if (queued > flush_threshold) {
                 if (g_saw_first_idr && g_last_good_frame != 0) {
                     u32 keep = flush_threshold / 2;
                     if (keep < 32) keep = 32;
@@ -900,6 +1119,7 @@ static int sw_decoder_thread(SceSize args, void *argp)
 
     dec_log("SW decoder thread exiting (decoded=%d dropped=%d)\n",
             g_frames_decoded, g_frames_dropped);
+    sceKernelExitDeleteThread(0);
     return 0;
 }
 
@@ -950,9 +1170,10 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     /* Start decoder thread */
     g_frame_rb = rb;
     g_dec_running = 1;
+    int decoder_priority = decoder_thread_priority_for_mode();
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             SW_DECODER_THREAD_PRIORITY,
+                                             decoder_priority,
                                              128 * 1024,  /* 128KB stack for VFPU recon */
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
@@ -966,7 +1187,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
 
     g_decoder_ready = 1;
     dec_log("Decoder init OK (sw_pipeline active, priority=0x%02X batch=%d)\n",
-            SW_DECODER_THREAD_PRIORITY, DECODER_DRAIN_BATCH_LIMIT);
+            decoder_priority, DECODER_DRAIN_BATCH_LIMIT);
     return 0;
 }
 
@@ -982,15 +1203,33 @@ void sw_decoder_thread_shutdown(void)
 
     /* Wait for thread to finish */
     if (g_dec_thread_id >= 0) {
-        SceUInt timeout = 2000000; /* 2s */
+        const unsigned int PSP_THREAD_ALREADY_GONE = 0x80020198u;
+        SceUInt timeout = 500000; /* 500ms */
         int wait_ret = sceKernelWaitThreadEnd(g_dec_thread_id, &timeout);
         if (wait_ret < 0) {
-            dec_log("Decoder shutdown wait failed: 0x%08X, forcing terminate\n",
-                    (unsigned)wait_ret);
-            sceKernelTerminateThread(g_dec_thread_id);
-            sceKernelWaitThreadEnd(g_dec_thread_id, NULL);
+            if ((unsigned int)wait_ret == PSP_THREAD_ALREADY_GONE) {
+                dec_log("Decoder shutdown wait: thread already exited/deleted (0x%08X)\n",
+                        (unsigned)wait_ret);
+            } else {
+                dec_log("Decoder shutdown wait failed: 0x%08X, forcing terminate\n",
+                        (unsigned)wait_ret);
+                {
+                    int delete_ret = sceKernelTerminateDeleteThread(g_dec_thread_id);
+                    if (delete_ret < 0 &&
+                        (unsigned int)delete_ret != PSP_THREAD_ALREADY_GONE) {
+                        dec_log("Decoder terminate-delete failed: 0x%08X\n",
+                                (unsigned)delete_ret);
+                    }
+                }
+            }
+        } else {
+            int delete_ret = sceKernelDeleteThread(g_dec_thread_id);
+            if (delete_ret < 0 &&
+                (unsigned int)delete_ret != PSP_THREAD_ALREADY_GONE) {
+                dec_log("Decoder delete after wait failed: 0x%08X\n",
+                        (unsigned)delete_ret);
+            }
         }
-        sceKernelDeleteThread(g_dec_thread_id);
         g_dec_thread_id = -1;
     }
     if (g_dec_sema >= 0) {
@@ -1162,17 +1401,18 @@ void sw_decoder_thread_force_restart(void)
 
     /* 8. Start fresh decode thread */
     g_dec_running = 1;
+    int decoder_priority = decoder_thread_priority_for_mode();
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
-                                             SW_DECODER_THREAD_PRIORITY,
+                                             decoder_priority,
                                              128 * 1024,
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
     if (g_dec_thread_id >= 0) {
         sceKernelStartThread(g_dec_thread_id, 0, NULL);
         g_decoder_ready = 1;
-        dec_log("WATCHDOG: new decoder thread started (tid=0x%08X)\n",
-                (unsigned)g_dec_thread_id);
+        dec_log("WATCHDOG: new decoder thread started (tid=0x%08X priority=0x%02X)\n",
+                (unsigned)g_dec_thread_id, decoder_priority);
     } else {
         dec_log("WATCHDOG: CreateThread failed 0x%08X -- decoder offline\n",
                 (unsigned)g_dec_thread_id);
@@ -2003,9 +2243,9 @@ static void check_nal_for_sps_contract(const u8 *nal_data, int nal_len)
                 num_reorder_frames = (int)info.old_num_reorder_frames;
                 max_dec_frame_buffering = (int)info.old_max_dec_frame_buffering;
             }
-            if (max_num_ref_frames > 1 || profile_idc != 66 ||
+            if (max_num_ref_frames > 4 || profile_idc != 66 ||
                 (num_reorder_frames > 0) ||
-                (max_dec_frame_buffering > 1)) {
+                (max_dec_frame_buffering > 4)) {
                 ok = 0;
             }
             dec_log("SPS contract: profile=%u level=%u refs=%u reorder=%d dpb=%d ok=%d\n",
@@ -2077,7 +2317,7 @@ static void check_nal_for_sps_contract(const u8 *nal_data, int nal_len)
         goto sps_done;
 
 sps_done:
-    if (max_num_ref_frames > 1 || profile_idc != 66)
+    if (max_num_ref_frames > 4 || profile_idc != 66)
         ok = 0;
 
     dec_log("SPS contract: profile=%u level=%u refs=%u reorder=%d dpb=%d ok=%d\n",
@@ -2200,7 +2440,7 @@ static void check_nal_for_cabac(const u8 *nal_data, int nal_len)
 
                 if (entropy_flag) {
                     g_cabac_detected = 1;
-                    dec_log("CABAC DETECTED in PPS NAL -- warning screen will show\n");
+                    dec_log("CABAC DETECTED in PPS NAL -- telemetry only\n");
                 } else {
                     dec_log("PPS checked: CAVLC confirmed (entropy_coding_mode=0)\n");
                 }

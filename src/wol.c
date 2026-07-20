@@ -105,6 +105,8 @@ int wol_show_confirm(const char *host_name, const char *mac_str)
     int sent = 0;
     int toast_countdown = 0;
     const char *toast_text = "WOL Sent!";
+    extern volatile unsigned int g_remote_buttons;
+    extern volatile unsigned int g_remote_app_exit_request;
 
     /* Build the prompt line: "Wake HOSTNAME?" */
     char prompt[64];
@@ -113,6 +115,14 @@ int wol_show_confirm(const char *host_name, const char *mac_str)
 
     while (1) {
         sceCtrlPeekBufferPositive(&pad, 1);
+        pad.Buttons |= g_remote_buttons;
+        g_remote_buttons = 0;
+
+        if (g_remote_app_exit_request) {
+            wol_log("remote app-exit request while WOL dialog active\n");
+            diag_log_flush();
+            return 0;
+        }
 
         if (toast_countdown > 0) {
             /* ---- Toast phase — show "WOL Sent!" and count down ---- */

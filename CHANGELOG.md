@@ -8,6 +8,22 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ---
 
+## [1.4.0] - 2026-07-18
+
+### Decoders and Playback
+- Added full support and optimizations for H.264 CABAC streams. This allows smooth, stutter-free playback on hosts using AMD AMF encoders (which often force CABAC and ignore CAVLC requests).
+- Implemented a 3-slot RGBA ring buffer in the decoder to avoid frame memory/pointer contention between the presenter and the decoder thread.
+- Optimized 8x8 and 4x4 inverse discrete cosine transform (IDCT) code paths with DC-only sparse residual fast paths.
+- Skips redundant active-texture dcache writeback for Media Engine clean buffers.
+
+### Networking
+- Initialized Net Resolver and implemented DNS resolution support via `gethostbyname()` with a fallback to `inet_addr()`, fixing external IP and host connection issues (Issue #8).
+
+### Teardown and Resource Management
+- Implemented safe in-app teardown and graceful self-module unloading, avoiding black screen hangs on exit. Lingering process-owned threads, exit callback threads, and sockets are cleanly closed before memory unloads.
+
+---
+
 ## [1.3.0] - 2026-05-29
 
 ### Memory Stick Layout

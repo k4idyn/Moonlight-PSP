@@ -51,6 +51,8 @@ CXXFLAGS += -DDISABLE_DECODER_MT
 # improvement is significant — removes blocking artifacts at low bitrates.
 # Previously disabled (PSP_SKIP_DEBLOCKING) but re-enabled for quality.
 # CXXFLAGS += -DPSP_SKIP_DEBLOCKING
+CXXFLAGS += -DWELS_CABAC_INLINE_HOT
+CXXFLAGS += -DPSP_CABAC_LUMA_ONLY_DEBLOCK -DPSP_CABAC_PERF_BOUNDARY_DEBLOCK
 
 # PSP newlib has no pthread.h. Inject our shim via -include so every TU gets it
 # without requiring source modifications.
@@ -60,7 +62,10 @@ CXXFLAGS += -include codec/common/inc/psp_thread_shim.h
 CXXFLAGS += -I$(PSP_SDK_PATH)/include
 
 # OpenH264 internal includes
-INCFLAGS  = -Icodec/api/wels
+# NOTE: -I. MUST come first so our local pthread.h/semaphore.h intercepts
+# shadow the SDK's conflicting pthreads-embedded headers.
+INCFLAGS  = -I.
+INCFLAGS += -Icodec/api/wels
 INCFLAGS += -Icodec/common/inc
 INCFLAGS += -Icodec/decoder/core/inc
 INCFLAGS += -Icodec/decoder/plus/inc

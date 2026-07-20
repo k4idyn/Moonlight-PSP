@@ -104,6 +104,18 @@ typedef struct {
 int audio_thread_reserve_client_port(unsigned short *out_port);
 
 /**
+ * audio_thread_queue_external_rtp - Queue an audio RTP packet received by
+ * another UDP socket.
+ *
+ * Sunshine/Apollo can occasionally deliver Opus/FEC RTP to the video socket
+ * during endpoint learning. The video thread uses this narrow handoff for
+ * packets that are already identified as audio RTP from the audio server port.
+ *
+ * Returns: 0 if queued, negative if the packet was invalid or the queue was full.
+ */
+int audio_thread_queue_external_rtp(const void *packet, int len);
+
+/**
  * audio_thread_start_ping_only - Start the audio ping thread before RTSP PLAY
  *
  * Moonlight-common-c brings up the audio socket and ping path before PLAY so

@@ -3,6 +3,7 @@
  */
 
 #include <pspkernel.h>
+#include <pspmodulemgr.h>
 #include <pspdebug.h>
 #include <pspthreadman.h>
 #include <pspctrl.h>
@@ -57,6 +58,10 @@ static volatile int g_running = 1;
 volatile int me_running = 0;
 volatile int g_is_paired = 0;
 volatile int g_stream_status = 0;
+static SceUID g_callback_thread_id = -1;
+static SceUID g_exit_callback_id = -1;
+static volatile int g_exit_callback_seen = 0;
+static volatile int g_exit_callback_thread_stop = 0;
 
 /* Remote input via pspsh pokew — write PSP_CTRL_ bitmask to this address */
 volatile unsigned int g_remote_buttons = 0;
@@ -75,6 +80,8 @@ volatile int g_decode_paused = 0;
 /* Remote exit request — pspsh pokew 1 to immediately exit stream back to menu.
  * Avoids needing to hold Start+Select for 500ms, which is impossible via pokew. */
 volatile unsigned int g_remote_exit_request = 0;
+
+volatile unsigned int g_remote_app_exit_request = 0;
 
 /* Automation readiness flag — set when the first decoded frame reaches the
  * display path.  The test harness polls this tiny word instead of repeatedly
@@ -135,6 +142,7 @@ extern void abort_stream_to_menu(void);
 
 /* Decode-to-display latency timestamp (written by sw_decoder_thread) */
 extern volatile u32 g_last_frame_decode_us;
+extern volatile u32 g_decode_time_us;
 
 /* Removed legacy logging init */
 
@@ -142,6 +150,211 @@ extern volatile u32 g_last_frame_decode_us;
 #include "decode_flags.h"
 
 static int g_gu_active = 0;
+static void *s_entry_display_framebuf = NULL;
+static int s_entry_display_bufferwidth = 0;
+static int s_entry_display_pixelformat = 0;
+static int s_entry_display_valid = 0;
+#define PSP_DISPLAY_HEIGHT_PIXELS 272
+#define PSP_DISPLAY_MAX_STRIDE 512
+#define PSP_DISPLAY_MAX_COPY_BYTES (PSP_DISPLAY_MAX_STRIDE * PSP_DISPLAY_HEIGHT_PIXELS * 4)
+#define PSP_VRAM_UNCACHED_BASE ((u32)0x44000000u)
+#define CABAC_PRESENT_FINE_WAIT_US 10000U
+static unsigned char s_cabac_present_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64))) __attribute__((unused));
+
+static int cabac_present_pacing_enabled(void)
+{
+    return g_psp_config.cabacTestMode &&
+           g_psp_config.width > 0 &&
+           g_psp_config.width <= 480 &&
+           g_psp_config.height > 0 &&
+           g_psp_config.height <= 272 &&
+           g_psp_config.fps > 0 &&
+           g_psp_config.fps <= 60;
+}
+
+static int cabac_performance_video_only_mode(void)
+{
+    return g_psp_config.cabacTestMode &&
+           !g_psp_config.audioEnabled &&
+           g_psp_config.fps >= 30 &&
+           g_psp_config.width > 0 &&
+           g_psp_config.width <= 320 &&
+           g_psp_config.height > 0 &&
+           g_psp_config.height <= 180;
+}
+
+static u32 cabac_present_fine_wait_us(u32 interval_us)
+{
+    (void)interval_us;
+    return CABAC_PRESENT_FINE_WAIT_US;
+}
+
+static u32 cabac_present_resync_threshold_us(u32 interval_us)
+{
+    return interval_us;
+}
+
+static void cabac_store_pending_present_frame(void *incoming_frame,
+                                              int *pending_valid,
+                                              void **pending_frame)
+{
+    int copy_bytes;
+
+    if (!incoming_frame || !pending_valid || !pending_frame) {
+        return;
+    }
+
+    copy_bytes = FRAME_STRIDE * g_psp_config.height * PIXEL_SIZE;
+    if (copy_bytes <= 0 || copy_bytes > PSP_DISPLAY_MAX_COPY_BYTES) {
+        *pending_frame = incoming_frame;
+        *pending_valid = 1;
+        return;
+    }
+
+    *pending_frame = incoming_frame;
+    *pending_valid = 1;
+}
+
+static void *cabac_pace_present_frame(void *incoming_frame,
+                                      int video_started)
+{
+    static int s_enabled_prev = 0;
+    static int s_pending_valid = 0;
+    static void *s_pending_frame = NULL;
+    static u32 s_next_present_us = 0;
+    static u32 s_hold_count = 0;
+    static u32 s_replace_count = 0;
+    static u32 s_present_count = 0;
+    static u32 s_resync_count = 0;
+    int enabled = cabac_present_pacing_enabled();
+    u32 now_us;
+    u32 interval_us;
+    u32 fine_wait_us;
+    u32 resync_threshold_us;
+    void *present_frame = NULL;
+
+    if (!enabled) {
+        s_enabled_prev = 0;
+        s_pending_valid = 0;
+        s_pending_frame = NULL;
+        s_next_present_us = 0;
+        return incoming_frame;
+    }
+
+    now_us = sceKernelGetSystemTimeLow();
+    interval_us = 1000000U / (u32)g_psp_config.fps;
+    if (interval_us < 16666U) {
+        interval_us = 16666U;
+    }
+    fine_wait_us = cabac_present_fine_wait_us(interval_us);
+    resync_threshold_us = cabac_present_resync_threshold_us(interval_us);
+
+    if (!s_enabled_prev || !video_started) {
+        s_pending_valid = 0;
+        s_pending_frame = NULL;
+        s_next_present_us = 0;
+        s_enabled_prev = 1;
+    }
+
+    if (incoming_frame) {
+        if (s_pending_valid) {
+            s_replace_count++;
+            if (s_replace_count <= 4 || (s_replace_count % 120U) == 0) {
+                diag_log_write("PACE",
+                               "CABAC present replace pending frame count=%u",
+                               (unsigned)s_replace_count);
+            }
+        }
+        if (s_next_present_us == 0) {
+            s_next_present_us = now_us;
+        }
+    }
+
+    if (s_next_present_us == 0) {
+        s_next_present_us = now_us;
+    }
+
+    now_us = sceKernelGetSystemTimeLow();
+    if ((s32)(now_us - s_next_present_us) < 0) {
+        u32 wait_us = s_next_present_us - now_us;
+        s_hold_count++;
+        if (s_hold_count <= 4 || (s_hold_count % 120U) == 0) {
+            diag_log_write("PACE",
+                           "CABAC present hold wait=%uus interval=%uus count=%u",
+                           (unsigned)wait_us,
+                           (unsigned)interval_us,
+                           (unsigned)s_hold_count);
+        }
+        if (wait_us > fine_wait_us) {
+            if (incoming_frame) {
+                cabac_store_pending_present_frame(incoming_frame,
+                                                  &s_pending_valid,
+                                                  &s_pending_frame);
+            }
+            return NULL;
+        }
+        sceKernelDelayThread(wait_us);
+        now_us = sceKernelGetSystemTimeLow();
+        if ((s32)(now_us - s_next_present_us) < 0) {
+            if (incoming_frame) {
+                cabac_store_pending_present_frame(incoming_frame,
+                                                  &s_pending_valid,
+                                                  &s_pending_frame);
+            }
+            return NULL;
+        }
+    }
+
+    if (incoming_frame) {
+        s_pending_valid = 0;
+        s_pending_frame = NULL;
+        present_frame = incoming_frame;
+    } else if (s_pending_valid && s_pending_frame) {
+        s_pending_valid = 0;
+        present_frame = s_pending_frame;
+        s_pending_frame = NULL;
+    } else {
+        return NULL;
+    }
+
+    {
+        u32 late_us = now_us - s_next_present_us;
+        if (late_us > resync_threshold_us) {
+            s_resync_count++;
+            if (s_resync_count <= 8 || (s_resync_count % 120U) == 0) {
+                diag_log_write("PACE",
+                               "CABAC present resync late=%uus interval=%uus threshold=%uus count=%u",
+                               (unsigned)late_us,
+                               (unsigned)interval_us,
+                               (unsigned)resync_threshold_us,
+                               (unsigned)s_resync_count);
+            }
+        }
+    }
+
+    s_present_count++;
+    if (s_present_count <= 4 || (s_present_count % 120U) == 0) {
+        diag_log_write("PACE",
+                       "CABAC present frame interval=%uus count=%u",
+                       (unsigned)interval_us,
+                       (unsigned)s_present_count);
+    }
+
+    {
+        u32 deadline_us = s_next_present_us;
+        u32 late_us = now_us - deadline_us;
+        if (late_us > resync_threshold_us) {
+            s_next_present_us = now_us + interval_us;
+        } else {
+            s_next_present_us = deadline_us + interval_us;
+        }
+    }
+    return present_frame;
+}
+#define PSP_VRAM_ADDR_MASK     ((u32)0x001FFFFFu)
+#define MAIN_PRESENT_THREAD_PRIORITY 0x1A
+static unsigned char s_entry_display_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64)));
+static int s_entry_display_copy_bytes = 0;
 #define PSP_MBEDTLS_HEAP_BYTES (1024 * 1024)
 static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((aligned(16)));
 static int s_mbedtls_heap_ready = 0;
@@ -156,6 +369,240 @@ static void LOG(const char *fmt, ...) {
 #endif
 }
 
+static int moonlight_main_exit_to_psplink(const char *reason);
+static void moonlight_main_prepare_psplink_prompt_framebuffer(void);
+void moonlight_main_prepare_for_process_exit(void);
+void moonlight_main_mark_exitgame_pending(void);
+int moonlight_main_notify_exit_callback(void);
+static void moonlight_main_shutdown_exit_callback_thread(void);
+
+static int moonlight_main_display_bpp(int pixelformat)
+{
+    if (pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+        return 4;
+    }
+    if (pixelformat >= PSP_DISPLAY_PIXEL_FORMAT_565 &&
+        pixelformat <= PSP_DISPLAY_PIXEL_FORMAT_4444) {
+        return 2;
+    }
+    return 0;
+}
+
+static void *moonlight_main_display_cpu_addr(void *topaddr)
+{
+    u32 addr = (u32)topaddr;
+    return (void *)(PSP_VRAM_UNCACHED_BASE + (addr & PSP_VRAM_ADDR_MASK));
+}
+
+static void moonlight_main_capture_entry_display(void)
+{
+    void *topaddr = NULL;
+    int bufferwidth = 0;
+    int pixelformat = 0;
+    int bpp;
+    int ret;
+
+    ret = sceDisplayGetFrameBuf(&topaddr, &bufferwidth, &pixelformat,
+                                PSP_DISPLAY_SETBUF_IMMEDIATE);
+    bpp = moonlight_main_display_bpp(pixelformat);
+    if (ret == 0 && bufferwidth > 0 &&
+        bufferwidth <= PSP_DISPLAY_MAX_STRIDE && bpp > 0) {
+        int copy_bytes = bufferwidth * PSP_DISPLAY_HEIGHT_PIXELS * bpp;
+        s_entry_display_framebuf = topaddr;
+        s_entry_display_bufferwidth = bufferwidth;
+        s_entry_display_pixelformat = pixelformat;
+        s_entry_display_valid = 1;
+        if (copy_bytes > 0 && copy_bytes <= (int)sizeof(s_entry_display_copy)) {
+            void *src = moonlight_main_display_cpu_addr(topaddr);
+            memcpy(s_entry_display_copy, src, (size_t)copy_bytes);
+            s_entry_display_copy_bytes = copy_bytes;
+        }
+    }
+
+    diag_log_write("MAIN", "entry display capture ret=0x%08X valid=%d fb=0x%08X bw=%d fmt=%d copy=%d\n",
+                   (unsigned)ret,
+                   s_entry_display_valid,
+                   (unsigned)s_entry_display_framebuf,
+                   s_entry_display_bufferwidth,
+                   s_entry_display_pixelformat,
+                   s_entry_display_copy_bytes);
+    diag_log_flush();
+}
+
+static void moonlight_promote_main_present_thread(void)
+{
+    SceUID tid = sceKernelGetThreadId();
+    int ret = sceKernelChangeThreadPriority(tid, MAIN_PRESENT_THREAD_PRIORITY);
+    diag_log_write("MAIN", "main presentation priority set tid=0x%08X priority=0x%02X ret=0x%08X\n",
+                   (unsigned)tid,
+                   MAIN_PRESENT_THREAD_PRIORITY,
+                   (unsigned)ret);
+}
+
+void moonlight_main_mark_exitgame_pending(void)
+{
+    diag_log_write("MAIN", "process-exit exitgame mark begin\n");
+    diag_log_flush();
+    g_running = 0;
+    g_remote_buttons = 0;
+    g_remote_analog_active = 0;
+    g_remote_exit_request = 0;
+    g_remote_app_exit_request = 0;
+    diag_log_write("MAIN", "process-exit exitgame mark complete\n");
+    diag_log_flush();
+}
+
+int moonlight_main_notify_exit_callback(void)
+{
+    int ret;
+
+    if (g_exit_callback_id < 0) {
+        diag_log_write("MAIN", "process-exit callback notify unavailable (cbid=%d)\n",
+                       (int)g_exit_callback_id);
+        diag_log_flush();
+        return 0;
+    }
+
+    ret = sceKernelNotifyCallback(g_exit_callback_id, 0x4D4C);
+    diag_log_write("MAIN", "process-exit callback notify cbid=0x%08X ret=0x%08X\n",
+                   (unsigned)g_exit_callback_id,
+                   (unsigned)ret);
+    diag_log_flush();
+    return ret == 0;
+}
+
+static void moonlight_main_shutdown_exit_callback_thread(void)
+{
+    SceUID tid = g_callback_thread_id;
+    int wake_ret = 0;
+    int wait_ret = 0;
+
+    g_exit_callback_thread_stop = 1;
+
+    if (tid < 0 || tid == sceKernelGetThreadId()) {
+        diag_log_write("MAIN", "process-exit callback thread shutdown skipped tid=0x%08X\n",
+                       (unsigned)tid);
+        diag_log_flush();
+        return;
+    }
+
+    wake_ret = sceKernelWakeupThread(tid);
+    {
+        SceUInt timeout = 250000;
+        wait_ret = sceKernelWaitThreadEnd(tid, &timeout);
+    }
+
+    if (wait_ret < 0) {
+        int term_ret = sceKernelTerminateDeleteThread(tid);
+        diag_log_write("MAIN", "process-exit callback thread forced stop tid=0x%08X wake=0x%08X wait=0x%08X term=0x%08X\n",
+                       (unsigned)tid,
+                       (unsigned)wake_ret,
+                       (unsigned)wait_ret,
+                       (unsigned)term_ret);
+    } else {
+        diag_log_write("MAIN", "process-exit callback thread stopped tid=0x%08X wake=0x%08X wait=0x%08X\n",
+                       (unsigned)tid,
+                       (unsigned)wake_ret,
+                       (unsigned)wait_ret);
+    }
+
+    g_callback_thread_id = -1;
+    g_exit_callback_id = -1;
+    diag_log_flush();
+}
+
+static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
+{
+    diag_log_write("MAIN", "process-exit framebuffer handoff begin\n");
+    diag_log_flush();
+
+    if (g_gu_active) {
+        sceGuDisplay(GU_FALSE);
+        sceGuTerm();
+        g_gu_active = 0;
+    }
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDisplayWaitVblankStart();
+    sceDisplaySetMode(0, 480, 272);
+    pspDebugScreenInit();
+    pspDebugScreenSetXY(0, 0);
+    if (s_entry_display_valid) {
+        int ret;
+        if (s_entry_display_copy_bytes > 0) {
+            void *dst = moonlight_main_display_cpu_addr(s_entry_display_framebuf);
+            memcpy(dst, s_entry_display_copy, (size_t)s_entry_display_copy_bytes);
+            sceKernelDcacheWritebackInvalidateAll();
+            diag_log_write("MAIN", "process-exit restored entry framebuffer pixels bytes=%d cpu=0x%08X\n",
+                           s_entry_display_copy_bytes,
+                           (unsigned)dst);
+        }
+        ret = sceDisplaySetFrameBuf(s_entry_display_framebuf,
+                                    s_entry_display_bufferwidth,
+                                    s_entry_display_pixelformat,
+                                    PSP_DISPLAY_SETBUF_IMMEDIATE);
+        diag_log_write("MAIN", "process-exit restored entry framebuffer fb=0x%08X bw=%d fmt=%d ret=0x%08X\n",
+                       (unsigned)s_entry_display_framebuf,
+                       s_entry_display_bufferwidth,
+                       s_entry_display_pixelformat,
+                       (unsigned)ret);
+    } else {
+        diag_log_write("MAIN", "process-exit no entry framebuffer captured; leaving display buffer unchanged\n");
+    }
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDisplayWaitVblankStart();
+
+    diag_log_write("MAIN", "process-exit framebuffer handoff complete\n");
+    diag_log_flush();
+}
+
+static int moonlight_main_exit_to_psplink(const char *reason)
+{
+    const char *why = reason ? reason : "unspecified";
+
+    diag_log_write("MAIN", "top-level process exit begin reason=%s\n", why);
+    diag_log_flush();
+
+    if (!moonlight_prepare_process_exit()) {
+        diag_log_write("MAIN", "top-level process exit blocked reason=%s\n", why);
+        diag_log_flush();
+        return 0;
+    }
+
+#ifndef RETAIL_BUILD
+    moonlight_main_shutdown_exit_callback_thread();
+    moonlight_main_prepare_psplink_prompt_framebuffer();
+    diag_log_write("MAIN", "process exit: sceKernelSelfStopUnloadModule handoff reason=%s\n", why);
+    diag_log_flush();
+    sceKernelDelayThread(50000);
+    sceKernelSelfStopUnloadModule(1, 0, NULL);
+    diag_log_write("MAIN", "process exit: self-stop-unload returned unexpectedly reason=%s\n", why);
+    diag_log_flush();
+    return 1;
+#else
+    diag_log_write("MAIN", "top-level sceKernelExitGame handoff reason=%s\n", why);
+    diag_log_flush();
+    sceKernelDelayThread(50000);
+    sceKernelExitGame();
+    diag_log_write("MAIN", "top-level sceKernelExitGame returned unexpectedly reason=%s\n", why);
+    diag_log_flush();
+    return 1;
+#endif
+}
+
+void moonlight_main_prepare_for_process_exit(void)
+{
+    diag_log_write("MAIN", "process-exit main prepare begin\n");
+    diag_log_flush();
+    g_running = 0;
+    g_remote_buttons = 0;
+    g_remote_analog_active = 0;
+    g_remote_exit_request = 0;
+    g_remote_app_exit_request = 0;
+    diag_log_write("MAIN", "process-exit main prepare complete\n");
+    diag_log_flush();
+}
+
 static void halt_with_error(const char *step_name, int error_code) {
     SceCtrlData pad; sceGuTerm(); g_gu_active = 0; pspDebugScreenInit();
 #ifdef RETAIL_BUILD
@@ -167,7 +614,7 @@ static void halt_with_error(const char *step_name, int error_code) {
 #endif
     sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     while (1) { sceCtrlPeekBufferPositive(&pad, 1); if (pad.Buttons != 0) break; sceKernelDelayThread(50 * 1000); }
-    sceKernelExitGame();
+    moonlight_main_exit_to_psplink("fatal error");
 }
 
 static void setup_callbacks(void);
@@ -176,6 +623,7 @@ int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
     diag_log_clear();
+    moonlight_main_capture_entry_display();
     if (!s_mbedtls_heap_ready) {
         mbedtls_memory_buffer_alloc_init(s_mbedtls_heap, sizeof(s_mbedtls_heap));
         s_mbedtls_heap_ready = 1;
@@ -188,11 +636,13 @@ int main(int argc, char *argv[]) {
     diag_log_write("MAIN", "[REMOTE] g_remote_analog_ly at 0x%08X\n", (unsigned int)&g_remote_analog_ly);
     diag_log_write("MAIN", "[REMOTE] g_decode_paused at 0x%08X\n", (unsigned int)&g_decode_paused);
     diag_log_write("MAIN", "[REMOTE] g_remote_exit_request at 0x%08X\n", (unsigned int)&g_remote_exit_request);
+    diag_log_write("MAIN", "[REMOTE] g_remote_app_exit_request at 0x%08X\n", (unsigned int)&g_remote_app_exit_request);
     diag_log_write("MAIN", "[REMOTE] g_stream_ready_flag at 0x%08X\n", (unsigned int)&g_stream_ready_flag);
     diag_log_flush();  /* Force flush so automation can read addresses immediately */
     /* No-op legacy log_open removed */
     sceDisplaySetMode(0, 480, 272);
     display_init(); g_gu_active = 1;
+    moonlight_promote_main_present_thread();
     ret = ui_manager_init();
     if (ret < 0) { LOG("[STEP 0d] ui_manager_init() failed\n"); halt_with_error("UI Manager", ret); return ret; }
     LOG("[PROTO] generation=%d, clientVersion=%d\n", MOONLIGHT_PROTOCOL_GENERATION, MOONLIGHT_CLIENT_VERSION);
@@ -246,6 +696,12 @@ host_select_loop:
             diag_log_write("UI", "HOST back_to_settings t=%u\n", sceKernelGetSystemTimeLow() / 1000);
             host_discovery_shutdown();
             goto settings_menu_entry;
+        }
+        if (host_ret == -4) {
+            diag_log_write("UI", "HOST requested process exit t=%u\n",
+                           sceKernelGetSystemTimeLow() / 1000);
+            moonlight_main_exit_to_psplink("host discovery");
+            return 0;
         }
         if (host_ret >= 0) { selected_host = host_discovery_get_selected(); break; }
     }
@@ -312,7 +768,7 @@ host_select_loop:
                    (unsigned)(s_stream_ram_start_largest / 1024));
 
     extern int g_audio_rtsp_ok;
-    if (g_audio_rtsp_ok) {
+    if (g_audio_rtsp_ok && g_psp_config.audioEnabled) {
         int audio_ret;
         diag_log_write("MAIN", "Initializing audio thread...\n");
         audio_ret = audio_thread_init(selected_host_ip);
@@ -326,8 +782,10 @@ host_select_loop:
             skip_rescan = 1;
             goto host_select_loop;
         }
+    } else if (g_audio_rtsp_ok) {
+        diag_log_write("MAIN", "Audio disabled: keeping RTSP ping-only path; skipping RTP drain/decode/playback\n");
     } else {
-        diag_log_write("MAIN", "Skipping audio init (RTSP audio SETUP failed)\n");
+        diag_log_write("MAIN", "Skipping audio init (no RTSP audio transport)\n");
     }
 
     diag_log_write("MAIN", "Initializing shared memory (~%uKB)...\n",
@@ -375,6 +833,22 @@ host_select_loop:
     telemetry_reset();
     {
         int signal_bitrate_kbps = signal_strength_get_launch_bitrate_kbps(g_psp_config.bitrate);
+        int ri = g_psp_config.resolutionIndex;
+        int stream_w = 0;
+        int stream_h = 0;
+        if (ri >= 0 && ri < RESOLUTION_COUNT) {
+            stream_w = RESOLUTION_WIDTHS[ri];
+            stream_h = RESOLUTION_HEIGHTS[ri];
+        }
+        if (g_psp_config.cabacTestMode &&
+            g_psp_config.audioEnabled &&
+            stream_w == 480 && stream_h == 272 &&
+            g_psp_config.fps <= 10 &&
+            signal_bitrate_kbps > 192) {
+            diag_log_write("SIG", "CABAC quality signal cap: %d -> 192 kbps\n",
+                           signal_bitrate_kbps);
+            signal_bitrate_kbps = 192;
+        }
         signal_strength_init(signal_bitrate_kbps);
     }
     power_handler_init();
@@ -433,6 +907,38 @@ host_select_loop:
         }
 
         SceCtrlData pad; void *frame = NULL;
+        unsigned int remote_buttons_snapshot = g_remote_buttons;
+
+        if (g_remote_app_exit_request) {
+            diag_log_write("INP", "Remote app exit request detected before frame work\n");
+            diag_log_flush();
+            g_remote_app_exit_request = 0;
+            g_remote_buttons = 0;
+            moonlight_main_exit_to_psplink("remote app exit");
+            return 0;
+        }
+        if (g_remote_exit_request) {
+            diag_log_write("INP", "Remote exit request detected before frame work\n");
+            diag_log_flush();
+            g_remote_exit_request = 0;
+            g_remote_buttons = 0;
+            abort_stream_to_menu();
+            memset(&g_shared, 0, sizeof(g_shared));
+            skip_rescan = 1;
+            goto host_select_loop;
+        }
+        if (!g_decode_paused &&
+            (remote_buttons_snapshot & PSP_CTRL_START) &&
+            (remote_buttons_snapshot & PSP_CTRL_SELECT)) {
+            diag_log_write("INP", "Remote Start+Select exit request detected before frame work\n");
+            diag_log_flush();
+            g_remote_buttons = 0;
+            abort_stream_to_menu();
+            memset(&g_shared, 0, sizeof(g_shared));
+            skip_rescan = 1;
+            goto host_select_loop;
+        }
+
         /* Race-safe ring buffer drain: rely solely on head != tail.
          * The old 'frame_ready' flag had a TOCTOU race: consumer could
          * clear it to 0 right after producer set it to 1, losing a frame
@@ -459,145 +965,29 @@ host_select_loop:
         static int s_fps_frame_count = 0;
         static float s_display_fps = 0.0f;
         static int s_latency_avg_ms = 0;
+        int cabac_detected = decoder_is_cabac_detected();
 
-        /* CABAC warning dialog: show once per stream when CABAC entropy
-         * coding is detected.  User can accept the risk (choppy decode)
-         * or go back to the app list to switch encoder settings. */
+        /* CABAC detection is telemetry-only here. Release readiness must come
+         * from making this path playable, not from rejecting it after startup. */
         {
-            static int s_cabac_choice = 0; /* 0=not shown, 1=continue, 2=back */
-            static int s_cabac_prompt_logged = 0;
-            static u32 s_cabac_notice_start_us = 0;
+            static int s_cabac_detect_logged = 0;
 
-            /* Auto-reset when a new stream starts (g_cabac_detected resets to 0
-             * in sw_decoder_thread_init, so the first frames have it == 0). */
-            if (!decoder_is_cabac_detected()) {
-                s_cabac_choice = 0;
-                s_cabac_prompt_logged = 0;
-                s_cabac_notice_start_us = 0;
-            }
-
-            if (decoder_is_cabac_detected() && !s_cabac_prompt_logged) {
-                diag_log_write("CABAC", "CABAC detected while cabacTestMode=%d -- showing warning dialog\n",
+            if (!cabac_detected) {
+                s_cabac_detect_logged = 0;
+            } else if (!s_cabac_detect_logged) {
+                diag_log_write("CABAC", "CABAC detected while cabacTestMode=%d -- continuing\n",
                                g_psp_config.cabacTestMode ? 1 : 0);
-                s_cabac_prompt_logged = 1;
+                s_cabac_detect_logged = 1;
             }
 
-            if (decoder_is_cabac_detected() && s_cabac_choice == 0) {
-                /* Gate decoder + audio: stop processing until user confirms */
-                g_cabac_dialog_active = 1;
-
-                if (!g_psp_config.cabacTestMode) {
-                    u32 now_us = sceKernelGetSystemTimeLow();
-                    if (s_cabac_notice_start_us == 0) {
-                        s_cabac_notice_start_us = now_us;
-                    }
-
-                    ui_begin_frame();
-                    ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
-                    ui_draw_header("PSP Moonlight");
-
-                    {
-                        int pw = 360, ph = 120;
-                        int px = (UI_SCREEN_W - pw) / 2;
-                        int py = (UI_SCREEN_H - ph) / 2 - 10;
-                        int bd = 2;
-                        ui_set_blend(1);
-                        ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
-                        ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
-                        ui_set_blend(0);
-
-                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
-                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using unsupported CABAC entropy coding.");
-                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "PSP v1.0 requires CAVLC for stable playback.");
-                        ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Returning to the host menu. Fix the host encoder and retry.");
-                    }
-
-                    ui_draw_footer_hint("Normal mode rejects CABAC streams");
-                    ui_end_frame();
-
-                    if ((now_us - s_cabac_notice_start_us) < 1200000) {
-                        sceKernelDelayThread(50 * 1000);
-                    } else {
-                        diag_log_write("CABAC", "CABAC in normal mode -- auto-aborting stream\n");
-                        s_cabac_choice = 2;
-                    }
-                } else {
-
-                    /* Drain any stale button presses before accepting input */
-                    {
-                        SceCtrlData drain;
-                        do {
-                            sceCtrlPeekBufferPositive(&drain, 1);
-                            sceKernelDelayThread(16 * 1000);
-                        } while (drain.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE));
-                    }
-
-                    {
-                        SceCtrlData cpd, cprev;
-                        memset(&cprev, 0, sizeof(cprev));
-
-                        while (1) {
-                            sceCtrlPeekBufferPositive(&cpd, 1);
-                            cpd.Buttons |= g_remote_buttons; g_remote_buttons = 0;
-
-                            ui_begin_frame();
-                            ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
-                            ui_draw_header("PSP Moonlight");
-
-                            int pw = 360, ph = 120;
-                            int px = (UI_SCREEN_W - pw) / 2;
-                            int py = (UI_SCREEN_H - ph) / 2 - 10;
-                            int bd = 2;
-                            ui_set_blend(1);
-                            ui_draw_rect_rounded(px, py, pw, ph, 12, UI_COL_BORDER_FOC);
-                            ui_draw_rect_rounded(px + bd, py + bd, pw - 2*bd, ph - 2*bd, 12 - bd, UI_COL_PANEL_DARK);
-                            ui_set_blend(0);
-
-                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 30), UI_COL_TEXT, "CABAC Encoding Detected");
-                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 54), UI_COL_TEXT_DIM, "Server is using CABAC entropy coding.");
-                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 72), UI_COL_TEXT_DIM, "PSP v1.0 requires CAVLC for stable playback.");
-                            ui_draw_text_centered((float)px, (float)pw, (float)(py + 90), UI_COL_TEXT_DIM, "Continue only for testing, or go back and fix the host encoder.");
-
-                            ui_draw_footer_hint("{X}: Continue Anyway    {O}: Back");
-                            ui_end_frame();
-
-                            int cx = (cpd.Buttons & PSP_CTRL_CROSS) && !(cprev.Buttons & PSP_CTRL_CROSS);
-                            int co = (cpd.Buttons & PSP_CTRL_CIRCLE) && !(cprev.Buttons & PSP_CTRL_CIRCLE);
-
-                            if (cx) {
-                                diag_log_write("CABAC", "User chose CONTINUE with CABAC\n");
-                                s_cabac_choice = 1;
-                                break;
-                            }
-                            if (co) {
-                                diag_log_write("CABAC", "User chose BACK — aborting stream\n");
-                                s_cabac_choice = 2;
-                                break;
-                            }
-
-                            cprev = cpd;
-                            sceKernelDelayThread(50 * 1000);
-                        }
-                    }
-                }
-
-                /* Un-gate decoder + audio now that user has decided */
-                g_cabac_dialog_active = 0;
-                s_cabac_notice_start_us = 0;
-
-                if (s_cabac_choice == 2) {
-                    abort_stream_to_menu();
-                    memset(&g_shared, 0, sizeof(g_shared));
-                    s_cabac_choice = 0;  /* Reset for next stream */
-                    skip_rescan = 1;
-                    goto host_select_loop;
-                }
-            }
+            g_cabac_dialog_active = 0;
         }
 
         /* G-1: Poll input BEFORE display for minimum latency.
          * Input is sampled and sent at the earliest point in the frame. */
         if (video_started && !hud_is_visible()) input_poll_and_send();
+
+        frame = cabac_pace_present_frame(frame, video_started);
 
         if (frame) {
             if (!video_started) { g_stream_ready_flag = 1; diag_log_write("MAIN", "First video frame displayed\n"); diag_log_flush(); s_fps_last_us = sceKernelGetSystemTimeLow(); }
@@ -611,9 +1001,10 @@ host_select_loop:
             {
                 static u32 s_pace_count = 0;
                 u32 decode_ts = g_last_frame_decode_us;
+                int cabac_clocked_present = cabac_present_pacing_enabled();
                 if (decode_ts > 0) {
                     u32 age_us = sceKernelGetSystemTimeLow() - decode_ts;
-                    if (age_us < 4000) {
+                    if (!cabac_clocked_present && age_us < 4000) {
                         sceDisplayWaitVblankStart();
                         s_pace_count++;
                         if (s_pace_count <= 3 || (s_pace_count % 500) == 0) {
@@ -626,7 +1017,7 @@ host_select_loop:
 
             display_frame(frame);
             s_disp_count++;
-            s_idle_count = 0;  /* Reset idle counter — stream is active */
+            s_idle_count = 0;  /* Reset idle counter for new decoded content. */
             s_fps_frame_count++;
             /* Per-frame decode-to-display latency (rolling average) */
             {
@@ -655,23 +1046,21 @@ host_select_loop:
              *   default → every ~15s (900 frames) */
             {
                 static int s_credit_counter = 0;
+                ConnQualityState cq = control_stream_get_quality();
+                int restore_threshold = 900;
                 s_credit_counter++;
-                {
-                    ConnQualityState cq = control_stream_get_quality();
-                    int restore_threshold = 900;
-                    if (cq.fec_recovery_pct > 90)
-                        restore_threshold = 600;
-                    else if (cq.fec_recovery_pct < 70)
-                        restore_threshold = 1200;
-                    if (s_credit_counter >= restore_threshold) {
-                        s_credit_counter = 0;
-                        if (s_watchdog_restarts > 0) {
-                            s_watchdog_restarts--;
-                            diag_log_write("MAIN", "[WDG] credit restored (%d/5 used, fec=%u%%)",
-                                           s_watchdog_restarts, (unsigned)cq.fec_recovery_pct);
-                        }
-                        s_mode_b_soft_count = 0;
+                if (cq.fec_recovery_pct > 90)
+                    restore_threshold = 600;
+                else if (cq.fec_recovery_pct < 70)
+                    restore_threshold = 1200;
+                if (s_credit_counter >= restore_threshold) {
+                    s_credit_counter = 0;
+                    if (s_watchdog_restarts > 0) {
+                        s_watchdog_restarts--;
+                        diag_log_write("MAIN", "[WDG] credit restored (%d/5 used, fec=%u%%)",
+                                       s_watchdog_restarts, (unsigned)cq.fec_recovery_pct);
                     }
+                    s_mode_b_soft_count = 0;
                 }
             }
         } else if (video_started) {
@@ -846,11 +1235,12 @@ host_select_loop:
             /* B-4: Watchdog for ctrl_ping thread hang */
             {
                 extern volatile u32 g_ctrl_ping_heartbeat_us;
-                if (g_ctrl_ping_heartbeat_us != 0) {
-                    u32 ctrl_elapsed = sceKernelGetSystemTimeLow() - g_ctrl_ping_heartbeat_us;
+                u32 ctrl_heartbeat_us = g_ctrl_ping_heartbeat_us;
+                if (ctrl_heartbeat_us != 0) {
+                    u32 now_us = sceKernelGetSystemTimeLow();
+                    u32 ctrl_elapsed = now_us - ctrl_heartbeat_us;
                     if (ctrl_elapsed > 5000000) { /* 5s without ping */
                         static u32 s_last_ctrl_stall_log_us = 0;
-                        u32 now_us = sceKernelGetSystemTimeLow();
                         if (s_last_ctrl_stall_log_us == 0 ||
                             (now_us - s_last_ctrl_stall_log_us) >= 1000000) {
                             s_last_ctrl_stall_log_us = now_us;
@@ -940,7 +1330,7 @@ host_select_loop:
                 s_fps_frame_count = 0;
                 s_fps_last_us = now_us;
 #ifndef RETAIL_BUILD
-                update_hud_stats = 1;
+                update_hud_stats = video_started;
 #endif
                 if (update_hud_stats) {
                     HudStats hs;
@@ -1101,7 +1491,7 @@ host_select_loop:
         }
 
         sceCtrlPeekBufferPositive(&pad, 1);
-        unsigned int remote_buttons_snapshot = g_remote_buttons;
+        remote_buttons_snapshot |= g_remote_buttons;
         pad.Buttons |= remote_buttons_snapshot;  /* inject; cleared after input_poll_and_send */
 
         /* Remote exit request — single pokew triggers immediate stream exit */
@@ -1175,14 +1565,27 @@ host_select_loop:
         /* Periodic log flush — ensures buffered decode timing data reaches disk */
         { static int flush_ctr = 0; if (++flush_ctr >= 300) { diag_log_flush(); flush_ctr = 0; } }
 
-        if (frame || !video_started || decoder_is_cabac_detected()) {
+        if (frame || !video_started) {
             hud_render(); display_frame_finish();
         } else if (hud_overlay_visible()) {
             /* No new frame but HUD is open — re-blit last video frame so
              * the HUD can composite on top without double-buffer flashing. */
-            display_frame_repeat(); hud_render(); display_frame_finish();
+            if (cabac_performance_video_only_mode()) {
+                static int s_cabac_hud_idle_hold_logged = 0;
+                if (!s_cabac_hud_idle_hold_logged) {
+                    diag_log_write("GPU", "CABAC performance HUD idle hold path enabled");
+                    s_cabac_hud_idle_hold_logged = 1;
+                }
+                sceDisplayWaitVblankStart();
+            } else {
+                display_frame_repeat(); hud_render(); display_frame_finish();
+            }
         } else if (hud_closed_this_loop) {
-            display_frame_repeat(); display_frame_finish();
+            if (cabac_performance_video_only_mode()) {
+                sceDisplayWaitVblankStart();
+            } else {
+                display_frame_repeat(); display_frame_finish();
+            }
         } else {
             sceDisplayWaitVblankStart();
         }
@@ -1195,7 +1598,7 @@ host_select_loop:
         }
     }
 
-    exit_to_xmb();
+    moonlight_main_exit_to_psplink("main loop fallthrough");
     return 0;
 }
 
@@ -1207,7 +1610,10 @@ static int exit_callback(int arg1, int arg2, void *common) {
     g_remote_buttons = 0;
     g_remote_analog_active = 0;
     g_remote_exit_request = 0;
-    exit_to_xmb();
+    g_remote_app_exit_request = 0;
+    g_exit_callback_seen = 1;
+
+    moonlight_main_exit_to_psplink("exit callback");
     return 0;
 }
 
@@ -1221,18 +1627,37 @@ int module_stop(SceSize args, void *argp)
     g_remote_buttons = 0;
     g_remote_analog_active = 0;
     g_remote_exit_request = 0;
-    wifi_keepalive_abort();
-    network_me_abort();
-    control_stream_abort();
-    return 0;
+    g_remote_app_exit_request = 0;
+    {
+        int prepared;
+        diag_log_write("MAIN", "module_stop requested; running bounded app cleanup\n");
+        diag_log_flush();
+        prepared = moonlight_prepare_process_exit();
+        me_running = 0;
+        g_stream_status = 0;
+        moonlight_main_shutdown_exit_callback_thread();
+        moonlight_main_prepare_psplink_prompt_framebuffer();
+        diag_log_write("MAIN", "module_stop cleanup result=%d\n", prepared);
+        diag_log_flush();
+        return prepared ? 0 : 1;
+    }
 }
 static int callback_thread(SceSize args, void *argp) {
-    int cbid = sceKernelCreateCallback("Exit Callback", exit_callback, NULL);
-    if (cbid >= 0) sceKernelRegisterExitCallback(cbid);
-    while (1) sceKernelSleepThreadCB();
+    (void)args;
+    (void)argp;
+    g_exit_callback_id = sceKernelCreateCallback("Exit Callback", exit_callback, NULL);
+    if (g_exit_callback_id >= 0) sceKernelRegisterExitCallback(g_exit_callback_id);
+    while (!g_exit_callback_thread_stop) sceKernelSleepThreadCB();
+    if (g_exit_callback_id >= 0) {
+        sceKernelDeleteCallback(g_exit_callback_id);
+        g_exit_callback_id = -1;
+    }
+    g_callback_thread_id = -1;
+    sceKernelExitDeleteThread(0);
     return 0;
 }
 static void setup_callbacks(void) {
-    SceUID thid = sceKernelCreateThread("update_thread", callback_thread, 0x20, 0xFA0, 0, NULL);
-    if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
+    g_exit_callback_thread_stop = 0;
+    g_callback_thread_id = sceKernelCreateThread("update_thread", callback_thread, 0x20, 0xFA0, 0, NULL);
+    if (g_callback_thread_id >= 0) sceKernelStartThread(g_callback_thread_id, 0, NULL);
 }

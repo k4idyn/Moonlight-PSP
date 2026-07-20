@@ -27,6 +27,7 @@
 #include "shared.h"
 #include "runtime_telemetry.h"
 #include "hud.h"
+#include "diag_log.h"
 
 /* Unified resolution table — single source of truth for stream dimensions */
 #include "stream_resolution.h"
@@ -34,6 +35,7 @@
 /* Use g_psp_config for stream resolution (GPU upscale sub-native res) */
 #include "settings_menu.h"
 extern PspConfig g_psp_config;
+extern int oh264_frame_is_me_clean(const void *frame);
 
 /* ------------------------------------------------------------------ *
  * Constants — matches PSPdisp's graphic.h proven values
@@ -61,6 +63,15 @@ static const ScePspIMatrix4 s_video_dither_matrix __attribute__((aligned(16))) =
     {  3, -1,  2, -2 }
 };
 
+static int display_cabac_perf_direct_hud_texture(void)
+{
+    return g_psp_config.cabacTestMode &&
+           !g_psp_config.audioEnabled &&
+           g_psp_config.fps >= 30 &&
+           g_psp_config.width <= 320 &&
+           g_psp_config.height <= 180;
+}
+
 /* Stable frame storage is only needed while the HUD is compositing over
  * repeated video. The normal stream path can hand decoded buffers directly to
  * the GE, avoiding a per-frame CPU memcpy of the full texture stride. */
@@ -78,6 +89,17 @@ static void *display_prepare_frame_texture(void *frame_data,
 
     if (frame_data == (void *)s_last_frame_copy && s_last_frame_copy_valid) {
         s_last_frame_data = s_last_frame_copy;
+        return frame_data;
+    }
+
+    if (hud_overlay_visible() && display_cabac_perf_direct_hud_texture()) {
+        static int s_direct_hud_logged = 0;
+        if (!s_direct_hud_logged) {
+            diag_log_write("GPU", "CABAC performance HUD direct texture path enabled");
+            s_direct_hud_logged = 1;
+        }
+        s_last_frame_data = frame_data;
+        s_last_frame_copy_valid = 0;
         return frame_data;
     }
 
@@ -309,9 +331,12 @@ void display_frame(void *frame_data)
     if (!frame_data)
         return;
 
-    /* Only the active texture rows need to be visible to the GE. The old
-     * whole-cache writeback evicted hot decoder/network state every frame. */
-    sceKernelDcacheWritebackRange(frame_data, tex_stride * src_h * 4);
+    /* ME-produced RGBA buffers were already written by the ME and invalidated
+     * before returning to the display path. Avoid re-scanning the active
+     * texture every frame; CPU-owned HUD/copy/fallback buffers still write back. */
+    if (!oh264_frame_is_me_clean(frame_data)) {
+        sceKernelDcacheWritebackRange(frame_data, tex_stride * src_h * 4);
+    }
 
     gpu_start_us = sceKernelGetSystemTimeLow();
 

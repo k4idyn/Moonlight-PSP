@@ -1,6 +1,6 @@
 # UI Flow Reference
 
-This document describes the implemented UI flow of PSP Moonlight v1.3.0.
+This document describes the implemented UI flow of PSP Moonlight v1.4.0.
 
 All screen coordinates are in native PSP resolution: 480x272.
 

@@ -67,9 +67,8 @@ typedef struct {
  *   Balanced:    360x204 @20fps @480kbps p1200, audio enabled, still stress-only.
  *   Quality:     480x272 @10fps @576kbps p1200, audio enabled, native requirement.
  *
- *   Audio Disabled is client-side low work: keep audio RTSP keepalive,
- *   drain/drop audio RTP, and skip Opus/SRC/playback. It is not zero-RTP
- *   without explicit server support.
+ *   Audio Disabled keeps the RTSP audio SETUP/ping path for host liveness,
+ *   then skips local audio RTP drain, Opus/SRC decode, and playback.
  *
  *   NOTE: non-30:17 sizes are not presets because they can introduce bars,
  *   aspect distortion, or host-side padding. Sunshine also rejects very small

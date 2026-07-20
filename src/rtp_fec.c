@@ -121,6 +121,20 @@ static u32 g_fec_percentage = 0;
 static int g_frame_submitted = 0;
 static int g_initialized = 0;
 
+/* CABAC decode can drain RTP faster than PSP WiFi delivers reordered parity.
+ * Hold the next frame briefly in FEC order instead of declaring the previous
+ * frame unrecoverable as soon as a newer frame's first packet arrives. Wider
+ * windows added latency without improving survival on hardware. */
+#define CABAC_DEFERRED_PACKET_LIMIT 24
+#define CABAC_DEFERRED_FRAME_SPAN_MAX 1U
+static u32 s_deferred_frame = 0xFFFFFFFF;
+static u32 s_deferred_count = 0;
+static u32 s_deferred_overflow_count = 0;
+static u8  s_deferred_packets[CABAC_DEFERRED_PACKET_LIMIT][MAX_PKT_SIZE];
+static u16 s_deferred_lengths[CABAC_DEFERRED_PACKET_LIMIT];
+static u8  s_deferred_replay_packet[MAX_PKT_SIZE];
+static int s_replaying_deferred = 0;
+
 /* Last FEC status echoed to server — used by CTRL PING piggyback */
 volatile u16 g_fec_last_highest_seq     = 0;
 volatile u16 g_fec_last_next_contig_seq = 0;
@@ -188,6 +202,9 @@ static void reset_frame_receive_status(void);
 static void update_fec_status_cache(void);
 static void maybe_send_fec_status(void);
 static void mark_frame_packet_received(u32 index, int is_data_packet);
+static int rtp_fec_add_packet_inner(const u8 *packet, int packet_len,
+                                    int allow_defer);
+static void drain_deferred_cabac_packets(void);
 #ifndef RETAIL_BUILD
 static void log_frame_receive_mask(u32 missing_data_packets);
 static void log_late_frame_packet(u32 frame_index,
@@ -213,6 +230,9 @@ void rtp_fec_init(void)
     }
     reset_frame_receive_status();
     g_current_frame = 0xFFFFFFFF;
+    s_deferred_frame = 0xFFFFFFFF;
+    s_deferred_count = 0;
+    s_replaying_deferred = 0;
     g_initialized = 1;
     g_consecutive_frame_drops = 0;
     diag_log_write("FEC", "initialized\n");
@@ -248,6 +268,9 @@ void rtp_fec_reset(void)
     g_fec_percentage = 0;
     g_frame_submitted = 0;
     g_fec_recovery_clean = 0;
+    s_deferred_frame = 0xFFFFFFFF;
+    s_deferred_count = 0;
+    s_replaying_deferred = 0;
     s_consec_unrecoverable = 0;
     g_consecutive_frame_drops = 0;
     memset(s_pred_window, 0, sizeof(s_pred_window));
@@ -319,6 +342,192 @@ static void mark_frame_packet_received(u32 index, int is_data_packet)
         g_received_data_count++;
     else
         g_received_parity_count++;
+}
+
+static u32 packet_frame_index(const u8 *packet, int packet_len)
+{
+    int data_offset = FIXED_RTP_HEADER_SIZE;
+    const u8 *nv;
+
+    if (!packet || packet_len < FIXED_RTP_HEADER_SIZE + NV_VIDEO_PKT_SIZE)
+        return 0xFFFFFFFF;
+
+    if (packet[0] & RTP_FLAG_EXTENSION) {
+        if (packet_len < data_offset + 4)
+            return 0xFFFFFFFF;
+        data_offset += 4;
+    }
+
+    if (packet_len < data_offset + NV_VIDEO_PKT_SIZE)
+        return 0xFFFFFFFF;
+
+    nv = packet + data_offset;
+    return read_le32(nv + 4);
+}
+
+static void refresh_deferred_front_frame(void)
+{
+    if (s_deferred_count == 0) {
+        s_deferred_frame = 0xFFFFFFFF;
+        return;
+    }
+
+    s_deferred_frame = packet_frame_index(s_deferred_packets[0],
+                                          s_deferred_lengths[0]);
+}
+
+static u32 count_missing_current_data_packets(void)
+{
+    u32 missing = 0;
+    u32 i;
+
+    for (i = 0; i < g_data_packets && i < FEC_MAX_PACKETS; i++) {
+        if (!g_slots[i].received)
+            missing++;
+    }
+
+    return missing;
+}
+
+static int current_frame_needs_cabac_defer(void)
+{
+    u32 missing;
+
+    if (!g_psp_config.cabacTestMode ||
+        g_current_frame == 0xFFFFFFFF ||
+        g_frame_submitted ||
+        g_received_count == 0 ||
+        g_data_packets == 0) {
+        return 0;
+    }
+
+    if (g_num_fec_blocks > 1) {
+        int b;
+        for (b = 0; b < (int)g_num_fec_blocks; b++) {
+            fec_block_t *blk = &g_fec_blocks[b];
+            if (!blk->seen ||
+                blk->received_data_count < blk->data_packets ||
+                blk->received_count < blk->data_packets) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    missing = count_missing_current_data_packets();
+    if (missing == 0)
+        return 0;
+
+    if (g_received_count < g_data_packets)
+        return 1;
+
+    return g_received_parity_count < missing;
+}
+
+static int defer_cabac_newer_packet(const u8 *packet, int packet_len,
+                                    u32 frame_index)
+{
+    u32 span;
+
+    if (packet_len <= 0 || packet_len > MAX_PKT_SIZE)
+        return 0;
+
+    if (s_deferred_count == 0)
+        s_deferred_frame = frame_index;
+
+    span = (g_current_frame != 0xFFFFFFFF &&
+            (s32)(frame_index - g_current_frame) > 0) ?
+           (u32)(frame_index - g_current_frame) : 0U;
+
+    if (span == 0U ||
+        span > CABAC_DEFERRED_FRAME_SPAN_MAX ||
+        s_deferred_count >= CABAC_DEFERRED_PACKET_LIMIT) {
+        s_deferred_overflow_count++;
+#ifndef RETAIL_BUILD
+        if (s_deferred_overflow_count <= 3 ||
+            (s_deferred_overflow_count % 60) == 0) {
+            diag_log_write("FEC",
+                           "CABAC defer window full/span cur=%u new=%u span=%u pendingFrame=%u pending=%u overflow=%u\n",
+                           g_current_frame, frame_index, span,
+                           s_deferred_frame, s_deferred_count,
+                           s_deferred_overflow_count);
+        }
+#endif
+        return 0;
+    }
+
+    memcpy(s_deferred_packets[s_deferred_count], packet, packet_len);
+    s_deferred_lengths[s_deferred_count] = (u16)packet_len;
+    s_deferred_count++;
+
+#ifndef RETAIL_BUILD
+    if (s_deferred_count <= 3 || s_deferred_count == CABAC_DEFERRED_PACKET_LIMIT) {
+        diag_log_write("FEC",
+                       "CABAC deferred newer packet frame=%u while completing frame=%u span=%u pending=%u recv=%u/%u dataRecv=%u parityRecv=%u\n",
+                       frame_index, g_current_frame, span, s_deferred_count,
+                       g_received_count, g_data_packets,
+                       g_received_data_count, g_received_parity_count);
+    }
+#endif
+    return 1;
+}
+
+static void drop_submitted_deferred_frame_packets(void)
+{
+    while (s_deferred_count > 0 &&
+           g_frame_submitted &&
+           s_deferred_frame == g_current_frame) {
+        u32 i;
+        for (i = 1; i < s_deferred_count; i++) {
+            memcpy(s_deferred_packets[i - 1],
+                   s_deferred_packets[i],
+                   s_deferred_lengths[i]);
+            s_deferred_lengths[i - 1] = s_deferred_lengths[i];
+        }
+        s_deferred_count--;
+        refresh_deferred_front_frame();
+    }
+}
+
+static void drain_deferred_cabac_packets(void)
+{
+    if (s_replaying_deferred)
+        return;
+
+    s_replaying_deferred = 1;
+    while (s_deferred_count > 0) {
+        int can_replay = 0;
+        int replay_len;
+        u32 i;
+
+        drop_submitted_deferred_frame_packets();
+        if (s_deferred_count == 0)
+            break;
+
+        if (g_current_frame == 0xFFFFFFFF ||
+            g_frame_submitted ||
+            s_deferred_frame == g_current_frame) {
+            can_replay = 1;
+        }
+        if (!can_replay)
+            break;
+
+        replay_len = (int)s_deferred_lengths[0];
+        memcpy(s_deferred_replay_packet, s_deferred_packets[0], replay_len);
+        for (i = 1; i < s_deferred_count; i++) {
+            memcpy(s_deferred_packets[i - 1],
+                   s_deferred_packets[i],
+                   s_deferred_lengths[i]);
+            s_deferred_lengths[i - 1] = s_deferred_lengths[i];
+        }
+        s_deferred_count--;
+        refresh_deferred_front_frame();
+
+        (void)rtp_fec_add_packet_inner(s_deferred_replay_packet,
+                                       replay_len,
+                                       0);
+    }
+    s_replaying_deferred = 0;
 }
 
 #ifndef RETAIL_BUILD
@@ -831,6 +1040,10 @@ static void submit_frame_packets(void)
 
     /* Per-frame FEC log silenced for performance */
     g_frame_submitted = 1;
+
+    if (g_num_fec_blocks <= 1 && g_total_packets > 0) {
+        rtp_reassembly_note_fec_frame_complete((u16)(g_lowest_seq + g_total_packets));
+    }
 
     /* Periodic FEC summary every ~30s (900 frames at 30fps) */
 #ifndef RETAIL_BUILD
@@ -1463,7 +1676,8 @@ static void attempt_recovery_and_submit(void)
 
 /* ── Main packet processing ──────────────────────────────────────── */
 
-int rtp_fec_add_packet(const u8 *packet, int packet_len)
+static int rtp_fec_add_packet_inner(const u8 *packet, int packet_len,
+                                    int allow_defer)
 {
     /* Guard: auto-init if caller forgot rtp_fec_init() */
     if (!g_initialized)
@@ -1588,7 +1802,22 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
     }
 
     /* Frame transition — if new frame, submit previous and reset */
+process_frame_transition:
     if (frame_index != g_current_frame) {
+        if (allow_defer &&
+            frame_index > g_current_frame &&
+            current_frame_needs_cabac_defer()) {
+            if (defer_cabac_newer_packet(packet, packet_len, frame_index)) {
+                return 1;
+            }
+
+            if (g_current_frame != 0xFFFFFFFF && !g_frame_submitted && g_received_count > 0) {
+                attempt_recovery_and_submit();
+            }
+            drain_deferred_cabac_packets();
+            goto process_frame_transition;
+        }
+
         if (g_current_frame != 0xFFFFFFFF && !g_frame_submitted && g_received_count > 0) {
             attempt_recovery_and_submit();
         }
@@ -1722,6 +1951,20 @@ int rtp_fec_add_packet(const u8 *packet, int packet_len)
     }
 
     return 1; /* consumed by FEC layer */
+}
+
+int rtp_fec_add_packet(const u8 *packet, int packet_len)
+{
+    int consumed;
+
+    if (!g_initialized)
+        rtp_fec_init();
+
+    drain_deferred_cabac_packets();
+    consumed = rtp_fec_add_packet_inner(packet, packet_len, 1);
+    drain_deferred_cabac_packets();
+
+    return consumed;
 }
 
 /*============================================================================
