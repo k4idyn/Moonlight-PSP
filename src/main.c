@@ -698,8 +698,30 @@ settings_menu_entry:
                 goto settings_menu_entry;
             }
             if (ret < 0) {
-                halt_with_error("Wi-Fi", ret);
-                return -1;
+                char err_msg[64];
+                snprintf(err_msg, sizeof(err_msg), "Connection failed (0x%08X)", (unsigned int)ret);
+                while (1) {
+                    SceCtrlData pad;
+                    sceCtrlPeekBufferPositive(&pad, 1);
+                    if (pad.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_START)) {
+                        /* Wait for button release */
+                        while (1) {
+                            sceCtrlPeekBufferPositive(&pad, 1);
+                            if (!(pad.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_START))) break;
+                            sceKernelDelayThread(10000);
+                        }
+                        break;
+                    }
+                    ui_begin_frame();
+                    ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
+                    ui_draw_header("Wi-Fi Setup");
+                    ui_draw_text_centered(0.0f, 480.0f, 105.0f, UI_COL_TEXT, err_msg);
+                    ui_draw_text_centered(0.0f, 480.0f, 141.0f, UI_COL_TEXT_DIM, "Verify your router security is set to WPA2/Open");
+                    ui_draw_text_centered(0.0f, 480.0f, 177.0f, UI_COL_TEXT_DIM, "Press Cross/Circle to return to settings");
+                    ui_end_frame();
+                    sceDisplayWaitVblankStart();
+                }
+                goto settings_menu_entry;
             }
         } else {
             diag_log_write("UI", "WiFi already connected, skipping netconf\n");
