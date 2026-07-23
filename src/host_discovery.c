@@ -490,6 +490,12 @@ static void mdnsDiscoverHosts(void)
 
     nb = 1;
     sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
+    {
+        struct timeval rcv_to;
+        rcv_to.tv_sec = 0;
+        rcv_to.tv_usec = 100000; /* 100ms max timeout per recv */
+        sceNetInetSetsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+    }
 
     /* Bind to port 5353 so we also receive multicast responses */
     memset(&bind_addr, 0, sizeof(bind_addr));

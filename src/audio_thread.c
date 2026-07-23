@@ -2470,7 +2470,7 @@ int audio_thread_init(const char *host_ip)
     /* --- Recv/decode thread (fills ring buffer) --- */
     {
         int recv_prio = g_psp_config.audioEnabled ? 0x1A : 0x21;
-        int recv_stack = g_psp_config.audioEnabled ? (64 * 1024) : (16 * 1024);
+        int recv_stack = g_psp_config.audioEnabled ? (32 * 1024) : (16 * 1024);
         if (!g_psp_config.audioEnabled) {
             audio_log("[AUDIO] disabled: low-priority UDP drain/ping thread\n");
         }

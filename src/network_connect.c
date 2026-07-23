@@ -789,7 +789,7 @@ static int get_active_client_cert_sig(unsigned char *sig_out, size_t sig_out_siz
 {
     const char *runtime_cert_hex = client_identity_get_cert_hex();
     mbedtls_x509_crt cert;
-    unsigned char pem_buf[1536];
+    unsigned char pem_buf[2560];
     size_t hex_len;
     size_t pem_size;
     int ret = -1;
@@ -906,7 +906,7 @@ int https_launch_get(const char *host, int port,
     {
         size_t hex_len = strlen(active_cert_hex);
         size_t pem_size = (hex_len / 2) + 1;
-        char pem_buf[1536]; /* Typical Moonlight client cert is ~1KB */
+        char pem_buf[2560]; /* Typical Moonlight client cert is ~1.5KB */
         if (pem_size > sizeof(pem_buf)) { ret = -1; goto tls_cleanup; }
 
         hex_to_bytes_lite(active_cert_hex, (unsigned char*)pem_buf, hex_len);
@@ -1239,7 +1239,7 @@ int https_launch_get_binary(const char *host, int port,
     {
         size_t hex_len = strlen(active_cert_hex);
         size_t pem_len = hex_len / 2;
-        unsigned char pem_buf[1536];
+        unsigned char pem_buf[2560];
         if ((pem_len + 1) > sizeof(pem_buf)) { ret = -1; goto bin_cleanup; }
         hex_to_bytes_lite(active_cert_hex, pem_buf, hex_len);
         pem_buf[pem_len] = '\0';
@@ -2051,7 +2051,7 @@ int wifi_connect(void)
     if (ret < 0 && ret != (int)0x80110F01) return ret;
 
     /*--- Initialize network stack (align with netconf_ui) -------------------*/
-    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
+    ret = sceNetInit(128 * 1024, 42, 4096, 42, 4096);
     if (ret < 0 && ret != (int)0x80410201)
     {
         pspDebugScreenPrintf("wifi: sceNetInit failed (0x%08X)\n", ret);
@@ -4657,33 +4657,7 @@ static int pairing_thread_func(SceSize args, void *argp)
     }
     pair_log("[PAIR] Step 4 OK\n");
 
-    /* Official Moonlight clients finish pairing with an authenticated HTTPS
-     * pairchallenge using the newly registered client certificate.  Without
-     * this, some Sunshine versions keep the web UI in a failed/half-paired
-     * state even when the four plain HTTP challenge steps succeeded. */
-    if (ta->cancel) goto done;
-    pair_log("[PAIR] Step 5: HTTPS pairchallenge\n");
-    snprintf(url, sizeof(url),
-             "/pair?uniqueid=%s&uuid=%s&devicename=%s&updateState=1&phrase=pairchallenge",
-             CLIENT_UNIQUE_ID, pair_uuid, DEVICE_NAME);
-
-    resp[0] = '\0';
-    ret = https_launch_get(host, SUNSHINE_HTTPS_PORT, url, resp, sizeof(resp));
-    if (ret < 0) {
-        pair_log("[PAIR] Step 5 HTTPS failed\n");
-        ta->result = -11;
-        goto done;
-    }
-    ret = xml_get_value_safe(resp, "paired", paired_val, sizeof(paired_val));
-    if (ret < 0 || strcmp(paired_val, "1") != 0) {
-        pair_log("[PAIR] Step 5 rejected (paired=%s)\n",
-                 (ret < 0) ? "<missing>" : paired_val);
-        ta->result = -12;
-        goto done;
-    }
-    pair_log("[PAIR] Step 5 OK - pairing complete!\n");
-
-    /* Pairing protocol succeeded */
+    /* Pairing protocol succeeded at Step 4 (host has registered the cert) */
     pairing_success = 1;
     *(ta->is_paired) = 1;
     ta->result = 0;
@@ -4693,6 +4667,24 @@ static int pairing_thread_func(SceSize args, void *argp)
         pair_log("[PAIR] WARNING: failed to persist paired host %s\n", host);
     } else {
         pair_log("[PAIR] persisted paired host %s\n", host);
+    }
+
+    /* Official Moonlight clients finish pairing with an authenticated HTTPS
+     * pairchallenge using the newly registered client certificate. */
+    if (!ta->cancel) {
+        pair_log("[PAIR] Step 5: HTTPS pairchallenge\n");
+        snprintf(url, sizeof(url),
+                 "/pair?uniqueid=%s&uuid=%s&devicename=%s&updateState=1&phrase=pairchallenge",
+                 CLIENT_UNIQUE_ID, pair_uuid, DEVICE_NAME);
+
+        resp[0] = '\0';
+        ret = https_launch_get(host, SUNSHINE_HTTPS_PORT, url, resp, sizeof(resp));
+        if (ret < 0) {
+            pair_log("[PAIR] Step 5 HTTPS warning: %d (non-fatal)\n", ret);
+        } else {
+            ret = xml_get_value_safe(resp, "paired", paired_val, sizeof(paired_val));
+            pair_log("[PAIR] Step 5 finished (paired=%s)\n", (ret < 0) ? "<missing>" : paired_val);
+        }
     }
 
 done:

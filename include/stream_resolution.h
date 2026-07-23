@@ -29,12 +29,11 @@ extern "C" {
 #define PSP_LCD_HEIGHT      272
 #define PSP_LCD_STRIDE      512     /* VRAM pitch (power-of-2) */
 
-/* Active renderer path supports up to 1024 source width (2x512 pages) and
- * 512 source height (PSP GU max texture height without vertical tiling). */
+/* Active renderer path supports up to PSP LCD max resolution (480x272). */
 #define STREAM_MIN_WIDTH     300
 #define STREAM_MIN_HEIGHT    170
-#define STREAM_MAX_WIDTH    1024
-#define STREAM_MAX_HEIGHT    512
+#define STREAM_MAX_WIDTH     480
+#define STREAM_MAX_HEIGHT    272
 
 typedef struct {
     /* Base dimensions (from config) */

@@ -150,6 +150,7 @@ extern volatile u32 g_decode_time_us;
 #include "decode_flags.h"
 
 static int g_gu_active = 0;
+<<<<<<< Updated upstream
 static void *s_entry_display_framebuf = NULL;
 static int s_entry_display_bufferwidth = 0;
 static int s_entry_display_pixelformat = 0;
@@ -161,6 +162,11 @@ static int s_entry_display_valid = 0;
 #define CABAC_PRESENT_FINE_WAIT_US 10000U
 static unsigned char s_cabac_present_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64))) __attribute__((unused));
 
+=======
+#define PSP_DISPLAY_HEIGHT_PIXELS 272
+#define PSP_DISPLAY_MAX_STRIDE 512
+#define PSP_DISPLAY_MAX_COPY_BYTES (PSP_DISPLAY_MAX_STRIDE * PSP_DISPLAY_HEIGHT_PIXELS * 4)
+>>>>>>> Stashed changes
 static int cabac_present_pacing_enabled(void)
 {
     return g_psp_config.cabacTestMode &&
@@ -183,6 +189,10 @@ static int cabac_performance_video_only_mode(void)
            g_psp_config.height <= 180;
 }
 
+<<<<<<< Updated upstream
+=======
+#define CABAC_PRESENT_FINE_WAIT_US 10000U
+>>>>>>> Stashed changes
 static u32 cabac_present_fine_wait_us(u32 interval_us)
 {
     (void)interval_us;
@@ -351,10 +361,14 @@ static void *cabac_pace_present_frame(void *incoming_frame,
     }
     return present_frame;
 }
+<<<<<<< Updated upstream
 #define PSP_VRAM_ADDR_MASK     ((u32)0x001FFFFFu)
 #define MAIN_PRESENT_THREAD_PRIORITY 0x1A
 static unsigned char s_entry_display_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64)));
 static int s_entry_display_copy_bytes = 0;
+=======
+#define MAIN_PRESENT_THREAD_PRIORITY 0x1A
+>>>>>>> Stashed changes
 #define PSP_MBEDTLS_HEAP_BYTES (1024 * 1024)
 static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((aligned(16)));
 static int s_mbedtls_heap_ready = 0;
@@ -379,6 +393,7 @@ void moonlight_main_mark_exitgame_pending(void);
 int moonlight_main_notify_exit_callback(void);
 static void moonlight_main_shutdown_exit_callback_thread(void);
 
+<<<<<<< Updated upstream
 static int moonlight_main_display_bpp(int pixelformat)
 {
     if (pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
@@ -443,6 +458,8 @@ static void moonlight_promote_main_present_thread(void)
                    (unsigned)ret);
 }
 
+=======
+>>>>>>> Stashed changes
 void moonlight_main_mark_exitgame_pending(void)
 {
     diag_log_write("MAIN", "process-exit exitgame mark begin\n");
@@ -532,6 +549,7 @@ static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
     sceDisplaySetMode(0, 480, 272);
     pspDebugScreenInit();
     pspDebugScreenSetXY(0, 0);
+<<<<<<< Updated upstream
     if (s_entry_display_valid) {
         int ret;
         if (s_entry_display_copy_bytes > 0) {
@@ -554,6 +572,8 @@ static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
     } else {
         diag_log_write("MAIN", "process-exit no entry framebuffer captured; leaving display buffer unchanged\n");
     }
+=======
+>>>>>>> Stashed changes
     sceKernelDcacheWritebackInvalidateAll();
     sceDisplayWaitVblankStart();
 
@@ -575,6 +595,7 @@ static int moonlight_main_exit_to_psplink(const char *reason)
         return 0;
     }
 
+<<<<<<< Updated upstream
 #ifndef RETAIL_BUILD
     moonlight_main_shutdown_exit_callback_thread();
     moonlight_main_prepare_psplink_prompt_framebuffer();
@@ -586,6 +607,8 @@ static int moonlight_main_exit_to_psplink(const char *reason)
     diag_log_flush();
     return 1;
 #else
+=======
+>>>>>>> Stashed changes
     diag_log_write("MAIN", "top-level sceKernelExitGame handoff reason=%s\n", why);
     diag_log_flush();
     sceKernelDelayThread(50000);
@@ -593,7 +616,10 @@ static int moonlight_main_exit_to_psplink(const char *reason)
     diag_log_write("MAIN", "top-level sceKernelExitGame returned unexpectedly reason=%s\n", why);
     diag_log_flush();
     return 1;
+<<<<<<< Updated upstream
 #endif
+=======
+>>>>>>> Stashed changes
 }
 
 void moonlight_main_prepare_for_process_exit(void)
@@ -774,7 +800,7 @@ host_select_loop:
             ret = network_connect_all();
             connect_attempts++;
             if (ret >= 0) break;
-            if (ret == -2) break;  /* User cancelled — don't retry */
+            if (ret != -3) break;  /* Only retry RTSP session launch errors (-3), not pairing (-1) or cancel (-2) */
             if (connect_attempts >= MAX_CONNECT_ATTEMPTS) break;
             LOG("[STEP 4] Connection attempt %d failed (%d), retrying in 5s...\n",
                 connect_attempts, ret);
@@ -802,7 +828,7 @@ host_select_loop:
         audio_thread_shutdown();
         rtsp_session_close();
         network_connect_clear_retry_app();
-        skip_rescan = 1;  /* Keep cached host list — user can Square to rescan */
+        skip_rescan = 0;  /* Re-probe local network to rediscover host PC */
         goto host_select_loop;
     }
 

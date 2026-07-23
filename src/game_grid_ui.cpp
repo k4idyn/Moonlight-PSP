@@ -124,22 +124,6 @@ static void check_corruption(const char *loc) {
     }
 }
 
-static void set_desktop_fallback_tile(const char *reason)
-{
-    memset(s_tiles, 0, sizeof(s_tiles));
-    strncpy(s_tiles[0].title, "Desktop", sizeof(s_tiles[0].title) - 1);
-    s_tiles[0].title[sizeof(s_tiles[0].title) - 1] = '\0';
-    s_tiles[0].app_id = DESKTOP_FALLBACK_APP_ID;
-    s_tiles[0].bg_colour = k_tile_colours[0];
-    s_tiles[0].icon_rgb565 = NULL;
-    s_num_tiles = 1;
-    s_selected = 0;
-    s_state.scroll_curr = 0.0f;
-    s_state.focus_anim = 0.0f;
-    grid_log("Desktop fallback tile enabled after app-list failure (%s), appid=%d\n",
-             reason ? reason : "unknown", DESKTOP_FALLBACK_APP_ID);
-}
-
 static void update_animations(void) {
     /* Standard Wii-style Center Selection:
      * The scroll point is exactly the current integer selection index.
@@ -290,11 +274,11 @@ static void load_games_from_server(const char *host_ip)
         snprintf(msg, sizeof(msg), "game_list_fetch error: %d", ret);
         ui_begin_frame();
         ui_draw_gradient_bg(g_ui_bg_color, g_ui_bg_color);
-        ui_draw_error_modal("Failed to Load Games", msg, "Check host IP and Sunshine.   {O}: Back");
+        ui_draw_error_modal("Failed to Load Games", msg, "Check host IP and Sunshine.");
         ui_end_frame();
-        sceKernelDelayThread(3 * 1000 * 1000);
+        sceKernelDelayThread(2 * 1000 * 1000);
         s_fetch_error = 1;
-        set_desktop_fallback_tile("fetch");
+        s_num_tiles = 0;
         return;
     }
     s_fetch_error = 0;
@@ -352,6 +336,10 @@ extern "C" int game_grid_ui_run(const char *host_ip)
             s_cached_host[sizeof(s_cached_host) - 1] = '\0';
         }
         load_games_from_server(host_ip);
+
+        if (s_fetch_error) {
+            return -1;
+        }
 
         /* If server returned a VALID response with 0 apps (not a network
          * error) and we haven't already forced re-pair for this host,

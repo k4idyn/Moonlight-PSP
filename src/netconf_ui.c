@@ -60,18 +60,18 @@ int netconf_ui_run(void)
     diag_log_write("NET", "[NETCONF] load INET ret=0x%08X\n", (unsigned)ret);
     if (ret < 0 && ret != (int)0x80110F01) return ret;
 
-    /* Use a larger memory pool (128KB) and standard stack sizes (4KB).
-     * In Round 3, we make these non-fatal to avoid Permission errors if
-     * the stack was already half-initialized by another component. */
-    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
+    /* Use standard PSPSDK 128KB memory pool and 4KB stack sizes. */
+    ret = sceNetInit(128 * 1024, 42, 4096, 42, 4096);
     diag_log_write("NET", "[NETCONF] sceNetInit ret=0x%08X\n", (unsigned)ret);
-    if (ret >= 0) net_inited = 1;
+    if (ret >= 0 || ret == (int)0x80410201) net_inited = 1;
+
     ret = sceNetInetInit();
     diag_log_write("NET", "[NETCONF] sceNetInetInit ret=0x%08X\n", (unsigned)ret);
-    if (ret >= 0) inet_inited = 1;
+    if (ret >= 0 || ret == (int)0x80410701) inet_inited = 1;
+
     ret = sceNetApctlInit(0x2000, 42);
     diag_log_write("NET", "[NETCONF] sceNetApctlInit ret=0x%08X\n", (unsigned)ret);
-    if (ret >= 0) apctl_inited = 1;
+    if (ret >= 0 || ret == (int)0x80410B01) apctl_inited = 1;
 
     /* Build the dialog parameters ---------------------------------------- */
     memset(&netconf, 0, sizeof(netconf));
@@ -106,11 +106,11 @@ int netconf_ui_run(void)
         }
         if (status == PSP_UTILITY_DIALOG_NONE) break;
 
-        /* GU frame pump — PSP utility dialogs need this every iteration.
+        /* GU frame pump ??? PSP utility dialogs need this every iteration.
          * Required sequence (per PSP SDK):
-         *   sceGuStart → sceGuClear → sceGuFinish → sceGuSync
-         *   → sceUtilityXxxUpdate(1)   <- dialog renders itself here
-         *   → sceDisplayWaitVblankStart → sceGuSwapBuffers
+         *   sceGuStart ??? sceGuClear ??? sceGuFinish ??? sceGuSync
+         *   ??? sceUtilityXxxUpdate(1)   <- dialog renders itself here
+         *   ??? sceDisplayWaitVblankStart ??? sceGuSwapBuffers
          * Without the GU frame pump the dialog only gets updated at the
          * old sceKernelDelayThread rate (50 ms = 20 Hz) giving "slow motion".
          * The vblank wait replaces the old sleep and provides 60 Hz pacing. */
