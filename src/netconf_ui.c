@@ -125,8 +125,8 @@ int netconf_ui_run(void)
             sceUtilityNetconfShutdownStart();
         }
 
-        sceGuSwapBuffers();
         sceDisplayWaitVblankStart();
+        sceGuSwapBuffers();
     }
 
     /* -----------------------------------------------------------------------

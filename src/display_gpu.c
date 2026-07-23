@@ -427,8 +427,8 @@ void display_frame_finish(void)
 {
     sceGuFinish();
     sceGuSync(0, 0);
-    s_frame_buffer = sceGuSwapBuffers();
     sceDisplayWaitVblankStart();
+    s_frame_buffer = sceGuSwapBuffers();
 }
 
 /* ------------------------------------------------------------------ *

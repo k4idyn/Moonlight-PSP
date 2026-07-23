@@ -1506,7 +1506,7 @@ static int exit_callback(int arg1, int arg2, void *common) {
     g_remote_app_exit_request = 0;
     g_exit_callback_seen = 1;
 
-    moonlight_main_exit_to_psplink("exit callback");
+    sceKernelExitGame();
     return 0;
 }
 

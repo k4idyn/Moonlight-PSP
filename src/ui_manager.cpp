@@ -486,19 +486,6 @@ void ui_begin_frame(void)
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
     sceGuShadeModel(GU_FLAT);
 
-    /* Real hardware requires explicit back-buffer clearing every frame */
-    sceGuClear(GU_COLOR_BUFFER_BIT);
-
-    /* Sync the C-side texture-state tracker with the hardware state we
-     * just forced above.  Without this reset (set to 0 because we just
-     * called sceGuDisable), tex_disable/tex_enable guards will skip the
-     * actual sceGu calls on real hardware because they think the state
-     * is already what they want. */
-    s_tex_enabled = 0;
-
-    /* Reset the texture function to REPLACE every frame. */
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
-
     /* Clear the back buffer to solid black every frame. */
     sceGuClearColor(0xFF000000u);   /* ABGR: opaque black */
     sceGuClear(GU_COLOR_BUFFER_BIT);
@@ -519,8 +506,8 @@ void ui_end_frame(void)
 {
     sceGuFinish();
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-    sceGuSwapBuffers();
     sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
 }
 
 void ui_end_frame_no_swap(void)
@@ -831,7 +818,7 @@ void ui_draw_rect_rounded(int x, int y, int w, int h, int r, u32 color)
     if (r > w/2) r = w/2;
     if (r > h/2) r = h/2;
 
-    int rects[(3 + 4 * 140) * 4];
+    static int rects[(3 + 4 * 140) * 4];
     int count = 0;
 
 #define ADD_RECT(rx, ry, rw, rh) do { \
@@ -1731,11 +1718,13 @@ void ui_draw_texture_rgb565(int x, int y, int dw, int dh,
     sceGuDisable(GU_ALPHA_TEST);
     sceGuDisable(GU_STENCIL_TEST);
     sceGuDisable(GU_DEPTH_TEST);
-    sceGuEnable(GU_TEXTURE_2D);
+    tex_enable();
 
     sceGuDrawArray(GU_TRIANGLE_STRIP,
                    GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
                    4, NULL, v);
+
+    tex_disable();
 
     /* Textures are unclipped sharp rectangles.
        If we are focused, the game_grid_ui draws the glow ring BEHIND the texture
