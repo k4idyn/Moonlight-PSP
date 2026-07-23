@@ -519,8 +519,8 @@ void ui_end_frame(void)
 {
     sceGuFinish();
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-    sceDisplayWaitVblankStart();   /* wait BEFORE swap — eliminates flicker */
     sceGuSwapBuffers();
+    sceDisplayWaitVblankStart();
 }
 
 void ui_end_frame_no_swap(void)

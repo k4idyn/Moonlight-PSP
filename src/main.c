@@ -150,23 +150,9 @@ extern volatile u32 g_decode_time_us;
 #include "decode_flags.h"
 
 static int g_gu_active = 0;
-<<<<<<< Updated upstream
-static void *s_entry_display_framebuf = NULL;
-static int s_entry_display_bufferwidth = 0;
-static int s_entry_display_pixelformat = 0;
-static int s_entry_display_valid = 0;
 #define PSP_DISPLAY_HEIGHT_PIXELS 272
 #define PSP_DISPLAY_MAX_STRIDE 512
 #define PSP_DISPLAY_MAX_COPY_BYTES (PSP_DISPLAY_MAX_STRIDE * PSP_DISPLAY_HEIGHT_PIXELS * 4)
-#define PSP_VRAM_UNCACHED_BASE ((u32)0x44000000u)
-#define CABAC_PRESENT_FINE_WAIT_US 10000U
-static unsigned char s_cabac_present_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64))) __attribute__((unused));
-
-=======
-#define PSP_DISPLAY_HEIGHT_PIXELS 272
-#define PSP_DISPLAY_MAX_STRIDE 512
-#define PSP_DISPLAY_MAX_COPY_BYTES (PSP_DISPLAY_MAX_STRIDE * PSP_DISPLAY_HEIGHT_PIXELS * 4)
->>>>>>> Stashed changes
 static int cabac_present_pacing_enabled(void)
 {
     return g_psp_config.cabacTestMode &&
@@ -189,10 +175,7 @@ static int cabac_performance_video_only_mode(void)
            g_psp_config.height <= 180;
 }
 
-<<<<<<< Updated upstream
-=======
 #define CABAC_PRESENT_FINE_WAIT_US 10000U
->>>>>>> Stashed changes
 static u32 cabac_present_fine_wait_us(u32 interval_us)
 {
     (void)interval_us;
@@ -361,20 +344,10 @@ static void *cabac_pace_present_frame(void *incoming_frame,
     }
     return present_frame;
 }
-<<<<<<< Updated upstream
-#define PSP_VRAM_ADDR_MASK     ((u32)0x001FFFFFu)
 #define MAIN_PRESENT_THREAD_PRIORITY 0x1A
-static unsigned char s_entry_display_copy[PSP_DISPLAY_MAX_COPY_BYTES] __attribute__((aligned(64)));
-static int s_entry_display_copy_bytes = 0;
-=======
-#define MAIN_PRESENT_THREAD_PRIORITY 0x1A
->>>>>>> Stashed changes
 #define PSP_MBEDTLS_HEAP_BYTES (1024 * 1024)
 static unsigned char s_mbedtls_heap[PSP_MBEDTLS_HEAP_BYTES] __attribute__((aligned(16)));
 static int s_mbedtls_heap_ready = 0;
-
-/* Dynamic application directory resolved from argv[0] */
-char g_app_dir[512] = "ms0:/PSP/GAME/Moonlight";
 
 static void LOG(const char *fmt, ...) {
 #ifdef RETAIL_BUILD
@@ -393,73 +366,6 @@ void moonlight_main_mark_exitgame_pending(void);
 int moonlight_main_notify_exit_callback(void);
 static void moonlight_main_shutdown_exit_callback_thread(void);
 
-<<<<<<< Updated upstream
-static int moonlight_main_display_bpp(int pixelformat)
-{
-    if (pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
-        return 4;
-    }
-    if (pixelformat >= PSP_DISPLAY_PIXEL_FORMAT_565 &&
-        pixelformat <= PSP_DISPLAY_PIXEL_FORMAT_4444) {
-        return 2;
-    }
-    return 0;
-}
-
-static void *moonlight_main_display_cpu_addr(void *topaddr)
-{
-    u32 addr = (u32)topaddr;
-    return (void *)(PSP_VRAM_UNCACHED_BASE + (addr & PSP_VRAM_ADDR_MASK));
-}
-
-static void moonlight_main_capture_entry_display(void)
-{
-    void *topaddr = NULL;
-    int bufferwidth = 0;
-    int pixelformat = 0;
-    int bpp;
-    int ret;
-
-    ret = sceDisplayGetFrameBuf(&topaddr, &bufferwidth, &pixelformat,
-                                PSP_DISPLAY_SETBUF_IMMEDIATE);
-    bpp = moonlight_main_display_bpp(pixelformat);
-    if (ret == 0 && bufferwidth > 0 &&
-        bufferwidth <= PSP_DISPLAY_MAX_STRIDE && bpp > 0) {
-        int copy_bytes = bufferwidth * PSP_DISPLAY_HEIGHT_PIXELS * bpp;
-        s_entry_display_framebuf = topaddr;
-        s_entry_display_bufferwidth = bufferwidth;
-        s_entry_display_pixelformat = pixelformat;
-        s_entry_display_valid = 1;
-        if (copy_bytes > 0 && copy_bytes <= (int)sizeof(s_entry_display_copy)) {
-            void *src = moonlight_main_display_cpu_addr(topaddr);
-            memcpy(s_entry_display_copy, src, (size_t)copy_bytes);
-            s_entry_display_copy_bytes = copy_bytes;
-        }
-    }
-
-    diag_log_write("MAIN", "entry display capture ret=0x%08X valid=%d fb=0x%08X bw=%d fmt=%d copy=%d\n",
-                   (unsigned)ret,
-                   s_entry_display_valid,
-                   (unsigned)s_entry_display_framebuf,
-                   s_entry_display_bufferwidth,
-                   s_entry_display_pixelformat,
-                   s_entry_display_copy_bytes);
-    diag_log_flush();
-}
-
-static void moonlight_promote_main_present_thread(void)
-{
-    SceUID tid = sceKernelGetThreadId();
-    int ret = sceKernelChangeThreadPriority(tid, MAIN_PRESENT_THREAD_PRIORITY);
-    (void)ret;
-    diag_log_write("MAIN", "main presentation priority set tid=0x%08X priority=0x%02X ret=0x%08X\n",
-                   (unsigned)tid,
-                   MAIN_PRESENT_THREAD_PRIORITY,
-                   (unsigned)ret);
-}
-
-=======
->>>>>>> Stashed changes
 void moonlight_main_mark_exitgame_pending(void)
 {
     diag_log_write("MAIN", "process-exit exitgame mark begin\n");
@@ -549,31 +455,6 @@ static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
     sceDisplaySetMode(0, 480, 272);
     pspDebugScreenInit();
     pspDebugScreenSetXY(0, 0);
-<<<<<<< Updated upstream
-    if (s_entry_display_valid) {
-        int ret;
-        if (s_entry_display_copy_bytes > 0) {
-            void *dst = moonlight_main_display_cpu_addr(s_entry_display_framebuf);
-            memcpy(dst, s_entry_display_copy, (size_t)s_entry_display_copy_bytes);
-            sceKernelDcacheWritebackInvalidateAll();
-            diag_log_write("MAIN", "process-exit restored entry framebuffer pixels bytes=%d cpu=0x%08X\n",
-                           s_entry_display_copy_bytes,
-                           (unsigned)dst);
-        }
-        ret = sceDisplaySetFrameBuf(s_entry_display_framebuf,
-                                    s_entry_display_bufferwidth,
-                                    s_entry_display_pixelformat,
-                                    PSP_DISPLAY_SETBUF_IMMEDIATE);
-        diag_log_write("MAIN", "process-exit restored entry framebuffer fb=0x%08X bw=%d fmt=%d ret=0x%08X\n",
-                       (unsigned)s_entry_display_framebuf,
-                       s_entry_display_bufferwidth,
-                       s_entry_display_pixelformat,
-                       (unsigned)ret);
-    } else {
-        diag_log_write("MAIN", "process-exit no entry framebuffer captured; leaving display buffer unchanged\n");
-    }
-=======
->>>>>>> Stashed changes
     sceKernelDcacheWritebackInvalidateAll();
     sceDisplayWaitVblankStart();
 
@@ -595,20 +476,6 @@ static int moonlight_main_exit_to_psplink(const char *reason)
         return 0;
     }
 
-<<<<<<< Updated upstream
-#ifndef RETAIL_BUILD
-    moonlight_main_shutdown_exit_callback_thread();
-    moonlight_main_prepare_psplink_prompt_framebuffer();
-    diag_log_write("MAIN", "process exit: sceKernelSelfStopUnloadModule handoff reason=%s\n", why);
-    diag_log_flush();
-    sceKernelDelayThread(50000);
-    sceKernelSelfStopUnloadModule(1, 0, NULL);
-    diag_log_write("MAIN", "process exit: self-stop-unload returned unexpectedly reason=%s\n", why);
-    diag_log_flush();
-    return 1;
-#else
-=======
->>>>>>> Stashed changes
     diag_log_write("MAIN", "top-level sceKernelExitGame handoff reason=%s\n", why);
     diag_log_flush();
     sceKernelDelayThread(50000);
@@ -616,10 +483,6 @@ static int moonlight_main_exit_to_psplink(const char *reason)
     diag_log_write("MAIN", "top-level sceKernelExitGame returned unexpectedly reason=%s\n", why);
     diag_log_flush();
     return 1;
-<<<<<<< Updated upstream
-#endif
-=======
->>>>>>> Stashed changes
 }
 
 void moonlight_main_prepare_for_process_exit(void)
@@ -654,21 +517,7 @@ static void setup_callbacks(void);
 int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
-    
-    /* Resolve absolute application directory from argv[0] */
-    if (argc > 0 && argv[0] != NULL) {
-        char *last_slash = strrchr(argv[0], '/');
-        if (last_slash != NULL) {
-            size_t len = last_slash - argv[0];
-            if (len < sizeof(g_app_dir)) {
-                memcpy(g_app_dir, argv[0], len);
-                g_app_dir[len] = '\0';
-            }
-        }
-    }
-
     diag_log_clear();
-    moonlight_main_capture_entry_display();
     if (!s_mbedtls_heap_ready) {
         mbedtls_memory_buffer_alloc_init(s_mbedtls_heap, sizeof(s_mbedtls_heap));
         s_mbedtls_heap_ready = 1;
@@ -718,36 +567,7 @@ settings_menu_entry:
         if (apctl_state != 4) {
             ret = netconf_ui_run();
             diag_log_write("UI", "NETCONF returned %d\n", ret);
-            if (ret == -1) {
-                /* User cancelled the Wi-Fi setup; return to settings menu */
-                goto settings_menu_entry;
-            }
-            if (ret < 0) {
-                char err_msg[64];
-                snprintf(err_msg, sizeof(err_msg), "Connection failed (0x%08X)", (unsigned int)ret);
-                while (1) {
-                    SceCtrlData pad;
-                    sceCtrlPeekBufferPositive(&pad, 1);
-                    if (pad.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_START)) {
-                        /* Wait for button release */
-                        while (1) {
-                            sceCtrlPeekBufferPositive(&pad, 1);
-                            if (!(pad.Buttons & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_START))) break;
-                            sceKernelDelayThread(10000);
-                        }
-                        break;
-                    }
-                    ui_begin_frame();
-                    ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT);
-                    ui_draw_header("Wi-Fi Setup");
-                    ui_draw_text_centered(0.0f, 480.0f, 105.0f, UI_COL_TEXT, err_msg);
-                    ui_draw_text_centered(0.0f, 480.0f, 141.0f, UI_COL_TEXT_DIM, "Verify your router security is set to WPA2/Open");
-                    ui_draw_text_centered(0.0f, 480.0f, 177.0f, UI_COL_TEXT_DIM, "Press Cross/Circle to return to settings");
-                    ui_end_frame();
-                    sceDisplayWaitVblankStart();
-                }
-                goto settings_menu_entry;
-            }
+            if (ret < 0) { halt_with_error("Wi-Fi", -1); return -1; }
         } else {
             diag_log_write("UI", "WiFi already connected, skipping netconf\n");
         }
@@ -901,7 +721,6 @@ host_select_loop:
 
     diag_log_write("MAIN", "Control stream started. Entering main loop.\n");
     diag_log_flush();  /* Flush all handshake/setup logs to disk */
-    moonlight_promote_main_present_thread();
     safety_buffer_init();
     hud_init();
     telemetry_reset();

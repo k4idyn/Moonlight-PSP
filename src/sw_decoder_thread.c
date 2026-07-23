@@ -1174,11 +1174,7 @@ int sw_decoder_thread_init(FrameRingBuffer *rb)
     g_dec_thread_id = sceKernelCreateThread("sw_dec",
                                              sw_decoder_thread,
                                              decoder_priority,
-<<<<<<< Updated upstream
-                                             128 * 1024,  /* 128KB stack for VFPU recon */
-=======
                                              16 * 1024,   /* 16KB stack for decode loop */
->>>>>>> Stashed changes
                                              THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU,
                                              NULL);
     if (g_dec_thread_id < 0) {

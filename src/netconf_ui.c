@@ -16,7 +16,6 @@
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
-#include <pspnet_resolver.h>
 #include <pspdisplay.h>
 #include <pspgu.h>
 #include <string.h>
@@ -126,8 +125,8 @@ int netconf_ui_run(void)
             sceUtilityNetconfShutdownStart();
         }
 
-        sceDisplayWaitVblankStart();
         sceGuSwapBuffers();
+        sceDisplayWaitVblankStart();
     }
 
     /* -----------------------------------------------------------------------

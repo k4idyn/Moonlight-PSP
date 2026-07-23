@@ -24,12 +24,6 @@
 #include "stream_connect_ui.h"
 #include "ui_manager.h"
 
-<<<<<<< Updated upstream
-extern void wifi_disconnect(void);
-extern void display_shutdown(void);
-
-=======
->>>>>>> Stashed changes
 extern volatile int me_running;
 extern void sw_decoder_thread_shutdown(void);
 extern void network_me_shutdown(void);
@@ -133,12 +127,6 @@ int moonlight_prepare_process_exit(void)
     diag_log_flush();
     stream_connect_stop();
     wifi_keepalive_abort();
-<<<<<<< Updated upstream
-    wifi_disconnect();
-    ui_manager_shutdown();
-    display_shutdown();
-=======
->>>>>>> Stashed changes
     scePowerSetClockFrequency(222, 222, 111);
 
     g_stream_status = 0;
@@ -249,10 +237,6 @@ void abort_stream_to_menu(void)
 
     LOG_SESSION("TEARDOWN COMPLETE. Returning to host discovery menu\n");
     diag_log_flush();
-<<<<<<< Updated upstream
-    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 0x20);
-=======
->>>>>>> Stashed changes
     sceKernelDelayThread(50000);
 }
 
