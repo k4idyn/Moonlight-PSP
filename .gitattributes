@@ -1,0 +1,2 @@
+# Shell scripts must execute with Unix line endings on PSP SDK containers.
+*.sh text eol=lf
