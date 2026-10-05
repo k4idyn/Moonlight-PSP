@@ -36,6 +36,25 @@ void diag_log_set_debug(int enable)
 #endif
 }
 
+void diag_log_fatal(const char *step, int error_code, const char *detail)
+{
+    char line[768];
+    int len;
+    SceUID fd;
+    len = snprintf(line, sizeof(line),
+                   "Moonlight PSP v1.5\nStep: %s\nCode: 0x%08X\nFirmware: 0x%08X\n%s\n",
+                   step ? step : "Unknown", (unsigned)error_code,
+                   (unsigned)sceKernelDevkitVersion(), detail ? detail : "");
+    if (len < 0) return;
+    if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+    moonlight_storage_ensure_data_dir();
+    fd = sceIoOpen(MOONLIGHT_SAVE_ERROR_LOG_PATH,
+                   PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) return;
+    (void)sceIoWrite(fd, line, (SceSize)len);
+    sceIoClose(fd);
+}
+
 #ifndef RETAIL_BUILD
 
 /* ---------- paths ---------- */

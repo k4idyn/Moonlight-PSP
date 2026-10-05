@@ -274,7 +274,10 @@ int DisableMsLED(void)
 extern int sceMeBootStart660(int mode);
 int BootAvcMode(int mode)
 {
-    static int last_mode = 3;
+    /* A fresh helper has not established ownership of the firmware mode.
+     * The previous application/XMB can leave a different ME state behind.
+     * Cache only a boot that this helper actually completed. */
+    static int last_mode = -1;
     unsigned int version = sceKernelDevkitVersion(), k1;
     int ret;
     if ((version != 0x06060010 && version != 0x06060110) ||

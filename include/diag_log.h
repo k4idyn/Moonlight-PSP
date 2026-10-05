@@ -44,6 +44,9 @@ void diag_log_flush(void);
  */
 void diag_log_clear(void);
 
+/* Save one fatal error in every build, without verbose or stream-time I/O. */
+void diag_log_fatal(const char *step, int error_code, const char *detail);
+
 #if defined(RETAIL_BUILD) && !defined(DIAG_LOG_IMPLEMENTATION)
 #undef diag_log_set_debug
 #undef diag_log_write

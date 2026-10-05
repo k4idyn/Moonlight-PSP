@@ -30,7 +30,7 @@ EBOOT.PBP: ICON0.PNG PIC1.PNG
 # ============================================================================
 # Source Files
 # ============================================================================
-OBJS = src/main.o src/network_connect.o src/network_me.o \
+OBJS = src/main.o src/app_startup.o src/network_connect.o src/network_me.o \
        src/net_send.o \
        src/decoder_thread.o src/stream_resolution.o \
        src/upnp_client.o \

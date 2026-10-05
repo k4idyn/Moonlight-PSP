@@ -10,6 +10,11 @@ see the [archived repo](https://github.com/k4idyn/Moonlight-PSP).
 
 ## [1.5.0] - 2026-10-05
 
+### Application Startup
+- Load the adjacent Media Engine helper when launching from XMB.
+- Initialize the requested Media Engine mode when the helper starts fresh.
+- Show initialization errors with a readable code and save the last fatal error for bug reports.
+
 ### Decoders and Playback
 - Added Sony hardware AVC decoding with automatic CAVLC/Baseline and CABAC/Main selection.
 - Reduced video receive copies and added a six-slot output pool with clear frame ownership.

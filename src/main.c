@@ -23,6 +23,8 @@
 #include <mbedtls/memory_buffer_alloc.h>
 
 #include "shared.h"
+#include "app_startup.h"
+#include "storage_paths.h"
 #include "psp_avc_build.h"
 #if PSP_HARDWARE_AVC
 #include "psp_avc_player.h"
@@ -693,6 +695,12 @@ static int moonlight_main_exit_to_psplink(const char *reason)
         return 1;
     }
 #else
+    {
+        int helper_result = moonlight_startup_release_helper();
+        if (helper_result < 0)
+            diag_log_fatal("Release Media Engine helper", helper_result,
+                           moonlight_startup_helper_path());
+    }
     diag_log_write("MAIN", "top-level sceKernelExitGame handoff reason=%s\n", why);
     diag_log_flush();
     sceKernelDelayThread(50000);
@@ -717,17 +725,30 @@ void moonlight_main_prepare_for_process_exit(void)
 }
 
 static void halt_with_error(const char *step_name, int error_code) {
-    SceCtrlData pad; sceGuTerm(); g_gu_active = 0; pspDebugScreenInit();
-#ifdef RETAIL_BUILD
-    (void)step_name;
-    pspDebugScreenPrintf("Moonlight error\nCode: 0x%08X\nPress any button to exit...\n",
-                         (unsigned int)error_code);
-#else
-    LOG("\n=== FATAL ERROR ===\nStep : %s\nCode : 0x%08X (%d)\nPress any button to exit...\n", step_name, (unsigned int)error_code, error_code);
+    SceCtrlData pad;
+    int released = 0;
+    diag_log_fatal(step_name, error_code, moonlight_startup_helper_path());
+    if (g_gu_active) sceGuTerm();
+    g_gu_active = 0;
+    pspDebugScreenInit();
+    pspDebugScreenPrintf("Moonlight could not continue\n\nStep: %s\nCode: 0x%08X\n\n",
+                         step_name, (unsigned int)error_code);
+    if (strstr(step_name, "helper"))
+        pspDebugScreenPrintf("Place moonlight_me_helper.prx beside EBOOT.PBP.\n\n");
+    pspDebugScreenPrintf("Error file: PSP/SAVEDATA/Moonlight/error.log\n\nPress a button to exit.\n");
+    LOG("\n=== FATAL ERROR ===\nStep : %s\nCode : 0x%08X (%d)\n", step_name, (unsigned int)error_code, error_code);
     diag_log_flush();
-#endif
     sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    while (1) { sceCtrlPeekBufferPositive(&pad, 1); if (pad.Buttons != 0) break; sceKernelDelayThread(50 * 1000); }
+    /* The XMB launch button may still be held when startup fails. Require
+     * release and a new press so the error cannot vanish immediately. */
+    while (1) {
+        memset(&pad, 0, sizeof(pad));
+        if (sceCtrlPeekBufferPositive(&pad, 1) >= 0) {
+            if (!pad.Buttons) released = 1;
+            else if (released) break;
+        }
+        sceKernelDelayThread(50 * 1000);
+    }
     moonlight_main_exit_to_psplink("fatal error");
 }
 
@@ -831,6 +852,17 @@ int main(int argc, char *argv[]) {
     diag_log_clear();
     moonlight_main_capture_entry_display();
 #if PSP_HARDWARE_AVC
+#ifdef RETAIL_BUILD
+    /* PSPLink owns helper loading for diagnostics. XMB launches must load
+     * their adjacent helper before calling any of its weak imports. */
+    pspDebugScreenInit();
+    pspDebugScreenPrintf("Starting Moonlight...\n");
+    ret = moonlight_startup_load_helper(argc, argv);
+    if (ret < 0) {
+        halt_with_error(moonlight_startup_error_step(), ret);
+        return ret;
+    }
+#endif
     ret = loadConfig(&g_psp_config);
     diag_log_write("AVC", "entry config read result=%d cabac=%d firmware_main=%d dimensions=%dx%d",
                    ret,g_psp_config.cabacTestMode,
@@ -841,7 +873,7 @@ int main(int argc, char *argv[]) {
     if (ret < 0) {
         diag_log_write("MAIN", "entry AVC prime failed=%d\n", ret);
         diag_log_flush();
-        moonlight_main_exit_to_psplink("entry AVC prime failed");
+        halt_with_error("Initialize hardware AVC", ret);
         return ret;
     }
 #endif
@@ -903,7 +935,7 @@ settings_menu_entry:
     if (ret < 0) {
         diag_log_write("MAIN", "configured AVC session failed=%d\n", ret);
         diag_log_flush();
-        moonlight_main_exit_to_psplink("configured AVC session failed");
+        halt_with_error("Configure hardware AVC", ret);
         return ret;
     }
 #endif
@@ -950,7 +982,7 @@ host_select_loop:
         if (ret < 0) {
             diag_log_write("MAIN", "host-loop AVC warmup failed=%d\n", ret);
             diag_log_flush();
-            moonlight_main_exit_to_psplink("host-loop AVC warmup failed");
+            halt_with_error("Reopen hardware AVC", ret);
             return ret;
         }
     }
@@ -2082,6 +2114,9 @@ int module_stop(SceSize args, void *argp)
         g_stream_status = 0;
         moonlight_main_shutdown_exit_callback_thread();
         moonlight_main_prepare_psplink_prompt_framebuffer();
+#ifdef RETAIL_BUILD
+        if (prepared) (void)moonlight_startup_release_helper();
+#endif
         diag_log_write("MAIN", "module_stop cleanup result=%d\n", prepared);
         diag_log_flush();
 #ifndef RETAIL_BUILD

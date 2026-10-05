@@ -2,6 +2,12 @@
 
 _PSP Moonlight v1.5.0_
 
+## Starting Moonlight
+
+Keep `EBOOT.PBP` and `moonlight_me_helper.prx` from the same package in the same folder. Moonlight loads the helper when it starts.
+
+If initialization fails, the error screen shows the step and hexadecimal error code. The last fatal error is saved to `ms0:/PSP/SAVEDATA/Moonlight/error.log` for bug reports. Release the launch button, then press a button to leave the error screen.
+
 ## Wireless streaming
 
 The PSP supports 2.4 GHz Wi-Fi only. Crowded channels, weak signal and burst loss can cause stutter or recovery pauses. Keep the PSP close to the access point and use a clear channel.

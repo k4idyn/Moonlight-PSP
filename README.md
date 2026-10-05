@@ -19,6 +19,7 @@ v1.5 adds Sony hardware H.264 decoding for CAVLC and CABAC streams. Balanced is 
 
 ## New in v1.5
 
+- **Application startup**: Load the bundled Media Engine helper on XMB launch and show a readable error code if initialization fails.
 - **Sony hardware H.264 decoding**: Decode CAVLC and CABAC streams through the PSP's AVC hardware, with the decoder mode selected from the stream.
 - **Video presentation improvements**: Reduced receive copies, owned frame buffers, corrected color range and quicker presentation of ready frames.
 - **Audio playback improvements**: Corrected playback clock accounting across silence, held audio and queue trims.
