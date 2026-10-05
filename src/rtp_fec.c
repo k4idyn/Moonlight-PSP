@@ -21,13 +21,21 @@
 #include "rs.h"
 #include "diag_log.h"
 #include "control_stream.h"
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "decode_flags.h"
 #include "signal_strength.h"
 #include "config.h"
 #include "runtime_telemetry.h"
 
 extern PspConfig g_psp_config;
+extern volatile int g_avc_entropy_mode;
+
+static int fec_stream_is_cabac(void)
+{
+    int mode=g_avc_entropy_mode;
+    if(mode==0 || mode==1) return mode;
+    return g_psp_config.cabacTestMode!=0;
+}
 
 /* g_last_good_frame declared in decode_flags.h */
 
@@ -393,7 +401,7 @@ static int current_frame_needs_cabac_defer(void)
 {
     u32 missing;
 
-    if (!g_psp_config.cabacTestMode ||
+    if (!fec_stream_is_cabac() ||
         g_current_frame == 0xFFFFFFFF ||
         g_frame_submitted ||
         g_received_count == 0 ||

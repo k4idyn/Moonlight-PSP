@@ -1,6 +1,6 @@
 # RTP Packet Reassembly
 
-This module handles RTP packet reassembly for the PSP Moonlight video stream. It converts raw UDP payloads into complete H.264 NAL units for the OpenH264 decoder. Supports single NAL units and FU-A fragmented NAL units per RFC 6184.
+This module handles RTP packet reassembly for the PSP Moonlight video stream. It converts raw UDP payloads into complete H.264 access units for Sony hardware AVC decoding. It supports single NAL units and FU-A fragmented NAL units per RFC 6184.
 
 ## Overview
 
@@ -136,14 +136,14 @@ The module integrates seamlessly with the existing PSP Moonlight codebase:
 
 ### Integration
 
-The reassembler is driven by `sw_decoder_thread.c`, which reads from the 1024-slot packet ring buffer and calls `rtp_reassembly_process_packet()`. When a complete NAL unit is ready, the callback calls `oh264_pipeline_decode_frame()` on the main CPU. FEC repair (`rtp_fec.c`) is applied to each RTP frame group before passing to reassembly.
+The reassembler is driven by `decoder_thread.c`, which reads incoming packets and calls `rtp_reassembly_process_packet()`. Complete H.264 access units are submitted to the Sony AVC player. FEC repair (`rtp_fec.c`) is applied to each RTP frame group before passing to reassembly.
 
 ## Error Handling
 
 The module handles various error conditions gracefully:
 
 - **Invalid RTP packets**: Discarded silently
-- **Sequence gaps**: Partial NAL units are discarded; the decoder state is reset to wait for the next IDR frame to prevent visual artifacts and hardware hangs (`0x80628002`).
+- **Sequence gaps**: Incomplete access units are discarded and the decoder waits for a valid recovery frame.
 - **Buffer overflow**: Fragments that would exceed the buffer are discarded
 - **Out-of-order packets**: Older packets are discarded
 
@@ -154,20 +154,11 @@ The module handles various error conditions gracefully:
 - **No locks**: Thread-safe operation without mutexes
 - **Static allocation**: No dynamic memory allocation
 
-## Testing
-
-To test the module:
-
-1. Send RTP packets with single NAL units (types 1-23)
-2. Send RTP packets with FU-A fragmented NAL units (type 28)
-3. Introduce packet loss and verify sequence gap detection
-4. Send out-of-order packets and verify they are handled correctly
-
-## Known Limitations
+## Packet and buffer limits
 
 - STAP-A (type 24) and FU-B (type 29) are not supported — Sunshine does not send these in practice.
-- The 64 KB assembly buffer is static. NAL units larger than 64 KB are dropped with a logged error.
-- Sequence number tracking wraps at 65535; rollover handling is implemented but not stress-tested.
+- The 64 KB assembly buffer is static. NAL units larger than 64 KB are discarded.
+- RTP sequence numbers wrap at 65535 and are handled across rollover.
 
 ## References
 

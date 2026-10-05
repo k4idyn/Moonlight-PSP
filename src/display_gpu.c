@@ -25,6 +25,11 @@
 #include <string.h>
 
 #include "shared.h"
+#include "psp_avc_build.h"
+#if PSP_HARDWARE_AVC
+#include "psp_avc_player.h"
+static void *s_avc_owned_frame;
+#endif
 #include "runtime_telemetry.h"
 #include "hud.h"
 #include "diag_log.h"
@@ -35,7 +40,9 @@
 /* Use g_psp_config for stream resolution (GPU upscale sub-native res) */
 #include "settings_menu.h"
 extern PspConfig g_psp_config;
+#if !PSP_HARDWARE_AVC
 extern int oh264_frame_is_me_clean(const void *frame);
+#endif
 
 /* ------------------------------------------------------------------ *
  * Constants — matches PSPdisp's graphic.h proven values
@@ -43,6 +50,10 @@ extern int oh264_frame_is_me_clean(const void *frame);
 #define BUF_WIDTH   512
 #define SCR_WIDTH   480
 #define SCR_HEIGHT  272
+
+/* Last measured GU command submission plus completion-sync wall time. This is
+ * a frame-path duration, not a claim about GPU-core utilization. */
+volatile u32 g_display_gu_submit_sync_us = 0;
 
 /* GU command list — 256 KB, 16-byte aligned (PSPdisp uses 1 MB but
  * 256K is sufficient for video frame + HUD overlay) */
@@ -331,12 +342,20 @@ void display_frame(void *frame_data)
     if (!frame_data)
         return;
 
+    /* Sony AVC output slots are invalidated after CSC in psp_avc_submit().
+     * The retained HUD copy is CPU-owned and still needs writeback. */
+#if PSP_HARDWARE_AVC
+    if (frame_data == (void *)s_last_frame_copy) {
+        sceKernelDcacheWritebackRange(frame_data, tex_stride * src_h * 4);
+    }
+#else
     /* ME-produced RGBA buffers were already written by the ME and invalidated
-     * before returning to the display path. Avoid re-scanning the active
-     * texture every frame; CPU-owned HUD/copy/fallback buffers still write back. */
+     * before returning to the display path. CPU-owned fallback buffers still
+     * write back. */
     if (!oh264_frame_is_me_clean(frame_data)) {
         sceKernelDcacheWritebackRange(frame_data, tex_stride * src_h * 4);
     }
+#endif
 
     gpu_start_us = sceKernelGetSystemTimeLow();
 
@@ -405,7 +424,8 @@ void display_frame(void *frame_data)
 
     sceGuFinish();
     sceGuSync(0, 0);
-    telemetry_accum_gpu(sceKernelGetSystemTimeLow() - gpu_start_us);
+    g_display_gu_submit_sync_us = sceKernelGetSystemTimeLow() - gpu_start_us;
+    telemetry_accum_gpu(g_display_gu_submit_sync_us);
 }
 
 /* ------------------------------------------------------------------ *
@@ -423,6 +443,30 @@ void display_frame(void *frame_data)
  * was also insufficient because idle loops ran at ~1kHz, causing
  * unsynced swaps 1ms after each VBlank-synced one).
  * ------------------------------------------------------------------ */
+#if PSP_HARDWARE_AVC
+void display_avc_frame(void *frame)
+{
+    void *previous = s_avc_owned_frame;
+    if (!frame) return;
+    display_frame(frame); /* Includes GU completion before releasing any slot. */
+    s_avc_owned_frame = (s_last_frame_data == frame) ? frame : NULL;
+    if (previous && previous != frame) psp_avc_player_release(previous);
+    /* HUD may have copied the pixels into its own stable texture. */
+    if (s_last_frame_data != frame) psp_avc_player_release(frame);
+}
+
+void display_avc_release_frame(void)
+{
+    sceGuSync(0, 0);
+    s_last_frame_data = NULL;
+    s_last_frame_copy_valid = 0;
+    if (s_avc_owned_frame) {
+        psp_avc_player_release(s_avc_owned_frame);
+        s_avc_owned_frame = NULL;
+    }
+}
+#endif
+
 void display_frame_finish(void)
 {
     sceGuFinish();

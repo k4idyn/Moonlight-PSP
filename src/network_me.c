@@ -92,6 +92,15 @@ typedef char _ss_ping_size_check[(sizeof(SsPingPkt) == 20) ? 1 : -1];
 
 /* UDP receive socket (shared with ping thread for sendto) */
 static int udp_socket = -1;
+static volatile u32 s_video_last_packet_us = 0;
+static volatile int s_video_packet_seen = 0;
+
+u32 network_me_video_idle_ms(void)
+{
+    u32 last = s_video_last_packet_us;
+    if (!s_video_packet_seen || last == 0) return 0;
+    return (sceKernelGetSystemTimeLow() - last) / 1000u;
+}
 static volatile u32 s_video_ping_seq = 0;
 
 static u32 next_video_ping_seq(void)
@@ -1159,6 +1168,8 @@ void network_me_set_power_save(int enable)
  *--------------------------------------------------------------------------*/
 void network_me_init(PacketRingBuffer *rb)
 {
+    s_video_last_packet_us = 0;
+    s_video_packet_seen = 0;
     diag_log_write("NET", "network_me_init entry (rb=%p)\n", rb);
     int ret;
     unsigned short local_port;
@@ -1398,8 +1409,9 @@ static int network_ping_thread(SceSize args, void *argp)
             consec_sendfail = 0;
         }
 
-        /* Log first 5 pings and errors only (silenced hot-path for perf) */
-        if (seq <= 5 || err) {
+        /* A five-second diagnostic heartbeat distinguishes an idle media
+         * socket from a stopped keepalive without per-packet log traffic. */
+        if (seq <= 5 || err || (seq % 10u) == 0) {
             net_log("[PING] #%u -> %s:%d sent=%d%s%d\n",
                     seq, g_video_server_ip, g_video_server_port, sent,
                     err ? " SENDFAIL errno=" : "",
@@ -1566,7 +1578,8 @@ void network_me_abort(void)
 static int network_recv_thread(SceSize args, void *argp)
 {
     PacketRingBuffer *rb = *((PacketRingBuffer **)argp);
-    u8 recv_buf[MAX_PACKET_SIZE];
+    u8 recv_scratch[MAX_PACKET_SIZE];
+    u8 *recv_buf = recv_scratch;
     struct sockaddr_in from_addr;
     socklen_t from_len;
     u32 pkt_count = 0;
@@ -1576,6 +1589,7 @@ static int network_recv_thread(SceSize args, void *argp)
 #endif
 
     net_log("[NET] recv thread running\n");
+    net_log("[NET] receive path=direct-to-ring (scratch only when full)\n");
     net_log("[NET] packet ring slots=%u (packet size=%u)\n", RING_BUFFER_SLOTS, MAX_PACKET_SIZE);
 
 #ifndef RETAIL_BUILD
@@ -1587,6 +1601,7 @@ static int network_recv_thread(SceSize args, void *argp)
     u32 last_data_us = sceKernelGetSystemTimeLow();
     u32 last_idle_ping_us = 0;
     int recv_hot_path_disabled = 0;
+    int idle_idr_requested = 0;
 
     /* Log actual bound address so we can verify Sunshine is sending here */
 #ifndef RETAIL_BUILD
@@ -1606,6 +1621,15 @@ static int network_recv_thread(SceSize args, void *argp)
     while (me_running) {
         ssize_t n;
         u32 next_head;
+        int recv_direct;
+
+        /* The producer owns rb->head until it publishes by advancing head.
+         * Receive directly into that free slot. If the ring is full, use the
+         * scratch buffer so inspecting a packet cannot overwrite queued data. */
+        next_head = (rb->head + 1) % RING_BUFFER_SLOTS;
+        recv_direct = (next_head != rb->tail);
+        recv_buf = recv_direct ? rb->slots[rb->head] : recv_scratch;
+
 
         /* Legacy note: this path previously used blocking recvfrom with SO_RCVTIMEO.
          *
@@ -1620,7 +1644,7 @@ static int network_recv_thread(SceSize args, void *argp)
         /* Runtime path is intentionally non-blocking so the video ping thread
          * can keep the host routing media on this same UDP socket. */
         if (pkt_count != 0 && !recv_hot_path_disabled) {
-            n = sceNetInetRecv(udp_socket, recv_buf, sizeof(recv_buf),
+            n = sceNetInetRecv(udp_socket, recv_buf, MAX_PACKET_SIZE,
                                MSG_DONTWAIT);
             if (n <= 0) {
                 int hot_err = sceNetInetGetErrno();
@@ -1632,7 +1656,7 @@ static int network_recv_thread(SceSize args, void *argp)
                     from_len = sizeof(from_addr);
                     memset(&from_addr, 0, sizeof(from_addr));
                     from_addr.sin_len = (uint8_t)sizeof(from_addr);
-                    n = sceNetInetRecvfrom(udp_socket, recv_buf, sizeof(recv_buf),
+                    n = sceNetInetRecvfrom(udp_socket, recv_buf, MAX_PACKET_SIZE,
                                            MSG_DONTWAIT,
                                            (struct sockaddr *)&from_addr, &from_len);
                 }
@@ -1641,7 +1665,7 @@ static int network_recv_thread(SceSize args, void *argp)
             from_len = sizeof(from_addr);
             memset(&from_addr, 0, sizeof(from_addr));
             from_addr.sin_len = (uint8_t)sizeof(from_addr); /* PSP BSD socket */
-            n = sceNetInetRecvfrom(udp_socket, recv_buf, sizeof(recv_buf),
+            n = sceNetInetRecvfrom(udp_socket, recv_buf, MAX_PACKET_SIZE,
                                    MSG_DONTWAIT,
                                    (struct sockaddr *)&from_addr, &from_len);
         }
@@ -1675,6 +1699,13 @@ static int network_recv_thread(SceSize args, void *argp)
 #endif
                 if (pkt_count != 0) {
                     u32 idle_us = now_us - last_data_us;
+                    if (idle_us >= 2500000u && !idle_idr_requested) {
+                        int idr_ret = control_stream_request_idr_force();
+                        net_log("[NET] video idle recovery IDR request ret=%d after %ums\n",
+                                idr_ret, (unsigned)(idle_us / 1000));
+                        (void)idr_ret; /* net_log may compile out in retail builds. */
+                        idle_idr_requested = 1;
+                    }
                     if (idle_us >= 2500000u &&
                         (last_idle_ping_us == 0 ||
                          (now_us - last_idle_ping_us) >= 5000000u)) {
@@ -1729,6 +1760,9 @@ static int network_recv_thread(SceSize args, void *argp)
         consecutive_empty = 0;
         u32 recv_now_us = sceKernelGetSystemTimeLow();
         last_data_us = recv_now_us;
+        idle_idr_requested = 0;
+        s_video_last_packet_us = recv_now_us;
+        s_video_packet_seen = 1;
 #ifndef RETAIL_BUILD
         if (pkt_count == 1) {
             net_log("[NET] FIRST packet: %d bytes from %s:%u\n",
@@ -1987,7 +2021,9 @@ static int network_recv_thread(SceSize args, void *argp)
             continue;
         }
 
-        memcpy(rb->slots[rb->head], recv_buf, (u16)n);
+        if (!recv_direct) {
+            memcpy(rb->slots[rb->head], recv_buf, (u16)n);
+        }
         rb->slot_length[rb->head] = (u16)n;
         rb->head = next_head;
         telemetry_accum_video_accept((u32)n);

@@ -2,13 +2,12 @@
 
 # Moonlight PSP
 
-**v1.4.0 - PSP-native H.264 Game Streaming Client**
+**v1.5.0 - PSP-native H.264 Game Streaming Client**
 
-[![Build](https://img.shields.io/badge/build-passing-brightgreen)](#building)
 [![PSP FW](https://img.shields.io/badge/PSP%20FW-6.60%2F6.61-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-GPLv3-blue)](#license)
-[![Status](https://img.shields.io/badge/status-stable-brightgreen)](#known-limitations)
-[![Release](https://img.shields.io/badge/release-v1.4.0-blue)](#version-history)
+[![Release](https://img.shields.io/badge/release-v1.5.0-blue)](#version-history)
+
 
 </div>
 
@@ -16,14 +15,23 @@
 
 Moonlight PSP is a Moonlight-compatible game-streaming client for Sony PSP systems, designed around a custom PSP-native networking, decode, audio, input, and rendering stack.
 
-The project streams H.264 video from a host PC running Sunshine, decodes video on the PSP main CPU, and uses the Media Engine for accelerated YUV-to-RGBA conversion.
+v1.5 adds Sony hardware H.264 decoding for CAVLC and CABAC streams. Balanced is the recommended default for visual detail, smoothness and audio.
 
 ## New in v1.4
 
-- **Full H.264 CABAC Stream Support**: Delivers optimized, hardware-accelerated software decoding for CABAC H.264 streams on the PSP. Perfect for hosts using AMD AMF encoders which default to CABAC.
+- **H.264 CABAC support**: The OpenH264 software path supports CABAC; the Media Engine accelerates color conversion.
 - **3-Slot Decoder Buffer Ring**: Prevents frame pointer contention and stalls between the OpenH264/Media Engine threads and the presenter.
-- **Tighter Teardown & Safe Process Exit**: Gracefully cleans up lingering thread contexts, exit callback structures, and Wi-Fi networks before PRX self-unloads, preventing physical black screen hangs.
+- **Tighter Teardown & Safe Process Exit**: Gracefully cleans up lingering thread contexts, exit callback structures, and Wi-Fi networks before PRX self-unloads.
 - **Integrated DNS Resolution**: Uses PSP net resolver to resolve DDNS/hostnames via `gethostbyname()` with IP fallback, fixing remote/external connectivity (Issue #8).
+
+## New in v1.5
+
+- **Sony hardware H.264 decoding**: Decode CAVLC and CABAC streams through the PSP's AVC hardware, with the decoder mode selected from the stream.
+- **Video presentation improvements**: Reduced receive copies, owned frame buffers, corrected color range and quicker presentation of ready frames.
+- **Audio playback improvements**: Corrected playback clock accounting across silence, held audio and queue trims.
+- **Reliable controls**: Corrected keyboard, mouse wheel and controller packets, with acknowledged delivery for buttons, keys and gamepad state.
+- **Cleaner stream exit**: Release decoder, application memory and network resources when leaving the stream or application.
+- **Mapping interface fixes**: Visible analog direction badges and local HUD controls that do not send unwanted keys to the host.
 
 ## Highlights
 
@@ -32,9 +40,9 @@ The project streams H.264 video from a host PC running Sunshine, decodes video o
 | Host discovery | Implemented | mDNS, known-host probes, optional subnet scan |
 | Pairing + TLS transport auth | Implemented | Runtime identity, PIN flow, authenticated confirm |
 | Game library + icons | Implemented | Sunshine box-art download, static PNG decode, raw RGB565 cache |
-| RTSP / RTP / FEC pipeline | Implemented | PSP-native transport with CAVLC host profile required |
-| OpenH264 decode + ME conversion | Implemented | PSP-optimized software decode path |
-| Audio | Implemented | Opus playback when enabled; Performance preset disables local audio work |
+| RTSP / RTP / FEC pipeline | Implemented | Packet assembly and recovery for Sony hardware AVC |
+| Sony hardware AVC | Implemented | Hardware decoding with actual CAVLC/CABAC PPS selection |
+| Audio | Implemented | Opus playback is enabled in Quality and Balanced; Performance disables local audio work |
 | Input | Implemented | Xbox and Browser modes, customizable PSP combo mapper |
 | UPnP hotspot/remote assist | Implemented | Temporary IGD UDP port mapping for stream ports |
 | Multi-host support | Implemented | Up to 8 paired hosts |
@@ -42,8 +50,8 @@ The project streams H.264 video from a host PC running Sunshine, decodes video o
 ## Recommended Host Profile
 
 - Codec: H.264
-- Encoder profile: Baseline
-- Entropy: CAVLC
+- H.264 profile and entropy: Baseline with CAVLC, or Main with CABAC
+- The hardware decoder selects its mode from the emitted PPS
 - Rate control: low latency / bandwidth-limited mode
 - FEC: start at 35 percent for PSP Wi-Fi, then tune only if your network is clean
 
@@ -53,22 +61,17 @@ This guidance applies to NVIDIA NVENC, AMD AMF, Intel QSV, and software x264 hos
 
 | Preset | Use When | Stream | Audio |
 |---|---|---|---|
-| Performance | You want the most responsive PSP-1000 profile | 300x170, 30 fps, 384 kbps, 1056-byte packets | Disabled |
-| Balanced | You want a middle point between detail and smoothness | 360x204, 20 fps, 480 kbps, 1200-byte packets | Enabled |
-| Quality | You want native PSP resolution | 480x272, 10 fps, 576 kbps, 1200-byte packets | Enabled |
+| Performance | You want the most responsive PSP profile | 300x170, 30 fps, 384 kbps, 1056-byte packets | Disabled |
+| Balanced (default) | Recommended for visual detail, smoothness and audio | 360x204, 20 fps, 480 kbps, 1200-byte packets | Enabled |
+| Quality | You want native PSP resolution | 480x272, 15 fps, 576 kbps, 1200-byte packets | Enabled |
+
+New installations start with Balanced. Existing saved settings are retained when upgrading.
 
 Audio Disabled is a client-side low-work mode. It skips local Opus decode, SRC playback, and audio output work on the PSP. It does not require changing Sunshine host settings and can be changed from the PSP settings menu.
 
 ## How It Works
 
-```text
-Main CPU (Allegrex)                    Media Engine
---------------------                   ---------------------------
-Wi-Fi receive + RTP/FEC processing     YUV420P -> RGBA8888 via VFPU
-OpenH264 software decode               Concurrent conversion work
-Control/input channel                  Output frame handoff
-Opus audio decode when enabled
-```
+The client uses Sony's sceMpeg AVC framework. The Media Engine helper loads firmware providers and prepares the AVC mode. The client inspects the stream's PPS before submitting the first IDR and presents decoded video through the PSP graphics engine.
 
 ## Requirements
 
@@ -81,21 +84,16 @@ Opus audio decode when enabled
 ### Host PC
 
 - Sunshine current stable release recommended
-- H.264 Baseline + CAVLC configured for PSP-compatible streaming
+- H.264 Baseline/CAVLC or Main/CABAC, with low-latency rate control
 
 ## Building
 
 See [docs/BUILDING.md](docs/BUILDING.md) for full environment setup.
 
 ```bash
-# 1) Build Media Engine helper PRX
-cd moonlight_me_helper && make
-
-# 2) Build application. Retail mode is the default.
-cd .. && make
-
-# Optional verbose diagnostics build
-make RETAIL_BUILD=0
+# From the repository root; make all builds the helper and application
+make clean
+make -j2 RETAIL_BUILD=1 PSP_HARDWARE_AVC=1 PSP_AVC_UNIFIED_MAIN_MODE=1 PSP_VIDEO_FEC_PERCENT=35 PSP_VIDEO_FEC_MIN_REQUIRED=1 PSP_AUDIO_PACKET_DURATION_MS=40
 ```
 
 Build output includes:
@@ -122,14 +120,15 @@ ms0:/PSP/GAME/Moonlight/
 
 Runtime data is written to `ms0:/PSP/SAVEDATA/Moonlight/`, not the install folder.
 
-When updating from an older build, delete stale old-build files/folders such as `ms0:/moonlight/` and the old `ms0:/PSP/GAME/Moonlight/` install folder before copying v1.4, then pair again in Sunshine.
+When updating from an older build, follow [INSTALL.md](INSTALL.md).
 
 For full setup, pairing flow, and troubleshooting, see [INSTALL.md](INSTALL.md).
 
 ## Known Limitations
 
 - The PSP Wi-Fi radio is 2.4 GHz only and remains the main practical bottleneck.
-- H.264 CAVLC is recommended for lower decode latency, but CABAC is fully supported and optimized in v1.4.0.
+- CAVLC and CABAC differ in compression efficiency and decode work. Use the built-in presets for a balance of detail and responsiveness.
+
 - High resolutions above the native PSP display are outside the intended operating range.
 - Some fast-motion content can still expose the PSP display and network limits.
 
@@ -156,6 +155,7 @@ Detailed notes: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
 
 ## Version History
 
+- v1.5.0: Sony hardware AVC decoding, improved video presentation and audio timing, reliable controls, mapping hints and stream cleanup.
 - v1.4.0: H.264 CABAC stream decoding support, 3-slot decoder ring buffer, safe self-module exit teardown, and Net Resolver DNS hostname support.
 - v1.3.0: Savedata runtime layout, remote public-IP launch fix, pairing persistence, XMB artwork, and safer HOME/XMB exit cleanup.
 - v1.2.0: PSP preset ladder, packet-size setting, pairing confirm, controller-map overhaul, Browser input cleanup, and transition-buffer fixes.

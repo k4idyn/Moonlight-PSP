@@ -32,6 +32,9 @@ extern void display_shutdown(void);
 #define IP_ACQUIRE_TIMEOUT_US   (60 * 1000 * 1000)
 /* Polling interval for post-dialog IP-wait loop (microseconds) */
 #define POLL_INTERVAL_US        (50 * 1000)
+/* sceUtilityLoadNetModule uses this result when a prior network dialog left
+ * the common/inet module resident. That is a usable state for repeated UI. */
+#define MOONLIGHT_NET_MODULE_ALREADY_LOADED ((int)0x80110802)
 
 /* Small GU command list used only for the dialog frame pump.
  * 16 KB is ample for a single sceGuClear call per frame. */
@@ -54,13 +57,15 @@ int netconf_ui_run(void)
 
     ret = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
     diag_log_write("NET", "[NETCONF] load COMMON ret=0x%08X\n", (unsigned)ret);
-    if (ret < 0 && ret != (int)0x80110F01) return ret;
+    if (ret < 0 && ret != (int)0x80110F01 &&
+        ret != MOONLIGHT_NET_MODULE_ALREADY_LOADED) return ret;
     ret = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
     diag_log_write("NET", "[NETCONF] load INET ret=0x%08X\n", (unsigned)ret);
-    if (ret < 0 && ret != (int)0x80110F01) return ret;
+    if (ret < 0 && ret != (int)0x80110F01 &&
+        ret != MOONLIGHT_NET_MODULE_ALREADY_LOADED) return ret;
 
-    /* Use standard PSPSDK 128KB memory pool and 4KB stack sizes. */
-    ret = sceNetInit(128 * 1024, 42, 4096, 42, 4096);
+    /* Match the v1.4 network pool used for Moonlight's sustained RTP traffic. */
+    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
     diag_log_write("NET", "[NETCONF] sceNetInit ret=0x%08X\n", (unsigned)ret);
     if (ret >= 0 || ret == (int)0x80410201) net_inited = 1;
 

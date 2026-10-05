@@ -10,7 +10,7 @@
  *   2. All components read from g_stream_res instead of local defines
  *   3. PSP LCD constants (480x272) remain fixed (hardware limitation)
  *
- * NOTE: sw_decode_pipeline.h retains compile-time SW_FRAME_* defines
+ * NOTE: decoder_pipeline.h retains compile-time SW_FRAME_* defines
  * for the decommissioned CAVLC pipeline's static struct sizing.
  * The active OpenH264 path uses g_stream_res exclusively.
  */

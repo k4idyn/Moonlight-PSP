@@ -1,5 +1,5 @@
 /*
- * runtime_telemetry.c - One-second utilization windows for HUD/debug logging.
+ * runtime_telemetry.c - One-second measured work-time shares for diagnostics.
  */
 
 #include <string.h>

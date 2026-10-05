@@ -41,6 +41,7 @@
 #include "net_send.h"
 #include "signal_strength.h"
 #include "control_stream.h"
+#include "stream_crypto.h"
 #define pair_log(fmt, ...) diag_log_write("NET", fmt, ##__VA_ARGS__)
 
 #ifndef CLIENT_CERT_SIG_LEN
@@ -149,6 +150,7 @@ extern PspConfig g_psp_config;
 #define HTTPS_CONNECT_TIMEOUT_US    (5 * 1000 * 1000)
 #define HTTPS_HANDSHAKE_TIMEOUT_US  (8 * 1000 * 1000)
 #define HTTPS_IO_TIMEOUT_US         (6 * 1000 * 1000)
+#define HTTPS_CANCEL_WRITE_TIMEOUT_US (2 * 1000 * 1000)
 
 /* RTSP CSeq counter (increments per request) */
 static int rtsp_cseq = 1;
@@ -216,6 +218,9 @@ static char g_rtsp_session_id[64] = "";
 static int s_retry_appid = -1;
 static char s_retry_host[16] = "";
 static char s_retry_title[64] = "";
+static SceUID g_cancel_tid = -1;
+
+int network_wait_for_cancel_thread(void);
 
 static int g_rtsp_port = SUNSHINE_RTSP_PORT_PRIMARY;
 static char g_rtsp_connect_host[64] = DEFAULT_SUNSHINE_HOST;
@@ -854,6 +859,35 @@ cleanup:
  *
  * Returns 0 on success (resp contains XML body), -1 on any error.
  */
+static void https_log_network_state(const char *phase)
+{
+    int ap_state = -1;
+    int ap_ret;
+    int ip_ret;
+    int rssi_ret;
+    int rssi = -999;
+    union SceNetApctlInfo ip_info;
+    union SceNetApctlInfo rssi_info;
+
+    memset(&ip_info, 0, sizeof(ip_info));
+    memset(&rssi_info, 0, sizeof(rssi_info));
+    ap_ret = sceNetApctlGetState(&ap_state);
+    ip_ret = sceNetApctlGetInfo(8, &ip_info); /* 8 = assigned IP */
+    rssi_ret = sceNetApctlGetInfo(5, &rssi_info); /* 5 = RSSI */
+    if (rssi_ret >= 0) {
+        rssi = *(int *)&rssi_info;
+    }
+
+    pair_log("[LAUNCH-TLS] network state phase=%s apctl_ret=%08X state=%d ip_ret=%08X ip=%s rssi_ret=%08X rssi=%d\n",
+             phase ? phase : "unknown",
+             (unsigned)ap_ret,
+             ap_state,
+             (unsigned)ip_ret,
+             ip_ret >= 0 ? ip_info.ip : "<unavailable>",
+             (unsigned)rssi_ret,
+             rssi);
+}
+
 int https_launch_get(const char *host, int port,
                              const char *path, char *resp, int resp_size)
 {
@@ -861,6 +895,8 @@ int https_launch_get(const char *host, int port,
     int ret, nb;
     int connected = 0;
     int tls_ready = 0;
+    unsigned int hs_want_read = 0;
+    unsigned int hs_want_write = 0;
     struct sockaddr_in addr;
 
     mbedtls_ssl_context ssl;
@@ -878,6 +914,7 @@ int https_launch_get(const char *host, int port,
     char *body;
     const char *active_cert_hex = get_active_client_cert_hex();
     const char *active_key_pem = get_active_client_key_pem();
+    int is_cancel_request = (path && strncmp(path, "/cancel?", 8) == 0);
 
     if (!active_cert_hex || !active_key_pem) {
         pair_log("[LAUNCH-TLS] runtime client identity unavailable\n");
@@ -959,6 +996,7 @@ int https_launch_get(const char *host, int port,
         int e = sceNetInetGetErrno();
         if (e != EINPROGRESS && e != EALREADY && e != EAGAIN && e != EWOULDBLOCK) {
             pair_log("[LAUNCH-TLS] connect failed immediately errno=%d\n", e);
+            https_log_network_state("connect-immediate-failure");
             ret = -1; goto tls_cleanup;
         }
     }
@@ -990,6 +1028,7 @@ int https_launch_get(const char *host, int port,
     if (!connected) {
         pair_log("[LAUNCH-TLS] connect timed out (%ds)\n",
                  HTTPS_CONNECT_TIMEOUT_US / 1000000);
+        https_log_network_state("connect-timeout");
         ret = -1;
         goto tls_cleanup;
     }
@@ -1044,14 +1083,20 @@ int https_launch_get(const char *host, int port,
     pair_log("[LAUNCH-TLS] starting TLS handshake...\n");
     u32 hs_t = sceKernelGetSystemTimeLow();
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-            ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+            hs_want_read++;
+        } else if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            hs_want_write++;
+        } else {
             pair_log("[LAUNCH-TLS] handshake failed: -0x%04X\n", -ret);
             goto tls_cleanup;
         }
         if (sceKernelGetSystemTimeLow() - hs_t > HTTPS_HANDSHAKE_TIMEOUT_US) {
-            pair_log("[LAUNCH-TLS] handshake timed out (%ds)\n",
-                     HTTPS_HANDSHAKE_TIMEOUT_US / 1000000);
+            pair_log("[LAUNCH-TLS] handshake timed out (%ds) want_read=%u want_write=%u\n",
+                     HTTPS_HANDSHAKE_TIMEOUT_US / 1000000,
+                     hs_want_read,
+                     hs_want_write);
+            https_log_network_state("handshake-timeout");
             goto tls_cleanup;
         }
         sceKernelDelayThread(5000); /* Reduced from 10ms for speed */
@@ -1085,22 +1130,42 @@ int https_launch_get(const char *host, int port,
         int req_len = (int)strlen(request);
         int written = 0;
         u32 wr_t = sceKernelGetSystemTimeLow();
+        unsigned int write_timeout_us = is_cancel_request ?
+                                        HTTPS_CANCEL_WRITE_TIMEOUT_US :
+                                        HTTPS_IO_TIMEOUT_US;
+        pair_log("[LAUNCH-TLS] HTTP request write begin len=%d cancel=%d\n",
+                 req_len, is_cancel_request);
         while (written < req_len) {
             ret = mbedtls_ssl_write(&ssl,
                                     (const unsigned char *)request + written,
                                     req_len - written);
-            if (ret > 0) { written += ret; wr_t = sceKernelGetSystemTimeLow(); continue; }
+            if (ret > 0) {
+                written += ret;
+                wr_t = sceKernelGetSystemTimeLow();
+                continue;
+            }
             if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                 ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
                 pair_log("[LAUNCH-TLS] write failed: -0x%04X\n", -ret);
                 goto tls_cleanup;
             }
-            if (sceKernelGetSystemTimeLow() - wr_t > HTTPS_IO_TIMEOUT_US) {
+            if (sceKernelGetSystemTimeLow() - wr_t > write_timeout_us) {
                 pair_log("[LAUNCH-TLS] write timed out\n");
                 goto tls_cleanup;
             }
             sceKernelDelayThread(5000);
         }
+        pair_log("[LAUNCH-TLS] HTTP request write complete bytes=%d cancel=%d\n",
+                 written, is_cancel_request);
+    }
+
+    /* Apollo acts on /cancel as soon as it receives the complete HTTP
+     * request.  Waiting for the response can consume the entire teardown
+     * budget when the host is already stuck in session cleanup. */
+    if (is_cancel_request) {
+        pair_log("[LAUNCH-TLS] cancel request sent; closing without waiting for response\n");
+        ret = 0;
+        goto tls_cleanup;
     }
 
     /* --- read response --- */
@@ -2051,7 +2116,7 @@ int wifi_connect(void)
     if (ret < 0 && ret != (int)0x80110F01) return ret;
 
     /*--- Initialize network stack (align with netconf_ui) -------------------*/
-    ret = sceNetInit(128 * 1024, 42, 4096, 42, 4096);
+    ret = sceNetInit(512 * 1024, 42, 4096, 42, 4096);
     if (ret < 0 && ret != (int)0x80410201)
     {
         pspDebugScreenPrintf("wifi: sceNetInit failed (0x%08X)\n", ret);
@@ -2149,12 +2214,44 @@ int wifi_connect(void)
  */
 void wifi_disconnect(void)
 {
+    int state = -1;
+    int state_ret;
+    int disconnect_ret = 0;
+    int disconnect_polls = 0;
+    int resolver_ret;
+    int apctl_ret;
+    int inet_ret;
+    int net_ret;
+    int inet_unload_ret;
+    int common_unload_ret;
+
     wifi_launch_restore_power_save();
-    sceNetApctlDisconnect();
-    sceNetResolverTerm();
-    sceNetApctlTerm();
-    sceNetInetTerm();
-    sceNetTerm();
+    state_ret = sceNetApctlGetState(&state);
+    if (state_ret >= 0 && state > 0) {
+        disconnect_ret = sceNetApctlDisconnect();
+        while (disconnect_polls < 500) {
+            state_ret = sceNetApctlGetState(&state);
+            if (state_ret < 0 || state <= 0) break;
+            sceKernelDelayThread(10 * 1000);
+            disconnect_polls++;
+        }
+    }
+
+    /* Apctl disconnect is asynchronous. Wait for the state machine to settle
+     * before terminating its libraries, then unload the utility modules so a
+     * fresh PSPLink launch gets the same DDR available as the first launch. */
+    resolver_ret = sceNetResolverTerm();
+    apctl_ret = sceNetApctlTerm();
+    inet_ret = sceNetInetTerm();
+    net_ret = sceNetTerm();
+    inet_unload_ret = sceUtilityUnloadNetModule(PSP_NET_MODULE_INET);
+    common_unload_ret = sceUtilityUnloadNetModule(PSP_NET_MODULE_COMMON);
+
+    pair_log("[WIFI EXIT] state_ret=0x%08X state=%d disconnect=0x%08X polls=%d resolver=0x%08X apctl=0x%08X inet=0x%08X net=0x%08X unload_inet=0x%08X unload_common=0x%08X\n",
+             (unsigned)state_ret, state, (unsigned)disconnect_ret,
+             disconnect_polls, (unsigned)resolver_ret, (unsigned)apctl_ret,
+             (unsigned)inet_ret, (unsigned)net_ret,
+             (unsigned)inet_unload_ret, (unsigned)common_unload_ret);
     pspDebugScreenPrintf("wifi: disconnected\n");
 }
 
@@ -3467,8 +3564,15 @@ static int rtsp_announce(int sock, int enc_enabled)
                 "a=x-nv-video[0].maxNumReferenceFrames:1\r\n"
                 "a=x-nv-video[0].h264Profile:%d\r\n"
                 "a=x-nv-video[0].entropyCodingMode:%d\r\n"
-                /* --- Color: BT.601 full range, SDR --- */
+                /* Sony AVC CSC expands limited-range BT.601. Request matching
+                 * input instead of clipping full-range shadows/highlights.
+         * Keep the software path's existing request pending its own color
+         * contract review. */
+#if PSP_HARDWARE_AVC
+                "a=x-nv-video[0].encoderCscMode:0\r\n"
+#else
                 "a=x-nv-video[0].encoderCscMode:1\r\n"
+#endif
                 "a=x-nv-video[0].dynamicRangeMode:0\r\n"
                 /* --- Stream refresh: must match maxFPS for Sunshine/Apollo --- */
                 "a=x-nv-video[0].clientRefreshRateX100:%d\r\n"
@@ -3578,14 +3682,15 @@ static int rtsp_announce(int sock, int enc_enabled)
 /* Persistent socket used across the whole session */
 static int g_rtsp_persistent_sock = -1;
 
-void rtsp_session_close(void)
+int rtsp_session_close(void)
 {
+    int teardown_ok = (g_rtsp_session_id[0] == '\0');
+
     upnp_remove_stream_mappings();
 
     if (g_rtsp_persistent_sock >= 0) {
         if (g_rtsp_session_id[0]) {
             char teardown[384];
-            int sent = 0;
             int len = snprintf(teardown, sizeof(teardown),
                                "TEARDOWN / RTSP/1.0\r\n"
                                "CSeq: %d\r\n"
@@ -3599,20 +3704,30 @@ void rtsp_session_close(void)
                                g_rtsp_host_header,
                                g_rtsp_session_id);
             if (len > 0 && len < (int)sizeof(teardown)) {
-                int ret = rtsp_send_all_timeout(g_rtsp_persistent_sock,
-                                                teardown,
-                                                len,
-                                                "TEARDOWN",
-                                                &sent);
-                (void)ret;
-                pair_log("[RTSP] TEARDOWN sent ret=%d bytes=%d/%d\n",
-                         ret, sent, len);
+                char response[RTSP_BUF_SIZE];
+                response[0] = '\0';
+                int ret = rtsp_send_and_recv(g_rtsp_persistent_sock,
+                                             teardown,
+                                             response,
+                                             sizeof(response));
+                teardown_ok = (ret > 0 && rtsp_response_is_200(response));
+                pair_log("[RTSP] TEARDOWN response ret=%d status=%d request_bytes=%d\n",
+                         ret, rtsp_response_status_code(response), len);
+            } else {
+                teardown_ok = 0;
             }
         }
         sceNetInetClose(g_rtsp_persistent_sock);
         g_rtsp_persistent_sock = -1;
+    } else if (g_rtsp_session_id[0]) {
+        /* Apollo/Sunshine closes each RTSP transaction socket after its
+         * response. A completed write on the old PLAY socket is not proof
+         * that the host received TEARDOWN; require authenticated /cancel. */
+        pair_log("[RTSP] no reusable transaction socket; authenticated cancel required\n");
+        teardown_ok = 0;
     }
     g_rtsp_session_id[0] = '\0';
+    return teardown_ok;
 }
 
 /*
@@ -3975,6 +4090,25 @@ int rtsp_session(void)
         }
     }
 
+    /* Media starts as soon as PLAY succeeds. Prepare crypto and the audio
+     * consumer while the host is still waiting for PLAY, so encrypted audio
+     * cannot accumulate in the UDP socket during client startup. */
+    if (!g_remote_input_key_valid ||
+        stream_crypto_init(g_remote_input_key) < 0) {
+        pair_log("[RTSP] session crypto initialization failed before PLAY\n");
+        ret = -1;
+        goto rtsp_fail;
+    }
+
+    if (g_audio_rtsp_ok && g_psp_config.audioEnabled) {
+        ret = audio_thread_init(g_sunshine_host);
+        if (ret < 0) {
+            pair_log("[RTSP] audio initialization failed before PLAY (%d)\n", ret);
+            goto rtsp_fail;
+        }
+        pair_log("[RTSP] audio receiver/playback ready before PLAY\n");
+    }
+
     /* Sunshine/Apollo creates the stream session from ANNOUNCE and immediately
      * starts waiting for SS_PING. Keep one low-cost video prime before PLAY,
      * then follow the common-c order and issue PLAY immediately. For Audio
@@ -4003,9 +4137,13 @@ int rtsp_session(void)
         ret = rtsp_play(sock);
         if (ret < 0) { rtsp_close_transaction_socket(&sock); goto rtsp_fail; }
     }
-    /* Keep PLAY socket open for potential TEARDOWN later */
-    g_rtsp_persistent_sock = sock;
-    sock = -1;
+    /* Apollo/Sunshine handles one RTSP request per TCP connection and closes
+     * the socket after PLAY's response. Do not retain that dead connection
+     * and mistake a later local send() for a host-confirmed TEARDOWN. Stream
+     * shutdown uses authenticated /cancel unless the server returned a real
+     * 200 response to a live RTSP transaction. */
+    rtsp_close_transaction_socket(&sock);
+    g_rtsp_persistent_sock = -1;
 
     /* Keep the video endpoint fresh after PLAY returns. The audio SS_PING
      * thread is already running from SETUP audio for audio-enabled streams.
@@ -4028,6 +4166,7 @@ rtsp_fail:
         audio_thread_shutdown();
         g_audio_rtsp_ok = 0;
     }
+    stream_crypto_shutdown();
     if (g_video_client_port > 0) {
         network_me_shutdown();
         g_video_client_port = 0;
@@ -4712,9 +4851,43 @@ int network_connect_all(void)
     PairingPINUI pin_ui;
     PairingPINState pin_state;
 
+    /* A delayed authenticated /cancel from an earlier failed RTSP teardown
+     * must never race a newly selected stream on the same Apollo host. */
+    if (g_cancel_tid >= 0 && !network_wait_for_cancel_thread()) {
+        pair_log("[CONNECT] prior authenticated cancel is still active; refusing overlapping launch\n");
+        return -3;
+    }
+
     /* Brief delay to let the network stack settle after the native dialog */
     sceKernelDelayThread(100 * 1000);
 
+    /* Saved host entries are hints, not proof that this PSP's current client
+     * certificate is paired (settings can be copied between devices). */
+    if (g_is_paired) {
+        char verify_path[256], verify_response[4096], pair_status[16];
+        int verify_result, status;
+        snprintf(verify_path, sizeof(verify_path),
+                 "/serverinfo?uniqueid=%s&uuid=%s",
+                 CLIENT_UNIQUE_ID, client_identity_get_uuid());
+        verify_response[0] = '\0';
+        verify_result = https_launch_get(g_sunshine_host, SUNSHINE_HTTPS_PORT,
+                                        verify_path, verify_response, sizeof(verify_response));
+        status = verify_result >= 0 ? xml_get_status_code_attr(verify_response) : 0;
+        if (status == 401 || status == 403 ||
+            (status == 200 &&
+             xml_get_value_safe(verify_response, "PairStatus", pair_status, sizeof(pair_status)) >= 0 &&
+             strcmp(pair_status, "0") == 0)) {
+            g_is_paired = 0;
+            g_last_paired_host[0] = '\0';
+            pair_log("[PAIR] Host rejected cached pairing; requesting fresh PIN\n");
+        } else if (status != 200 ||
+                   xml_get_value_safe(verify_response, "PairStatus", pair_status, sizeof(pair_status)) < 0 ||
+                   strcmp(pair_status, "1") != 0) {
+            pair_log("[PAIR] Cannot verify pairing (transport=%d status=%d); not requesting games\n",
+                     verify_result, status);
+            return -1;
+        }
+    }
     need_pairing = !g_is_paired;
 
     if (need_pairing) {
@@ -5005,8 +5178,6 @@ static int cancel_thread_func(SceSize args, void *argp)
     return 0;
 }
 
-static SceUID g_cancel_tid = -1;
-
 void network_cancel_stream_session(void)
 {
     if (g_cancel_tid >= 0) {
@@ -5021,7 +5192,12 @@ void network_cancel_stream_session(void)
                                         0,
                                         NULL);
     if (g_cancel_tid >= 0) {
+        pair_log("[CANCEL-THREAD] created tid=0x%08X; starting\n",
+                 (unsigned)g_cancel_tid);
         sceKernelStartThread(g_cancel_tid, 0, NULL);
+    } else {
+        pair_log("[CANCEL-THREAD] create failed 0x%08X\n",
+                 (unsigned)g_cancel_tid);
     }
 }
 
@@ -5029,7 +5205,12 @@ int network_wait_for_cancel_thread(void)
 {
     if (g_cancel_tid >= 0) {
         const unsigned int PSP_THREAD_ALREADY_GONE = 0x80020198u;
-        SceUInt timeout = 250000;
+        /* The host's authenticated cancel can need about 5.6 seconds for the
+         * client-certificate TLS handshake and request write. Keep a bounded
+         * 7-second wait so that normal completions do not fall through as a
+         * timeout. Never force-terminate a worker inside the PSP TLS syscall;
+         * a genuinely slower worker remains tracked for safe async completion. */
+        SceUInt timeout = 7000000;
         int wait_ret;
         int delete_ret;
 
@@ -5040,18 +5221,15 @@ int network_wait_for_cancel_thread(void)
             if ((unsigned int)wait_ret == PSP_THREAD_ALREADY_GONE) {
                 pair_log("[NET] [CANCEL-THREAD] already exited/deleted (0x%08X)\n",
                          (unsigned)wait_ret);
+                g_cancel_tid = -1;
+                return 1;
             } else if (wait_ret == (int)0x800201A8) {
-                pair_log("[NET] [CANCEL-THREAD] wait timed out; force terminate-delete for module-safe teardown\n");
+                pair_log("[NET] [CANCEL-THREAD] wait timed out; leaving TLS worker alive for safe asynchronous completion\n");
             } else {
-                pair_log("[NET] [CANCEL-THREAD] wait failed 0x%08X; force terminate-delete for module-safe teardown\n",
+                pair_log("[NET] [CANCEL-THREAD] wait failed 0x%08X; preserving worker for safe asynchronous completion\n",
                          (unsigned)wait_ret);
             }
-            delete_ret = sceKernelTerminateDeleteThread(g_cancel_tid);
-            if (delete_ret < 0 &&
-                (unsigned int)delete_ret != PSP_THREAD_ALREADY_GONE) {
-                pair_log("[NET] [CANCEL-THREAD] terminate-delete failed 0x%08X\n",
-                         (unsigned)delete_ret);
-            }
+            return 0;
         } else {
             delete_ret = sceKernelDeleteThread(g_cancel_tid);
             if (delete_ret < 0 &&

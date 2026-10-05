@@ -1,8 +1,8 @@
 # Contributing to PSP Moonlight
 
-Contributions are welcome. This is a PSP homebrew project targeting real hardware, so platform-specific testing matters.
+Contributions are welcome. This is a PSP homebrew project for Sony PSP systems.
 
-This is the **v1.2.0 public release** of the rewritten PSP-native Moonlight pipeline. Hardware testing is still highly valuable for ongoing maintenance and compatibility work.
+This is the **v1.5.0 release** of the PSP-native Moonlight client. Contributions can improve compatibility, playback, controls and documentation.
 
 ## Before You Start
 
@@ -10,7 +10,7 @@ The PSP's dual-CPU model has constraints that are not obvious from desktop build
 
 - [docs/BUILDING.md](docs/BUILDING.md) - toolchain setup
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - asymmetric CPU, ME, GE, and network pipeline
-- [docs/DECODER_PIPELINE.md](docs/DECODER_PIPELINE.md) - OpenH264 plus ME conversion path
+- [docs/DECODER_PIPELINE.md](docs/DECODER_PIPELINE.md) - Sony AVC and frame presentation
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) - current platform limits and troubleshooting notes
 - [docs/UI_FLOW.md](docs/UI_FLOW.md) - menu, host, pairing, app list, and stream flow
 
@@ -32,19 +32,6 @@ The Media Engine is a second MIPS core with no normal kernel context:
 - Handle cache coherency explicitly before and after ME work.
 - Pass cached addresses to ME code; do not pass uncached aliases.
 - Keep ME helpers small, deterministic, and documented.
-
-## Hardware Testing
-
-PPSSPP is useful for UI and control-flow checks, but it does not emulate ME timing, PSP Wi-Fi, cache coherency, or the same memory pressure as real hardware. Test on real PSP hardware before submitting changes that touch decode, RTP/FEC, audio, input, pairing, networking, or rendering.
-
-Baseline PSP-1000 test configuration:
-
-- ARK-4 on 6.60 or 6.61
-- Sunshine host on a local 2.4 GHz 802.11b/g network
-- H.264 Baseline with CAVLC enabled
-- Performance first: 300x170, 30 fps, 384 kbps, 1056-byte packets, FEC 35 percent, audio disabled
-- Balanced follow-up: 360x204, 20 fps, 480 kbps, 1200-byte packets, FEC 35 percent, audio enabled
-- At least three minutes of playback for stream changes; short runs do not cover watchdog, reconnect, and buffer edge cases
 
 ## Code Style
 
@@ -68,8 +55,8 @@ Baseline PSP-1000 test configuration:
 
 1. Fork the repo and branch off `main`.
 2. Build with `make clean && make RETAIL_BUILD=1`.
-3. Test on real hardware when your change touches decode, ME, RTP/FEC, audio, input, pairing, networking, or rendering.
-4. Describe what changed, why, and what hardware plus stream preset you tested.
+3. Describe the PSP models, firmware and stream settings affected by your change.
+4. Explain what changed and why.
 5. Update docs when behavior, settings, limitations, or build requirements change.
 
 ## Questions

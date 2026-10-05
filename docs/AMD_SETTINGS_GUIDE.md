@@ -2,7 +2,7 @@
 
 ## Overview
 
-AMD AMF (Advanced Media Framework) is the hardware video encoder in AMD Radeon GPUs (RX 400 series and newer). It uses the Video Core Engine (VCE) for H.264/HEVC encoding with minimal CPU overhead. For PSP streaming, AMF works well when configured correctly — our A/B testing showed some default settings cause failures while others deliver excellent performance.
+AMD AMF (Advanced Media Framework) is the hardware video encoder in AMD Radeon GPUs (RX 400 series and newer). It uses the Video Core Engine (VCE) for H.264/HEVC encoding with minimal CPU overhead. For PSP streaming, select a low-latency H.264 profile and avoid bitrate spikes that exceed the wireless link budget.
 
 This is one backend-specific guide in the full host-encoder guidance set:
 
@@ -10,7 +10,7 @@ This is one backend-specific guide in the full host-encoder guidance set:
 - Intel users: see `docs/QSV_SETTINGS_GUIDE.md`
 - Software encoder users: see `docs/SOFTWARE_ENCODING_GUIDE.md`
 
-For all backends, the shared compatibility baseline is the same: H.264 Baseline + CAVLC with conservative starting bitrate/resolution.
+For CAVLC, use H.264 Baseline. For CABAC, use H.264 Main. PSP Moonlight selects the Sony decoder mode from the stream's in-band PPS.
 
 > **Sunshine vs Apollo:** All AMD encoder settings are identical between Sunshine and Apollo (ClassicOldSong fork). The encoding pipeline is shared code.
 
@@ -43,7 +43,7 @@ This is the most impactful setting. It sets a base "template" of hidden internal
 | `webcam` | Slow | Medium | High | Not useful for game streaming |
 | `transcoding` | Slowest | Highest | Highest | Not useful for real-time streaming |
 
-**PSP recommendation:** `ultralowlatency` or `lowlatency`. Our A/B testing showed `lowlatency_high_quality` actually delivered the highest FPS (38 fps peak) — likely because it produces cleaner frames that decode faster on the PSP.
+**PSP recommendation:** `ultralowlatency` or `lowlatency`. Use `ultralowlatency` for minimum encode delay or `lowlatency_high_quality` when image quality matters more.
 
 ---
 
@@ -63,7 +63,7 @@ Controls how the encoder manages bitrate (how many bits each frame gets).
 | `vbr_peak` | Variable bitrate with a hard ceiling — never exceeds max | Preventing spikes |
 | `cqp` | Ignores bitrate entirely — uses fixed quality level (QP) | **Avoid for PSP** — can exceed bandwidth |
 
-**PSP recommendation:** `vbr_latency`. Our testing showed `cqp` mode caused complete streaming failure because it doesn't respect the 384 kbps bitrate limit.
+**PSP recommendation:** `vbr_latency`. CQP can exceed the selected bitrate and create large network bursts; prefer a bitrate-constrained rate-control mode for PSP streaming.
 
 ---
 
@@ -99,7 +99,7 @@ This only affects H.264 streams (not HEVC or AV1). It controls how the compresse
 | `cavlc` | Less efficient | Faster to decode | Better for weak decoders |
 | `cabac` | More efficient (~10-15% smaller) | Slower to decode | Better quality per bit |
 
-**PSP recommendation:** `cavlc` (or `cabac` if your host's AMD AMF encoder defaults to CABAC and ignores the CAVLC selection). In v1.4.0, client-side CABAC decoding has been fully optimized and is supported without stalls or crashes. However, CAVLC remains recommended if configurable, as it consumes slightly less PSP CPU power.
+**PSP recommendation:** Use CAVLC with H.264 Baseline or CABAC with H.264 Main. The hardware AVC decoder selects the coder from the in-band PPS and supports both modes.
 
 ---
 
@@ -112,7 +112,7 @@ This only affects H.264 streams (not HEVC or AV1). It controls how the compresse
 
 HRD (Hypothetical Reference Decoder) forces the encoder to produce a bitstream that any standard-compliant decoder can handle without buffer overflow. In practice, it makes bitrate control stricter.
 
-**PSP recommendation:** `disabled`. Enabling HRD can cause visual artifacts on some AMD cards. Our testing showed it works but adds no benefit at PSP bitrates.
+**PSP recommendation:** `disabled`. Enabling HRD can cause visual artifacts on some AMD cards. Leave HRD disabled unless your encoder requires it for bitrate conformance.
 
 ---
 
@@ -220,38 +220,3 @@ Allows streaming without a physical monitor connected. Useful for dedicated stre
 **PSP recommendation:** `disabled` for normal use. Enable only if your PC has no monitor attached. Note: first connection with headless mode may show incorrect codec capabilities until reconnection.
 
 ---
-
-## A/B Test Results Summary
-
-Earlier hardware tests covered 14 encoder combinations on PSP at the old low-resolution profile. Keep the encoder choices below, but use the v1.2 preset ladder for stream size, frame rate, bitrate, packet size, and audio state:
-
-| Rank | Configuration | Peak FPS | Decode Latency | Stability | Notes |
-|------|--------------|----------|---------------|-----------|-------|
-| 1 | LowLat HQ + Speed + VBR | 38.2 | 25.9 ms | Excellent | **Best overall** |
-| 2 | Quality preset | 28.1 | 35.2 ms | Excellent | Best visual quality |
-| 3 | QP 22 | 16.1 | 33.2 ms | Good | Strong fallback |
-| 4 | VBAQ Off | 20.0 | 27.7 ms | Good | Alternative |
-| 5 | HRD Enforced | 12.7 | 35.6 ms | Fair | Unnecessary constraint |
-| — | Baseline (current) | — | — | **Failed** | Decode errors |
-| — | CQP mode | — | — | **Failed** | Ignores bitrate limit |
-| — | CBR+Balanced+HRD | — | — | **Failed** | Over-constrained |
-
-### Recommended Apollo/Sunshine Config for PSP
-
-```ini
-encoder = amdvce
-amd_usage = lowlatency_high_quality
-amd_quality = speed
-amd_rc = vbr_latency
-amd_coder = cavlc
-amd_enforce_hrd = disabled
-amd_preanalysis = disabled
-amd_vbaq = enabled
-qp = 28
-fec_percentage = 35
-hevc_mode = 0
-av1_mode = 0
-```
-
----
-

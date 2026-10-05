@@ -25,6 +25,8 @@ struct me_struct
 
 int InitME(volatile struct me_struct *mei );
 void KillME(volatile struct me_struct *mei );
+int RequestModuleUnload(SceUID modid);
+int BootAvcMode(int mode);
 int CallME(volatile struct me_struct *mei, int func, int param, int prelen, void *preadr, int postlen, void *postadr);
 int WaitME(volatile struct me_struct *mei);
 int BeginME(volatile struct me_struct *mei, int func, int param, int prelen, void *preadr, int postlen, void *postadr);

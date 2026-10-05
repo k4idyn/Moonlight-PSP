@@ -11,6 +11,8 @@ Software encoding uses your PC's CPU (via x264/libx264) instead of GPU hardware.
 
 Software encoding is **significantly slower** than hardware encoding. For PSP preset streaming, it is usually fine because the resolution is low.
 
+For H.264, use Baseline with CAVLC or Main with CABAC. PSP Moonlight selects its decoder mode from the emitted stream.
+
 ## Settings
 
 ### `sw_preset` — Speed vs Quality
@@ -32,7 +34,7 @@ Software encoding is **significantly slower** than hardware encoding. For PSP pr
 | `slower` | Very slow | Excellent | ~70% |
 | `veryslow` | Slowest | Best | ~90% |
 
-**PSP recommendation:** `superfast` or `veryfast`. At the v1.2 PSP preset sizes, even `superfast` looks decent. Don't go slower than `fast` — the added quality is invisible on the PSP screen and the CPU cost isn't worth it.
+**PSP recommendation:** `superfast` or `veryfast`. Use superfast or veryfast for low-latency host encoding. Stream bitrate, resolution, and wireless conditions determine client workload.
 
 ---
 

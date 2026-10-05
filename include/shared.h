@@ -4,11 +4,11 @@
  * Shared between the network receive thread and the decoder thread.
  *
  * Network thread: receives UDP packets, writes into PacketRingBuffer.
- * Decoder thread: reads ring buffer, runs CAVLC+VFPU decode, outputs RGBA.
+ * Video worker: reads ring data, dispatches to the selected decoder, outputs RGBA.
  * Main thread:    reads FrameRingBuffer, displays via GPU.
  *
- * The asymmetric dual-core pipeline (Main CPU + Media Engine) is internal
- * to the software decode pipeline (sw_decode_pipeline.h).
+ * The software-decoder build uses the Main CPU and Media Engine for decode
+ * and color conversion. The hardware build uses Sony AVC through the ME.
  */
 
 #ifndef SHARED_H

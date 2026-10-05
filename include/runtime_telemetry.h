@@ -1,5 +1,5 @@
 /*
- * runtime_telemetry.h - Lightweight non-retail hardware utilization counters.
+ * runtime_telemetry.h - Lightweight diagnostic wall-time counters.
  */
 
 #ifndef RUNTIME_TELEMETRY_H
@@ -37,6 +37,9 @@ void telemetry_reset(void);
 void telemetry_accum_cpu(u32 elapsed_us);
 void telemetry_accum_gpu(u32 elapsed_us);
 void telemetry_accum_me(u32 elapsed_us);
+/* Percentages are measured work-time shares, not hardware utilization
+ * registers. CPU/ME values describe the software decoder path; GPU is GU
+ * submission plus synchronization wall time. */
 void telemetry_sample(u32 elapsed_us, u32 *cpu_pct, u32 *gpu_pct, u32 *me_pct);
 void telemetry_accum_video_rx(u32 bytes);
 void telemetry_accum_video_accept(u32 bytes);

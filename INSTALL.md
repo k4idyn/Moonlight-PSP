@@ -1,4 +1,4 @@
-# Installation Guide - PSP Moonlight v1.4.0
+# Installation Guide - PSP Moonlight v1.5.0
 
 ## Prerequisites
 
@@ -47,7 +47,7 @@ ms0:/
 
 5. Safely eject the Memory Stick or disconnect USB.
 
-Both files must be in the same folder. The app loads `moonlight_me_helper.prx` at startup to initialize Media Engine conversion.
+Both files must be in the same folder. The app loads `moonlight_me_helper.prx` at startup to prepare Sony hardware AVC decoding.
 
 Runtime settings, pairing identity, logs, and icon cache are stored separately under `ms0:/PSP/SAVEDATA/Moonlight/`.
 
@@ -65,8 +65,8 @@ For a clean upgrade, remove stale old-build Moonlight clutter before copying the
    - `ms0:/raw_dump.h264`
    - `ms0:/idr_dump.h264`
 2. Delete the old install folder: `ms0:/PSP/GAME/Moonlight/`.
-3. Recreate `ms0:/PSP/GAME/Moonlight/` and copy the v1.4 `EBOOT.PBP` and `moonlight_me_helper.prx` into it.
-4. Pair again in Sunshine. v1.4 stores the client identity under `ms0:/PSP/SAVEDATA/Moonlight/`.
+3. Recreate `ms0:/PSP/GAME/Moonlight/` and copy the v1.5 `EBOOT.PBP` and `moonlight_me_helper.prx` into it.
+4. Pair again in Sunshine. v1.5 stores the client identity under `ms0:/PSP/SAVEDATA/Moonlight/`.
 
 ---
 
@@ -79,8 +79,8 @@ PSP Moonlight streams from Sunshine. Configure the host for low-latency H.264 ou
 | Setting | Value | Why |
 |---|---|---|
 | Video Codec | H.264 | Only codec supported by this PSP client |
-| Encoder Profile | Baseline | Lowest PSP decode cost |
-| Entropy Coding | CAVLC / CABAC | CAVLC is recommended for lower CPU overhead, but CABAC is fully supported and optimized in v1.4.0 (ideal for AMD hosts) |
+| Encoder Profile | Baseline / Main | Baseline for CAVLC, Main for CABAC |
+| Entropy Coding | CAVLC / CABAC | Sony hardware decoding selects the matching mode from the stream |
 | Rate Control | Low latency / bandwidth limited | Reduces burst pressure on PSP Wi-Fi |
 | FEC | 35 percent starting point | Adds recovery data for lossy 802.11b links |
 
@@ -89,14 +89,14 @@ PSP Moonlight streams from Sunshine. Configure the host for low-latency H.264 ou
 | PSP Preset | Stream | Bitrate | Packet Size | Audio |
 |---|---|---:|---:|---|
 | Performance | 300x170 @ 30 fps | 384 kbps | 1056 bytes | Disabled |
-| Balanced | 360x204 @ 20 fps | 480 kbps | 1200 bytes | Enabled |
-| Quality | 480x272 @ 10 fps | 576 kbps | 1200 bytes | Enabled |
+| Balanced (default) | 360x204 @ 20 fps | 480 kbps | 1200 bytes | Enabled |
+| Quality | 480x272 @ 15 fps | 576 kbps | 1200 bytes | Enabled |
 
-Start with Performance on PSP-1000 or weak Wi-Fi. Use Balanced when input, audio, and playback stay stable. Use Quality when you specifically want native 480x272 output.
+Balanced is the recommended default for visual detail, smoothness and audio. New installations select it automatically; upgrades retain your saved settings. Choose Quality for native 480x272 output at 15 fps, or Performance for 30 fps with audio disabled.
 
 ### Choosing Entropy Coding (CAVLC vs CABAC)
 
-In v1.4.0, client-side CABAC decoding has been fully optimized. However, CAVLC remains recommended if configurable, as it consumes slightly less PSP CPU power. For AMD host encoders (which often force CABAC and ignore CAVLC requests), CABAC can be used directly without performance penalties.
+v1.5 supports both CAVLC and CABAC through Sony hardware AVC. Use Baseline for CAVLC or Main for CABAC. The PSP selects its decoder mode from the stream, including when a host encoder emits CABAC despite a CAVLC request.
 
 To configure CAVLC in Sunshine's web UI:
 
@@ -121,7 +121,7 @@ qsv_coder = cavlc
 
 ### Host Encoder Notes
 
-Hardware encoders such as NVENC, AMF, and QSV are fine. The PSP cares about the output bitstream, not which host encoder produced it. Keep H.264 Baseline + CAVLC and avoid settings that create large bitrate spikes.
+Hardware encoders such as NVENC, AMF, and QSV are fine. The PSP cares about the output bitstream, not which host encoder produced it. Use H.264 Baseline/CAVLC or Main/CABAC and avoid settings that create large bitrate spikes.
 
 ---
 
@@ -129,7 +129,7 @@ Hardware encoders such as NVENC, AMF, and QSV are fine. The PSP cares about the 
 
 1. On the PSP, open Game -> Memory Stick.
 2. Launch PSP Moonlight.
-3. Choose your PSP preset in Settings. Performance is the safest starting point.
+3. Open Settings. Balanced is selected by default; choose Quality for native resolution or Performance for 30 fps.
 4. Continue to Wi-Fi setup. If the PSP is already connected, the network dialog is skipped.
 5. Select your Sunshine host, or add the IP manually if discovery misses it.
 6. If the host is unpaired, the PSP shows a 4-digit PIN.

@@ -1,8 +1,10 @@
 # Building PSP Moonlight
 
-_v1.4.0_
+_PSP Moonlight v1.5.0 build guide._
 
-This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Linux**, and **macOS**.
+v1.5 uses Sony hardware AVC with unified Main-mode priming and 40 ms audio packets. It links Sony PSP MPEG/AVC imports. Earlier software decoder sources are preserved under `legacy/software/` and excluded from the application build.
+
+Build with a community PSP toolchain on Windows, Linux or macOS.
 
 ---
 
@@ -10,7 +12,7 @@ This guide covers building PSP Moonlight from source on **Windows (WSL2)**, **Li
 
 ### 1. PSPSDK Toolchain
 
-The project requires the community PSP toolchain, which provides `psp-gcc 4.3.5` for the MIPS Allegrex architecture.
+The project requires the community PSP toolchain for the MIPS Allegrex architecture. 
 
 **Recommended: pspdev/psptoolchain (Docker or native)**
 
@@ -60,23 +62,13 @@ To set permanently: **Settings → System → About → Advanced system settings
 
 Included with the pspdev toolchain (`make.exe` in the bin directory).
 
-### 3. OpenH264 (PSP cross-compiled)
-
-`openh264_decode.cpp` links against PSP-cross-compiled OpenH264 (`libopenh264.a`). The pre-compiled
-static library must be present in `$PSPDEV/psp/lib`. Build OpenH264 from source for the PSP MIPS
-target, or download a pre-built package.
-
-> **Note:** The legacy FFmpeg decode path (`legacy/ffmpeg_decode.c`) is no longer built by default.
-> If you need the FFmpeg path for comparison, see the `legacy/` directory and its original build
-> instructions in the [FFmpeg PSP port](https://github.com/pspdev/psp-ports).
-
 ---
 
 ## Building
 
 ### Step 1 — Build the Media Engine Helper PRX
 
-The ME helper is a separate kernel PRX that must be built **before** the main application.
+The ME helper is a separate kernel PRX. The root make all target builds it as a dependency; build it separately only when you need the helper module on its own.
 
 ```bash
 cd moonlight_me_helper
@@ -92,46 +84,18 @@ Expected output:
   PRX  moonlight_me_helper.prx
 ```
 
-### Step 2 — Build the Main Application
+## Application Build
+
+### Sony hardware AVC
+
+The v1.5 hardware build selects CAVLC/CABAC mode from the in-band PPS and submits H.264 access units to Sony sceMpeg AVC.
 
 ```bash
-cd ..
-make
+make clean
+make -j2 RETAIL_BUILD=1 PSP_HARDWARE_AVC=1 PSP_AVC_UNIFIED_MAIN_MODE=1 PSP_VIDEO_FEC_PERCENT=35 PSP_VIDEO_FEC_MIN_REQUIRED=1 PSP_AUDIO_PACKET_DURATION_MS=40
 ```
 
-`make` now defaults to `RETAIL_BUILD=1` for public packaging.
-
-For local diagnostics and verbose logging during development, use:
-
-```bash
-make RETAIL_BUILD=0
-```
-
-Expected output (abbreviated):
-```
-  CC   src/main.c
-  CXX  src/openh264_decode.cpp
-  CC   src/sw_me_worker.c
-  CC   src/sw_decoder_thread.c
-  CC   src/stream_resolution.c
-  CC   src/signal_strength.c
-  ...
-  LD   moonlight.elf
-  STRIP moonlight.prx
-  PACK  EBOOT.PBP
-```
-
-> **Known harmless warning:** Some PSPSDK setups print a warning about a duplicate
-> `moonlight.elf` target from `build.mak`. This is not an error when `EBOOT.PBP`
-> and `moonlight.prx` are produced and `make` exits successfully.
-
-### Step 3 — Verify Outputs
-
-```bash
-ls -lh EBOOT.PBP moonlight.prx moonlight_me_helper/moonlight_me_helper.prx
-```
-
----
+The root build creates the matching Media Engine helper PRX and EBOOT.PBP. Install both in the same PSP game directory.
 
 ## Output Files
 
@@ -189,7 +153,8 @@ cd moonlight_me_helper && make clean
 | `psp-gcc: command not found` | PATH not set | Add toolchain `bin/` to PATH |
 | `undefined reference to sceMe*` | ME helper not built first | Run `make` in `moonlight_me_helper/` first |
 | `mksfoex: command not found` | PSPSDK bin not in PATH | Same fix as above |
-| `make[1]: *** [moonlight.elf] Error 1` | Duplicate target warning from build.mak | Harmless — check if `EBOOT.PBP` was produced |
-| `PRX > 2 MB` | Object files not stripped | Run `psp-strip moonlight.prx` manually |
+| `make[1]: *** [moonlight.elf] Error 1` | Compile or link failed | Inspect the first compiler/linker error and rebuild successfully; an existing EBOOT can be stale |
+| `warning: overriding commands for target moonlight.elf` | The project replaces an SDK recipe | Check that make exits zero and the fresh main/helper/EBOOT match the selected flags |
+| Unexpected PRX size | Diagnostics or symbols | Rebuild the intended retail mode from clean objects and preserve its matching helper and package hashes |
 | Black screen on PSP | ME helper PRX not found | Confirm both files are in the same XMB directory |
 | `avcodec.h: No such file` | Legacy FFmpeg path referenced | Legacy path no longer built by default; see `legacy/` |

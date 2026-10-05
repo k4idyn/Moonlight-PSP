@@ -59,6 +59,7 @@ _link.rsp
 # Log / dump artifacts
 *.log
 *.txt
+!docs/licenses/*.txt
 
 # Test artifacts
 test_logs/

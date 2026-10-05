@@ -29,7 +29,7 @@
 #include <string.h>
 #include <malloc.h>
 
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "shared.h"
 #include "diag_log.h"
 #include "me.h"

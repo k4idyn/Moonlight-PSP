@@ -34,7 +34,7 @@
 #include "decode_flags.h"
 #include "rtp_reassembly.h"
 #include "signal_strength.h"
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 
 /* ── Globals from network_connect.c ──────────────────────────────── */
 extern char          g_video_server_ip[64];
@@ -258,6 +258,66 @@ typedef struct {
 static retx_entry_t retx_ring[RETX_SLOTS];
 static int retx_head = 0;  /* next slot to write */
 
+/* Input must retain each button/key transition until acknowledged. A separate
+ * bounded queue prevents input traffic from overwriting control retransmits.
+ * All input entries are protected by this semaphore, including ACK handling. */
+static retx_entry_t input_retx_ring[RETX_SLOTS];
+static u32 input_first_send_us[RETX_SLOTS];
+#define INPUT_RETX_MAX_TRIES 8
+#define INPUT_DELIVERY_TIMEOUT_US 8000000U
+static SceUID ctrl_input_sem_id = -1;
+static unsigned int input_queued, input_acked, input_retries;
+
+static int input_lock(void)
+{
+    SceUInt timeout = 100000;
+    if (ctrl_input_sem_id < 0) return -1;
+    return sceKernelWaitSema(ctrl_input_sem_id, 1, &timeout);
+}
+
+static void input_unlock(void)
+{
+    sceKernelSignalSema(ctrl_input_sem_id, 1);
+}
+
+static void input_delivery_failed(void)
+{
+    /* Continuing after a missing reliable sequence would leave controls stuck.
+     * Surface the failure and take the normal stream cleanup path instead. */
+    ctrl_log("[CTRL INPUT] reliable delivery failed; stopping stream\n");
+    g_stream_status = 1;
+    me_running = 0;
+}
+
+static void input_retx_ack(unsigned char channel, unsigned short seq)
+{
+    int i;
+    if (input_lock() < 0) return;
+    for (i = 0; i < RETX_SLOTS; i++) {
+        retx_entry_t *e = &input_retx_ring[i];
+        if (e->active && e->channel == channel && e->seq == seq) {
+            e->active = 0;
+            input_acked++;
+            break;
+        }
+    }
+    input_unlock();
+}
+
+static void delete_ctrl_gcm_sem(void)
+{
+    if (ctrl_input_sem_id >= 0) {
+        int i, pending = 0;
+        for (i = 0; i < RETX_SLOTS; i++) pending += !!input_retx_ring[i].active;
+        ctrl_log("[CTRL INPUT] queued=%u acked=%u retries=%u pending=%d\n",
+                 input_queued, input_acked, input_retries, pending);
+        sceKernelDeleteSema(ctrl_input_sem_id);
+        ctrl_input_sem_id = -1;
+        memset(input_retx_ring, 0, sizeof(input_retx_ring));
+    }
+    sceKernelDeleteSema(ctrl_gcm_sem_id);
+}
+
 /* ── RTT-adaptive retransmit timeout (Jacobson/Karels) ──────────
  * Replaces the fixed 300ms timeout with one that adapts to actual
  * network conditions.  On LAN, RTO drops to ~50ms for faster gap
@@ -335,6 +395,8 @@ static void retx_ack(unsigned char channel, unsigned short seq)
 {
     int i;
     u32 now = sceKernelGetSystemTimeLow();
+    if (channel == 0x02 || channel == 0x03 || channel == 0x10)
+        input_retx_ack(channel, seq);
     for (i = 0; i < RETX_SLOTS; i++) {
         retx_entry_t *e = &retx_ring[i];
         if (e->active && !e->acked && e->channel == channel && e->seq == seq) {
@@ -358,9 +420,47 @@ static void retx_ack(unsigned char channel, unsigned short seq)
 
 /* Retransmit un-ACKed reliable packets. Called from the ping thread.
  * Returns the number of packets retransmitted. */
+static int input_retx_scan(int sock, const struct sockaddr_in *dst)
+{
+    int i, sent = 0, failed = 0;
+    u32 now = sceKernelGetSystemTimeLow();
+    if (input_lock() < 0) return 0;
+    for (i = 0; i < RETX_SLOTS; i++) {
+        retx_entry_t *e = &input_retx_ring[i];
+        u32 retry_delay = s_rto_us;
+        unsigned int shift = e->retries < 5 ? e->retries : 5;
+        retry_delay <<= shift;
+        if (retry_delay > 1000000U) retry_delay = 1000000U;
+        if (!e->active || (now - e->send_time_us) < retry_delay) continue;
+        if (e->retries >= INPUT_RETX_MAX_TRIES ||
+            (now - input_first_send_us[i]) >= INPUT_DELIVERY_TIMEOUT_US) {
+            ctrl_log("[CTRL INPUT] exhausted ch=%u seq=%u age=%uus tries=%u\n",
+                     (unsigned)e->channel, (unsigned)e->seq,
+                     (unsigned)(now - input_first_send_us[i]), (unsigned)e->retries);
+            failed = 1; break;
+        }
+        /* ENet's sentTime must describe this send, while the encrypted input
+         * bytes and reliable sequence stay identical to the original packet. */
+        {
+            unsigned short sent_time = (unsigned short)(now / 1000U);
+            e->data[2] = (unsigned char)(sent_time >> 8);
+            e->data[3] = (unsigned char)sent_time;
+        }
+        if (sceNetInetSendto(sock, e->data, e->len, MSG_DONTWAIT,
+                            (const struct sockaddr *)dst, sizeof(*dst)) >= 0)
+            sent++;
+        e->send_time_us = now;
+        e->retries++;
+        input_retries++;
+    }
+    input_unlock();
+    if (failed) input_delivery_failed();
+    return sent;
+}
+
 static int retx_scan(int sock, const struct sockaddr_in *dst)
 {
-    int i, retransmitted = 0;
+    int i, retransmitted = input_retx_scan(sock, dst);
     u32 now = sceKernelGetSystemTimeLow();
 
     for (i = 0; i < RETX_SLOTS; i++) {
@@ -1589,11 +1689,9 @@ int control_stream_send_fec_status(unsigned int frame_index,
 /* ══════════════════════════════════════════════════════════════════
  * control_stream_send_input - Send input through encrypted control channel
  *
- * Uses UNSEQUENCED delivery: the PSP's lightweight ENet lacks retransmission,
- * so a single lost reliable packet causes the server to buffer ALL subsequent
- * input on that channel forever.  Unsequenced bypasses ordered delivery,
- * letting each packet be processed independently — lost packets are simply
- * skipped and the next one carries full current state.
+ * Button, keyboard, scroll and gamepad packets use reliable ordered delivery.
+ * Only relative mouse motion is unsequenced. Publish a retained packet before
+ * its first send so an immediate ACK cannot race ahead of queue insertion.
  * ══════════════════════════════════════════════════════════════════ */
 int control_stream_send_input(const unsigned char *payload, int payload_len,
                               unsigned char channel)
@@ -1602,11 +1700,16 @@ int control_stream_send_input(const unsigned char *payload, int payload_len,
     int pkt_len;
     struct sockaddr_in dst;
     int ret = 0;
+    int slot = -1;
+    int reliable;
     static unsigned int s_input_tx_failures = 0;
 
     if (!ctrl_crypto_ready || ctrl_socket < 0) {
         return -1;
     }
+    if (!payload || payload_len < 8 || payload_len > 92) return -1;
+    reliable = !(channel == 0x03 && payload[4] == 0x07 &&
+                 payload[5] == 0 && payload[6] == 0 && payload[7] == 0);
 
     memset(&dst, 0, sizeof(dst));
     dst.sin_len    = (unsigned char)sizeof(dst);
@@ -1614,15 +1717,50 @@ int control_stream_send_input(const unsigned char *payload, int payload_len,
     dst.sin_port   = htons((unsigned short)g_control_server_port);
     dst.sin_addr.s_addr = inet_addr(g_video_server_ip);
 
-    pkt_len = build_encrypted_unsequenced_msg(pkt, sizeof(pkt),
-                          CTRL_TYPE_INPUT,
-                          payload, payload_len, channel);
+    if (reliable) {
+        int i;
+        if (input_lock() < 0) { input_delivery_failed(); return -1; }
+        for (i = 0; i < RETX_SLOTS; i++) {
+            if (!input_retx_ring[i].active) { slot = i; break; }
+        }
+        /* Reject before allocating an ENet sequence; never create a gap. */
+        if (slot < 0) {
+            input_unlock();
+            input_delivery_failed();
+            return -1;
+        }
+        pkt_len = build_encrypted_control_msg(pkt, sizeof(pkt),
+                         CTRL_TYPE_INPUT, payload, payload_len, channel);
+    } else {
+        pkt_len = build_encrypted_unsequenced_msg(pkt, sizeof(pkt),
+                         CTRL_TYPE_INPUT, payload, payload_len, channel);
+    }
     if (pkt_len <= 0) {
+        if (reliable) { input_unlock(); input_delivery_failed(); }
         return -1;
+    }
+
+    if (reliable) {
+        retx_entry_t *e = &input_retx_ring[slot];
+        memcpy(e->data, pkt, (size_t)pkt_len);
+        e->len = pkt_len;
+        e->channel = channel;
+        e->seq = get_be16(pkt + 6);
+        e->send_time_us = sceKernelGetSystemTimeLow();
+        input_first_send_us[slot] = e->send_time_us;
+        e->retries = 0;
+        e->active = 1;
+        input_queued++;
     }
 
     ret = ctrl_sendto_with_diag(pkt, pkt_len, &dst,
                                 "input", &s_input_tx_failures);
+    if (reliable) {
+        input_unlock();
+        /* A nonblocking initial send can fail transiently. The retained
+         * packet remains queued for retransmission and ordered delivery. */
+        return pkt_len;
+    }
     return ret;
 }
 
@@ -1819,6 +1957,23 @@ int control_stream_request_idr_startup(void)
  * ══════════════════════════════════════════════════════════════════ */
 int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
 {
+#if defined(PSP_HARDWARE_AVC) && PSP_HARDWARE_AVC
+    /* The tested AMD VCE/CAVLC host rejects Gen7 RFI requests.  For the
+     * Sony hardware decoder path, ask for the supported IDR recovery frame
+     * instead of sending CTRL_TYPE_RFI_REQ and leaving the damaged reference
+     * range live on the host.  The fast recovery helper retains the existing
+     * 500 ms request coalescing so loss bursts do not flood the urgent lane. */
+    static unsigned int s_rfi_idr_fallbacks;
+    if (ctrl_socket < 0 || !ctrl_running) {
+        return -1;
+    }
+    s_rfi_idr_fallbacks++;
+    if (s_rfi_idr_fallbacks <= 8u || (s_rfi_idr_fallbacks % 30u) == 0) {
+        ctrl_log("[CTRL] RFI unsupported by hardware stream host; fallback IDR frames %u-%u count=%u\n",
+                 start_frame, end_frame, s_rfi_idr_fallbacks);
+    }
+    return control_stream_request_idr_recovery_fast();
+#else
     unsigned char send_buf[128];
     unsigned char rfi_payload[24];
     int pkt_len;
@@ -1878,6 +2033,7 @@ int control_stream_request_rfi(unsigned int start_frame, unsigned int end_frame)
     ctrl_log("[CTRL] RFI request (0x0301) frames %u-%u urgent=%d\n",
              start_frame, end_frame, ret_urgent);
     return (ret_urgent > 0) ? 0 : -3;
+#endif
 }
 
 
@@ -1952,11 +2108,25 @@ int control_stream_start(void)
         return -1;
     }
 
+    memset(input_retx_ring, 0, sizeof(input_retx_ring));
+    input_queued = input_acked = input_retries = 0;
+    ctrl_input_sem_id = sceKernelCreateSema("ctrl_input_sem", 0, 1, 1, NULL);
+    if (ctrl_input_sem_id < 0) {
+        ctrl_log("[CTRL] input semaphore create failed: %d\n", (int)ctrl_input_sem_id);
+        delete_ctrl_gcm_sem();
+        ctrl_gcm_sem_id = -1;
+        sceKernelDeleteSema(ctrl_seq_sem_id);
+        ctrl_seq_sem_id = -1;
+        mbedtls_gcm_free(&ctrl_gcm_ctx);
+        ctrl_crypto_ready = 0;
+        return -1;
+    }
+
     /* Create UDP socket */
     ctrl_socket = sceNetInetSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (ctrl_socket < 0) {
         ctrl_log("[CTRL] socket() failed\n");
-        sceKernelDeleteSema(ctrl_gcm_sem_id);
+        delete_ctrl_gcm_sem();
         ctrl_gcm_sem_id = -1;
         sceKernelDeleteSema(ctrl_seq_sem_id);
         ctrl_seq_sem_id = -1;
@@ -2085,7 +2255,7 @@ int control_stream_start(void)
         ctrl_log("[CTRL] VERIFY_CONNECT timeout after 5 attempts\n");
         sceNetInetClose(ctrl_socket);
         ctrl_socket = -1;
-        sceKernelDeleteSema(ctrl_gcm_sem_id);
+        delete_ctrl_gcm_sem();
         ctrl_gcm_sem_id = -1;
         sceKernelDeleteSema(ctrl_seq_sem_id);
         ctrl_seq_sem_id = -1;
@@ -2127,7 +2297,7 @@ int control_stream_start(void)
             ctrl_log("[CTRL] START_A build failed\n");
             sceNetInetClose(ctrl_socket);
             ctrl_socket = -1;
-            sceKernelDeleteSema(ctrl_gcm_sem_id);
+            delete_ctrl_gcm_sem();
             ctrl_gcm_sem_id = -1;
             sceKernelDeleteSema(ctrl_seq_sem_id);
             ctrl_seq_sem_id = -1;
@@ -2161,7 +2331,7 @@ int control_stream_start(void)
             ctrl_log("[CTRL] START_B build failed\n");
             sceNetInetClose(ctrl_socket);
             ctrl_socket = -1;
-            sceKernelDeleteSema(ctrl_gcm_sem_id);
+            delete_ctrl_gcm_sem();
             ctrl_gcm_sem_id = -1;
             sceKernelDeleteSema(ctrl_seq_sem_id);
             ctrl_seq_sem_id = -1;
@@ -2199,7 +2369,7 @@ int control_stream_start(void)
             ctrl_running = 0;
             sceNetInetClose(ctrl_socket);
             ctrl_socket = -1;
-            sceKernelDeleteSema(ctrl_gcm_sem_id);
+            delete_ctrl_gcm_sem();
             ctrl_gcm_sem_id = -1;
             sceKernelDeleteSema(ctrl_seq_sem_id);
             ctrl_seq_sem_id = -1;
@@ -2212,7 +2382,7 @@ int control_stream_start(void)
         ctrl_running = 0;
         sceNetInetClose(ctrl_socket);
         ctrl_socket = -1;
-        sceKernelDeleteSema(ctrl_gcm_sem_id);
+        delete_ctrl_gcm_sem();
         ctrl_gcm_sem_id = -1;
         sceKernelDeleteSema(ctrl_seq_sem_id);
         ctrl_seq_sem_id = -1;
@@ -2240,7 +2410,7 @@ int control_stream_start(void)
                 sceKernelDeleteThread(ctrl_recv_thread_id);
                 ctrl_recv_thread_id = -1;
             }
-            sceKernelDeleteSema(ctrl_gcm_sem_id);
+            delete_ctrl_gcm_sem();
             ctrl_gcm_sem_id = -1;
             sceKernelDeleteSema(ctrl_seq_sem_id);
             ctrl_seq_sem_id = -1;
@@ -2261,7 +2431,7 @@ int control_stream_start(void)
             sceKernelDeleteThread(ctrl_recv_thread_id);
             ctrl_recv_thread_id = -1;
         }
-        sceKernelDeleteSema(ctrl_gcm_sem_id);
+        delete_ctrl_gcm_sem();
         ctrl_gcm_sem_id = -1;
         sceKernelDeleteSema(ctrl_seq_sem_id);
         ctrl_seq_sem_id = -1;
@@ -2524,9 +2694,14 @@ void control_stream_stop(void)
     if (ctrl_socket >= 0) {
         unsigned char disc_pkt[16];
         unsigned char *p = disc_pkt;
-        /* ENet protocol header (4 bytes) */
-        p = put_be16(p, (server_peer_id & 0x0FFF) |
-                        ((unsigned short)session_bits << 12));
+        /* ENet protocol header (4 bytes, including sentTime).  The
+         * SENT_TIME flag is required because the following zero word is
+         * part of the header, not the first command byte. */
+        unsigned short disc_header =
+            (server_peer_id & 0x0FFF) |
+            ((unsigned short)(session_bits & 0x03) << 12) |
+            ENET_FLAG_SENT_TIME;
+        p = put_be16(p, disc_header);
         p = put_be16(p, 0); /* sentTime = 0 */
         /* ENet DISCONNECT command (8 bytes) */
         *p++ = ENET_CMD_DISCONNECT | ENET_CMD_FLAG_ACK; /* commandType */
@@ -2571,7 +2746,7 @@ void control_stream_stop(void)
         ctrl_crypto_ready = 0;
     }
     if (ctrl_gcm_sem_id >= 0) {
-        sceKernelDeleteSema(ctrl_gcm_sem_id);
+        delete_ctrl_gcm_sem();
         ctrl_gcm_sem_id = -1;
     }
     if (ctrl_seq_sem_id >= 0) {

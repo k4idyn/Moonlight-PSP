@@ -27,7 +27,7 @@
 #include <string.h>
 #include <malloc.h>
 
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "me.h"
 #include "diag_log.h"
 

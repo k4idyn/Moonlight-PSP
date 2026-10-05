@@ -1,8 +1,8 @@
 # MediaEngine kernel PRX — exports InitME/KillME
-# User-side functions (CallME/BeginME/WaitME etc) live in src/me.c
+# Historical conversion dispatch is preserved in legacy/software/src/me.c.
 
 TARGET = moonlight_me_helper
-OBJS = me_stub.o main.o
+OBJS = me_stub.o main.o avc_boot.o
 
 INCDIR =
 CFLAGS = -O2 -G0 -Wall -std=gnu99
@@ -23,13 +23,16 @@ CC = $(PSP_TOOL_BIN)/psp-gcc
 CXX = $(PSP_TOOL_BIN)/psp-g++
 
 LDFLAGS = -nostartfiles
-LIBS = -lpspkernel
+# build.mak appends the kernel/SDK libraries. Keep the default SDK group at
+# the end so psp-fixup-imports sees its stubs in the expected order.
+LIBS =
 
 EXTRA_TARGETS = MediaEngine.S MediaEngine.o
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
 
+ifeq ($(OS),Windows_NT)
 override CC := $(PSP_TOOL_BIN)/psp-gcc.exe
 override CXX := $(PSP_TOOL_BIN)/psp-g++.exe
 override AS := $(PSP_TOOL_BIN)/psp-gcc.exe
@@ -40,6 +43,7 @@ override STRIP := $(PSP_TOOL_BIN)/psp-strip.exe
 override MKSFO := $(PSP_TOOL_BIN)/mksfo.exe
 override PACK_PBP := $(PSP_TOOL_BIN)/pack-pbp.exe
 override FIXUP := $(PSP_TOOL_BIN)/psp-fixup-imports.exe
+endif
 
 MediaEngine.S: $(PRX_EXPORTS)
 	$(PSP_TOOL_BIN)/psp-build-exports --build-stubs $(PRX_EXPORTS)

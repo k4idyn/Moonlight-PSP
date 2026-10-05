@@ -28,7 +28,7 @@ QSV is available on:
 | `slower` | Slow | Excellent |
 | `veryslow` | Slowest | Best |
 
-**PSP recommendation:** `veryfast` or `faster`. At the v1.2 PSP preset sizes, quality differences between presets are negligible. Use the fastest preset for lowest encoding latency.
+**PSP recommendation:** `veryfast` or `faster`. Use veryfast or faster when host encoding latency is the priority. The PSP stream bitrate and resolution determine the client-side workload.
 
 ---
 
@@ -44,7 +44,7 @@ QSV is available on:
 | `cabac` | Better (~10-15% smaller) | Slower to decode |
 | `cavlc` | Less efficient | Faster to decode |
 
-**PSP recommendation:** `cavlc`. Same reasoning as AMD and NVIDIA — the PSP's CPU is slow, so CAVLC's simpler decoding is beneficial. CABAC is treated as unsupported for normal PSP playback, and the client will return to the menu if a host still delivers CABAC.
+**PSP recommendation:** Use Baseline with CAVLC or Main with CABAC. PSP Moonlight's hardware AVC decoder supports both and selects the matching mode from the stream PPS. CAVLC favors simpler coding; CABAC can use bitrate more efficiently.
 
 ---
 

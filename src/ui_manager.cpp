@@ -338,6 +338,12 @@ static float bmf_draw(float x, float y, u32 color, const char *text, float scale
     return cx;
 }
 
+static float bmf_measure_text(const char *text, float scale)
+{
+    if (!text) return 0.0f;
+    return (float)strlen(text) * 8.0f * scale;
+}
+
 /* =========================================================================
  * Module-private state
  * ========================================================================= */
@@ -1003,6 +1009,14 @@ float ui_draw_text(float x, float y, u32 color, const char *text)
 void ui_draw_text_centered(float cx, float cw, float y, u32 color, const char *text)
 {
     if (!text) return;
+    if (!s_font) {
+        float scale = 1.0f;
+        float text_w = bmf_measure_text(text, scale);
+        float tx = cx + (cw - text_w) * 0.5f;
+        if (tx < cx) tx = cx;
+        bmf_draw(tx, y, color, text, scale);
+        return;
+    }
     float scale = (s_font == s_font_serif) ? 0.55f : 0.48f;
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
@@ -1019,7 +1033,11 @@ void ui_draw_text_centered(float cx, float cw, float y, u32 color, const char *t
 float ui_draw_text_right(float right_margin_x, float y, u32 color, const char *text)
 {
     if (!text) return right_margin_x;
-    if (!s_font) return right_margin_x;
+    if (!s_font) {
+        float scale = 1.0f;
+        return bmf_draw(right_margin_x - bmf_measure_text(text, scale),
+                        y, color, text, scale);
+    }
 
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
@@ -1037,6 +1055,14 @@ float ui_draw_text_right(float right_margin_x, float y, u32 color, const char *t
 void ui_draw_text_medium_centered(float cx, float cw, float y, u32 color, const char *text)
 {
     if (!text) return;
+    if (!s_font) {
+        float scale = 1.2f;
+        float text_w = bmf_measure_text(text, scale);
+        float tx = cx + (cw - text_w) * 0.5f;
+        if (tx < cx) tx = cx;
+        bmf_draw(tx, y, color, text, scale);
+        return;
+    }
     float scale = (s_font == s_font_serif) ? 0.48f : 0.40f;
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
@@ -1199,7 +1225,7 @@ void ui_draw_header(const char *title)
 #define BTN_BADGE_LF   10  /* D-pad left (PS3)            */
 #define BTN_BADGE_RF   11  /* D-pad right (PS3)           */
 #define BTN_BADGE_DP   12  /* D-pad full  (PS3)           */
-#define BTN_BADGE_AN   13  /* Analog nub  (Oculus Remote) */
+#define BTN_BADGE_AN   13  /* Native analog nub prompt   */
 #define BTN_BADGE_AUP  14  /* Analog up                   */
 #define BTN_BADGE_ADN  15  /* Analog down                 */
 #define BTN_BADGE_ALF  16  /* Analog left                 */
@@ -1312,6 +1338,11 @@ void ui_draw_footer_hint(const char *hint_text)
             int j;
             for (j = 0; j < seglen; ++j) seg[j] = p[j];
             seg[seglen] = '\0';
+            if (!s_font) {
+                px = bmf_draw(px, py, UI_COL_TEXT_DIM, seg, 0.93f);
+                p = next;
+                continue;
+            }
             /* Footer text: 0.42f (one step larger than medium) and
              * no upward offset so text sits slightly lower than icons */
             sceGuEnable(GU_BLEND);

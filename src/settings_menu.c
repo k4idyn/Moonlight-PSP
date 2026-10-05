@@ -41,8 +41,8 @@ extern volatile unsigned int g_remote_buttons;
  *   Performance chases the highest stable FPS the PSP can sustain; the
  *   current practical anchor is 30fps, not a fixed ceiling.
  *
- *   2026-05-17 hardware evidence currently anchors:
- *     Quality:     480x272@10fps 576kbps p1200 (native requirement)
+ *   2026-10-03 AVC candidate anchors (PSP-1000 verification still required):
+ *     Quality:     480x272@15fps 576kbps p1200 (native requirement)
  *     Balanced:    360x204@20fps 480kbps p1200 (exact 30:17 candidate)
  *     Performance: 300x170@30fps 384kbps p1056 (best packet bracket)
  *   Bitrate/packet values remain measured defaults; exact-panel aspect is
@@ -60,7 +60,7 @@ extern volatile unsigned int g_remote_buttons;
  *   Overhead:    1000 µs (sceKernel scheduling, IRQ latency, VSync)
  *   Total/frame: 385 * (W*H/1000) + 3031 µs
  *
- *   Quality:   385*130.560 + 3031 =  53,296 us -> 100,000 us budget (53.3% @10fps)
+ *   Quality:   385*130.560 + 3031 =  53,296 us ->  66,667 us budget (79.9% @15fps)
  *   Balanced:  385*73.440 + 3031 =  31,305 us ->  50,000 us budget (62.6% @20fps)
  *   Perf:      385*51.000 + 3031 =  22,666 us ->  33,333 us budget (68.0% @30fps)
  *
@@ -93,7 +93,7 @@ static const char * const PRESET_LABELS[RESOLUTION_COUNT] = {
 };
 
 const int RESOLUTION_OPTIMAL_FPS_IDX[RESOLUTION_COUNT] = {
-    0, /* Quality: 10 FPS at native resolution */
+    1, /* Quality: 15 FPS at native resolution */
     2, /* Balanced: 20 FPS at 360x204 */
     3, /* Performance: 30 FPS at 300x170 */
     0,

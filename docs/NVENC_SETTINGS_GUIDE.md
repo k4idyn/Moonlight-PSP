@@ -23,7 +23,7 @@ NVENC is NVIDIA's hardware video encoder built into GeForce GTX 600+ and Quadro/
 | P6 | Slow | Very good | Near-maximum quality |
 | P7 | Slowest | Best | Maximum quality, highest latency |
 
-**PSP recommendation:** `1` (P1). At the v1.2 PSP preset sizes, the quality differences between presets are invisible. P1 gives the lowest encoding latency.
+**PSP recommendation:** `1` (P1). P1 minimizes host encoding delay. Higher preset values can trade encoder speed for compression quality.
 
 ---
 
@@ -39,7 +39,7 @@ NVENC is NVIDIA's hardware video encoder built into GeForce GTX 600+ and Quadro/
 | `quarter_res` | Quick pre-pass at 1/4 resolution — good balance |
 | `full_res` | Full pre-pass at full resolution — best bitrate accuracy, slower |
 
-**PSP recommendation:** `quarter_res` or `disabled`. The two-pass mode helps the encoder distribute bits more evenly across the frame, but at the v1.2 PSP preset sizes the difference is minimal.
+**PSP recommendation:** `quarter_res` or `disabled`. Two-pass mode can distribute bits more evenly at additional encoding cost. Choose the mode that fits the host GPU and stream-latency target.
 
 ---
 
@@ -109,7 +109,7 @@ Requests the NVIDIA driver to keep the GPU in a high-power state for faster enco
 
 Forces CAVLC entropy coding instead of CABAC. CAVLC is ~10% less efficient (bigger frames) but faster to decode.
 
-**PSP recommendation:** `enabled`. The PSP's CPU is very slow — CAVLC reduces decode load. The 10% efficiency loss is acceptable at PSP resolution. CABAC is treated as unsupported for normal PSP playback, and the client will return to the menu if the host still delivers CABAC.
+**PSP recommendation:** Use Baseline with CAVLC or Main with CABAC. PSP Moonlight's hardware AVC decoder supports both and selects the matching mode from the stream PPS. CAVLC favors simpler coding; CABAC can use bitrate more efficiently.
 
 ---
 

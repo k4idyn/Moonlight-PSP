@@ -91,32 +91,28 @@ typedef struct {
 
 /* ── Phase 3 Protocol Constants ──────────────────────────────────── */
 
-/* Keyboard event (Type 5) */
-#define KEYBOARD_MAGIC            0x00000005
+/* Gen5 keyboard action is the packet magic, not a payload field. */
 #define KEY_ACTION_DOWN           0x03
 #define KEY_ACTION_UP             0x04
 
-/* Controller Arrival (Type 0x37) */
-#define CONTROLLER_ARRIVAL_MAGIC  0x00000037
+/* Sunshine controller extensions, matching moonlight-common-c/Input.h. */
+#define CONTROLLER_ARRIVAL_MAGIC  0x55000004
 #define CONTROLLER_TYPE_XBOX      1
 /* Supported button flags: all standard Xbox buttons.
  * PSP can emulate most via button mapper. */
 #define SUPPORTED_BUTTON_FLAGS    0x0000FFFF
 /* Capabilities: we have analog triggers (via L+combo) */
-#define CONTROLLER_CAP_ANALOG_TRIGGERS  0x01
+#define CONTROLLER_CAP_ANALOG_TRIGGERS  0x41 /* analog triggers + battery */
 
-/* Controller Battery (Type 0x40) */
-#define CONTROLLER_BATTERY_MAGIC  0x00000040
+#define CONTROLLER_BATTERY_MAGIC  0x55000007
 #define BATTERY_STATE_UNKNOWN     0x00
 #define BATTERY_STATE_NOT_PRESENT 0x01
 #define BATTERY_STATE_DISCHARGING 0x02
-#define BATTERY_STATE_CHARGING    0x04
-#define BATTERY_STATE_FULL        0x08
+#define BATTERY_STATE_CHARGING    0x03
+#define BATTERY_STATE_FULL        0x05
 
-/* Scroll Event (Type 0x09, Gen5) */
-#define SCROLL_MAGIC_GEN5         0x00000009
-/* High-res Scroll (Type 0x33) */
-#define SCROLL_HIRES_MAGIC        0x00000033
+/* Both ordinary and high resolution vertical wheel use NV_SCROLL_PACKET. */
+#define SCROLL_MAGIC_GEN5         0x0000000A
 
 /* Battery report interval: every 30 seconds */
 #define BATTERY_REPORT_INTERVAL_US  (30 * 1000 * 1000)
@@ -673,11 +669,11 @@ static void send_controller_arrival(void)
     uint8_t pkt[16];
     memset(pkt, 0, sizeof(pkt));
     put_be32(&pkt[0], 12);                              /* size: remaining bytes */
-    put_le32(&pkt[4], CONTROLLER_ARRIVAL_MAGIC);         /* magic 0x37 */
+    put_le32(&pkt[4], CONTROLLER_ARRIVAL_MAGIC);
     pkt[8] = 0;                                          /* controllerNumber = 0 */
     pkt[9] = CONTROLLER_TYPE_XBOX;                       /* controllerType = Xbox */
-    put_le32(&pkt[10], SUPPORTED_BUTTON_FLAGS);          /* supportedButtonFlags */
-    put_le16(&pkt[14], CONTROLLER_CAP_ANALOG_TRIGGERS);  /* capabilities */
+    put_le16(&pkt[10], CONTROLLER_CAP_ANALOG_TRIGGERS);  /* capabilities */
+    put_le32(&pkt[12], SUPPORTED_BUTTON_FLAGS);         /* supportedButtonFlags */
 #ifdef RETAIL_BUILD
     control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_GAMEPAD0);
 #else
@@ -715,10 +711,10 @@ static void send_controller_battery(void)
         g_last_battery_percent = percent;
     }
 
-    uint8_t pkt[11];
+    uint8_t pkt[12];
     memset(pkt, 0, sizeof(pkt));
-    put_be32(&pkt[0], 7);                           /* size: remaining bytes */
-    put_le32(&pkt[4], CONTROLLER_BATTERY_MAGIC);     /* magic 0x40 */
+    put_be32(&pkt[0], 8);                           /* size: remaining bytes */
+    put_le32(&pkt[4], CONTROLLER_BATTERY_MAGIC);
     pkt[8] = 0;                                      /* controllerNumber = 0 */
     pkt[9] = state;                                  /* batteryState */
     pkt[10] = (uint8_t)percent;                      /* batteryPercentage */
@@ -735,15 +731,14 @@ static void send_controller_battery(void)
 /* ── Phase 3.3: Keyboard Event Sender ───────────────────────────── */
 void input_send_keyboard_event(uint8_t key_action, uint16_t vk_code, uint8_t modifiers)
 {
-    uint8_t pkt[17];
+    uint8_t pkt[14];
     memset(pkt, 0, sizeof(pkt));
-    put_be32(&pkt[0], 13);                   /* size: remaining bytes */
-    put_le32(&pkt[4], KEYBOARD_MAGIC);       /* magic 0x05 */
-    pkt[8] = key_action;                     /* KEY_ACTION_DOWN or _UP */
-    /* pkt[9..11] = padding (0) */
-    put_le16(&pkt[12], 0x0000);              /* reserved */
-    put_le16(&pkt[14], vk_code);             /* Windows VK code */
-    pkt[16] = modifiers;                     /* modifier bitmask */
+    put_be32(&pkt[0], 10);
+    put_le32(&pkt[4], key_action);
+    /* pkt[8] = Sunshine flags, zero for a normal virtual-key event. */
+    put_le16(&pkt[9], vk_code);
+    pkt[11] = modifiers;
+    /* pkt[12..13] = zero2 */
 
 #ifdef RETAIL_BUILD
     control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_KEYBOARD);
@@ -765,12 +760,14 @@ static void send_key_tap(uint16_t vk_code, uint8_t modifiers)
 /* ── Phase 3.4: Scroll Event Senders ────────────────────────────── */
 void input_send_scroll(int16_t scroll_amount)
 {
-    uint8_t pkt[10];
+    uint8_t pkt[14];
     memset(pkt, 0, sizeof(pkt));
-    put_be32(&pkt[0], 6);                   /* size: remaining bytes */
-    put_le32(&pkt[4], SCROLL_MAGIC_GEN5);   /* magic 0x09 */
+    put_be32(&pkt[0], 10);
+    put_le32(&pkt[4], SCROLL_MAGIC_GEN5);
     pkt[8] = (uint8_t)((scroll_amount >> 8) & 0xFF);  /* BE16 scrollAmt high */
     pkt[9] = (uint8_t)(scroll_amount & 0xFF);          /* BE16 scrollAmt low */
+    pkt[10] = pkt[8];
+    pkt[11] = pkt[9];
 
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
     if (ret <= 0) {
@@ -780,12 +777,14 @@ void input_send_scroll(int16_t scroll_amount)
 
 void input_send_scroll_hires(int16_t scroll_amount_120ths)
 {
-    uint8_t pkt[10];
+    uint8_t pkt[14];
     memset(pkt, 0, sizeof(pkt));
-    put_be32(&pkt[0], 6);                       /* size: remaining bytes */
-    put_le32(&pkt[4], SCROLL_HIRES_MAGIC);       /* magic 0x33 */
+    put_be32(&pkt[0], 10);
+    put_le32(&pkt[4], SCROLL_MAGIC_GEN5);
     pkt[8] = (uint8_t)((scroll_amount_120ths >> 8) & 0xFF);
     pkt[9] = (uint8_t)(scroll_amount_120ths & 0xFF);
+    pkt[10] = pkt[8];
+    pkt[11] = pkt[9];
 
     int ret = control_stream_send_input(pkt, sizeof(pkt), CTRL_CHANNEL_MOUSE);
     if (ret <= 0) {
@@ -1071,7 +1070,7 @@ void input_poll_and_send(void)
         uint8_t packet[34];
         build_packet(packet, buttons, lt, rt, lsx, lsy, rsx, rsy);
 
-        /* Send through encrypted control stream (unsequenced) */
+        /* Send an acknowledged, ordered full gamepad state. */
         {
             int ret = control_stream_send_input(packet, sizeof(packet), CTRL_CHANNEL_GAMEPAD0);
             if (ret <= 0) {

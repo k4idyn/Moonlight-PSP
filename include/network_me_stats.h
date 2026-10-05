@@ -17,5 +17,7 @@ typedef struct {
 } NetworkRtcpStats;
 
 void network_me_get_rtcp_stats(NetworkRtcpStats *out);
+/* Milliseconds since the last RTP datagram, or zero before the first packet. */
+u32 network_me_video_idle_ms(void);
 
 #endif /* NETWORK_ME_STATS_H */

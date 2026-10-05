@@ -27,7 +27,7 @@
 
 #include <string.h>
 #include <pspthreadman.h>
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "diag_log.h"
 
 /* sceRtcGetCurrentTick prototype — avoid including psprtc.h which has

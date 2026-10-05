@@ -71,6 +71,8 @@ void rtp_reassembly_note_fec_frame_complete(u16 next_seq_after_fec);
 /* Host processing latency extracted from Sunshine frame headers (microseconds).
  * Updated per-frame when Sunshine type-0x01 headers are present. */
 extern volatile u32 g_host_processing_us;
+extern volatile u32 g_host_processing_sample_us;
+extern volatile int g_host_processing_valid;
 
 /*--------------------------------------------------------------------------
  * Required External Function

@@ -19,6 +19,7 @@
 
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
+#include "stream_crypto.h"
 
 #include "mbedtls/aes.h"
 #include "mbedtls/gcm.h"
@@ -58,6 +59,13 @@ int stream_crypto_init(const unsigned char *key)
         return -1;
     }
 
+    /* RTSP may retry after ANNOUNCE/PLAY failures, and a user can reconnect
+     * without restarting Moonlight. Release the previous session contexts
+     * before replacing their key. */
+    if (s_initialized) {
+        stream_crypto_shutdown();
+    }
+
     memcpy(s_session_key, key, 16);
 
     /* Audio: AES-CBC decrypt context */
@@ -65,6 +73,8 @@ int stream_crypto_init(const unsigned char *key)
     ret = mbedtls_aes_setkey_dec(&s_aes_ctx, s_session_key, 128);
     if (ret != 0) {
         crypto_log("[CRYPTO] aes_setkey_dec failed: -0x%04X\n", -ret);
+        mbedtls_aes_free(&s_aes_ctx);
+        memset(s_session_key, 0, sizeof(s_session_key));
         return -1;
     }
 
@@ -75,11 +85,14 @@ int stream_crypto_init(const unsigned char *key)
     if (ret != 0) {
         crypto_log("[CRYPTO] gcm_setkey failed: -0x%04X\n", -ret);
         mbedtls_aes_free(&s_aes_ctx);
+        mbedtls_gcm_free(&s_gcm_ctx);
+        memset(s_session_key, 0, sizeof(s_session_key));
         return -1;
     }
 
     s_initialized = 1;
     s_error_count = 0;
+    g_crypto_fatal = 0;
     crypto_log("[CRYPTO] session key initialized OK (GCM+CBC)\n");
     return 0;
 }
@@ -214,5 +227,6 @@ void stream_crypto_shutdown(void)
             crypto_log("[CRYPTO] shutdown with %u total errors\n", s_error_count);
         }
         s_initialized = 0;
+        g_crypto_fatal = 0;
     }
 }

@@ -31,61 +31,26 @@ typedef struct {
 /*--------------------------------------------------------------------------
  * Default Configuration Values
  *
- * PSP-1000 WiFi: Marvell 88W8686, 802.11b ONLY (11 Mbps theoretical,
- * ~2-3 Mbps real-world with high packet loss on bursts).
- *
- * Low defaults are CRITICAL for stability:
- *  - 300x170 is the lowest even PSP-panel-aspect stream above the host floor.
- *  - 30 FPS is the current practical Performance anchor after the
- *    29/30/31/32/33/34/35/36/37/40 fps sweep.
- *  - 384 kbps / 1056-byte packets is the current Performance anchor:
- *    adjacent bitrate and packet brackets did not improve PSP survival.
+ * Balanced is the recommended visual default: 360x204 at 20 fps,
+ * 480 kbps, 1200-byte packets, with PSP audio enabled.
+ * The tuned preset ladder remains unchanged:
+ *   Quality:     480x272 at 15 fps, 576 kbps, p1200, audio on.
+ *   Balanced:    360x204 at 20 fps, 480 kbps, p1200, audio on.
+ *   Performance: 300x170 at 30 fps, 384 kbps, p1056, audio off.
+ * All built-in sizes match the PSP LCD's 30:17 aspect ratio.
  *--------------------------------------------------------------------------*/
-/*
- * PSP-1000 current hardware evidence:
- *
- *   CPU:  Allegrex MIPS32 @ 333MHz, 16KB L1i+L1d, in-order single-issue
- *   WiFi: 802.11b 11Mbps theoretical; burst loss is the practical limit
- *   ME:   YUV→RGBA in ~31µs (uncached DMA via 0x40000000)
- *   GE:   Bilinear upscale to 480×272 in ~2ms
- *
- *   300x170@30fps = 1,530,000 pixels/sec. The latest 2026-05-17
- *   Performance sweep has not promoted any preset to production readiness:
- *   - 30fps/384kbps/p1056/FEC35/min1/audio60 is the best current
- *     exact-aspect Performance packet bracket.
- *   - 31fps and 35fps remain high-side evidence points, not stable defaults.
- *   - 360x204@20fps/480kbps is the current Balanced exact-aspect candidate.
- *   - 480x272@10fps/576kbps is the required native Quality bracket anchor.
- *
- *   Defaults use the practical Performance anchor because it is the best
- *   repeatable low-work setting found so far on PSP-1000 hardware. Any future
- *   changes should be based on real PSP playback, input, audio, HUD, and log
- *   evidence rather than desktop-only testing.
- *   VSync:       60Hz -> valid fps: 10, 15, 20, 30, 60
- *
- *   Performance: 300x170 @30fps @384kbps p1056, audio and AV encryption disabled.
- *   Balanced:    360x204 @20fps @480kbps p1200, audio enabled, still stress-only.
- *   Quality:     480x272 @10fps @576kbps p1200, audio enabled, native requirement.
- *
- *   Audio Disabled keeps the RTSP audio SETUP/ping path for host liveness,
- *   then skips local audio RTP drain, Opus/SRC decode, and playback.
- *
- *   NOTE: non-30:17 sizes are not presets because they can introduce bars,
- *   aspect distortion, or host-side padding. Sunshine also rejects very small
- *   streams, so Performance starts at 300x170 instead of 240x136.
- *
- *   Higher bitrate and packet sizes are not promoted from comments; they must
- *   prove better end-to-end behavior on real PSP hardware.
- */
-#define DEFAULT_WIDTH           300
-#define DEFAULT_HEIGHT          170
-#define DEFAULT_FPS             30
+#define DEFAULT_PRESET_INDEX    1
+#define DEFAULT_FPS_INDEX       2
+#define DEFAULT_AUDIO_ENABLED   1
+#define DEFAULT_WIDTH           360
+#define DEFAULT_HEIGHT          204
+#define DEFAULT_FPS             20
 #define MIN_BITRATE             192
-#define DEFAULT_BITRATE         384
+#define DEFAULT_BITRATE         480
 #define MAX_BITRATE             2760
 #define MIN_STREAM_PACKET_SIZE  512
 #define MAX_STREAM_PACKET_SIZE  1392
-#define DEFAULT_PACKET_SIZE     1056
+#define DEFAULT_PACKET_SIZE     1200
 #define DEFAULT_CONTROL_MODE    CONTROL_MODE_XBOX
 
 /*--------------------------------------------------------------------------
@@ -99,10 +64,11 @@ typedef struct {
  *
  * Reads configuration from "ms0:/PSP/SAVEDATA/Moonlight/config.ini" file.
  * If the file doesn't exist or is corrupted, initializes with defaults:
- * - 300x170
- * - 30 FPS
- * - 384 kbps bitrate
- * - 1056 byte packet size
+ * - Balanced preset, 360x204
+ * - 20 FPS
+ * - 480 kbps bitrate
+ * - 1200 byte packet size
+ * - Audio enabled
  *
  * Returns: 0 on success, -1 on error (defaults applied)
  */
@@ -170,10 +136,11 @@ int config_add_paired_host(PspConfig *config, const char *ip);
  * @config: Pointer to PspConfig structure to initialize
  *
  * Sets defaults:
- * - 300x170
- * - 30 FPS
- * - 384 kbps bitrate
- * - 1056 byte packet size
+ * - Balanced preset, 360x204
+ * - 20 FPS
+ * - 480 kbps bitrate
+ * - 1200 byte packet size
+ * - Audio enabled
  * - Xbox control mode
  */
 void configSetDefaults(PspConfig *config);

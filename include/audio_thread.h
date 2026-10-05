@@ -90,6 +90,7 @@ typedef struct {
     u32 frames_played;
     u32 frames_dropped;   /* ring full */
     u32 underruns;        /* ring empty when audio thread needed data */
+    u32 empty_holds;      /* previous PCM chunk repeated while live source was empty */
 } AudioStats;
 
 /*--------------------------------------------------------------------------

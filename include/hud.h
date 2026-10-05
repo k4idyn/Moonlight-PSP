@@ -14,25 +14,42 @@
  * HUD Statistics Structure
  *============================================================================*/
 typedef struct {
-    int   latency_ms;       /* Current latency in milliseconds */
+    int   latency_ms;       /* Smoothed decode-to-present age in milliseconds */
+    int   latency_valid;
     float fps;              /* Display frames per second */
     float packet_loss_pct;  /* Video packet loss percentage */
-    float fec_recovery_pct; /* FEC recovery success percentage */
-    int   battery_pct;      /* PSP battery percentage (0-100) */
-    int   host_proc_ms;     /* Host-side encode latency in ms */
-    int   decode_ms;        /* Per-frame decode duration in ms */
-    int   cpu_pct;          /* Main CPU decode-side utilization window */
-    int   gpu_pct;          /* GU submit/sync utilization window */
-    int   me_pct;           /* Media Engine conversion utilization window */
-    int   ram_used_pct;     /* Stream RAM used relative to stream-start free RAM */
+    int   fec_active;       /* Host RTP metadata reported parity in the sample */
+    int   fec_metric_valid; /* 1 only when this sample saw recovery outcomes */
+    float fec_recovery_pct; /* recovered/(recovered+failed), otherwise undefined */
+    u32   fec_attempts;
+    u32   fec_recovered_packets;
+    u32   fec_failed_packets;
+    int   battery_pct;      /* PSP battery percentage; negative when unavailable */
+    int   host_proc_us;     /* Sunshine frame-header duration in microseconds */
+    int   host_proc_valid;  /* 1 only after a frame header supplied the value */
+    int   decode_us;        /* Most recent Sony/OpenH264 decode-call wall time */
+    int   decode_valid;
+    int   cpu_pct;          /* Software-decoder CPU time share; unavailable for Sony AVC */
+    int   gu_share_pct;     /* GU submit/sync wall-time share, not GPU-core utilization */
+    int   me_pct;           /* Software Media Engine work share; unavailable for Sony AVC */
+    u32   gu_submit_sync_us;/* Most recent GU submit + sync wall time */
+    int   gu_frame_valid;
     int   ram_free_kb;      /* Current free RAM in KB */
     int   ram_largest_kb;   /* Largest free memory block in KB */
+    int   ram_free_delta_kb;/* Stream-start free RAM minus current free RAM */
     int   bw_rx_kbps;       /* Raw UDP media bandwidth */
     int   bw_usable_kbps;   /* H.264 bytes accepted by reassembly */
     int   bw_audio_kbps;    /* Raw UDP audio bandwidth */
     int   bw_drop_kbps;     /* Video bytes dropped before decode */
     int   bw_usable_pct;    /* H.264 usable bytes / raw video bytes */
     int   bw_video_packets_s; /* Video packets per second */
+    int   audio_enabled;
+    int   audio_active;
+    u32   audio_frames_played;
+    u32   audio_empty_holds;
+    u32   audio_underruns;
+    u32   audio_ring_drops;
+    u32   audio_plc;
 } HudStats;
 
 /*============================================================================

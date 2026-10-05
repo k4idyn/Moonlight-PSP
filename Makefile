@@ -1,7 +1,6 @@
 # PSP Homebrew Makefile for PSP Moonlight
-# Asymmetric dual-core software H.264 decode:
-#   Main CPU: Network + CAVLC entropy decode
-#   Media Engine: VFPU reconstruction (IDCT + MotComp + YUV→RGBA)
+# v1.5 build: Sony hardware AVC decode through the Media Engine.
+# Historical software decoder sources are archived under legacy/software/.
 # Targets PSP with MIPS Allegrex core
 
 # ============================================================================
@@ -19,6 +18,7 @@ export PATH := $(PSP_TOOL_BIN):$(PATH)
 TARGET          = moonlight
 PSP_EBOOT_TITLE = PSP Moonlight
 BUILD_PRX       = 1
+PRX_EXPORTS     = exports.exp
 PSP_FW_VERSION  = 660
 PSP_EBOOT_ICON  = ICON0.PNG
 PSP_EBOOT_PIC1  = PIC1.PNG
@@ -32,7 +32,7 @@ EBOOT.PBP: ICON0.PNG PIC1.PNG
 # ============================================================================
 OBJS = src/main.o src/network_connect.o src/network_me.o \
        src/net_send.o \
-       src/sw_decoder_thread.o src/stream_resolution.o \
+       src/decoder_thread.o src/stream_resolution.o \
        src/upnp_client.o \
        src/display_gpu.o src/input.o src/rtp_reassembly.o src/rtp_fec.o src/rs.o src/host_discovery.o \
        src/settings_menu.o src/config.o src/hud.o src/stream_session.o src/game_list_parser.o \
@@ -43,8 +43,7 @@ OBJS = src/main.o src/network_connect.o src/network_me.o \
        src/crypto_lite.o src/psp_mbedtls_entropy.o \
        src/stream_crypto.o src/client_identity.o src/icon_cache.o src/control_stream.o \
        src/opus_decode_psp.o \
-       src/me.o moonlight_me_helper/MediaEngine.o \
-       src/openh264_decode.o \
+       moonlight_me_helper/MediaEngine.o \
        $(MBEDTLS_OBJS) $(OPUS_ALL_OBJS)
 
 # ============================================================================
@@ -122,11 +121,8 @@ OPUS_SILK_FIX_OBJS = $(addprefix opus_f_, $(addsuffix .o, $(OPUS_SILK_FIX_NAMES)
 OPUS_ALL_OBJS      = $(OPUS_SRC_OBJS) $(OPUS_CELT_OBJS) $(OPUS_SILK_OBJS) $(OPUS_SILK_FIX_OBJS)
 
 # ============================================================================
-# OpenH264 (PSP decoder-only port)
+# Shared headers
 # ============================================================================
-OPENH264_ROOT    = third_party/openh264
-OPENH264_LIB     = $(OPENH264_ROOT)/libopenh264_dec_psp.a
-OPENH264_INCDIR  = -I$(OPENH264_ROOT)
 CORE_HEADERS     = $(wildcard include/*.h)
 
 # ============================================================================
@@ -138,7 +134,63 @@ CORE_HEADERS     = $(wildcard include/*.h)
 RETAIL_BUILD ?= 1
 PSP_VIDEO_FEC_PERCENT ?= 35
 PSP_VIDEO_FEC_MIN_REQUIRED ?= 1
-PSP_AUDIO_PACKET_DURATION_MS ?= 60
+PSP_AUDIO_PACKET_DURATION_MS ?= 40
+PSP_HARDWARE_AVC ?= 1
+ifneq ($(PSP_HARDWARE_AVC),1)
+$(error v1.5 supports Sony hardware AVC only; software sources are in legacy/software)
+endif
+PSP_AVC_SPS_LEVEL_CEILING ?= 0
+PSP_AVC_PPA_STACK_PRELOADED ?= 0
+PSP_AVC_BOOT_MODE_BRIDGE ?= 0
+PSP_AVC_LOW_DDR ?= 0
+PSP_AVC_ENTRY_REPLAY ?= 0
+PSP_AVC_UNIFIED_MAIN_MODE ?= 1
+ifeq ($(PSP_AVC_UNIFIED_MAIN_MODE),1)
+ifneq ($(PSP_HARDWARE_AVC),1)
+$(error PSP_AVC_UNIFIED_MAIN_MODE requires PSP_HARDWARE_AVC=1)
+endif
+endif
+ifeq ($(PSP_AVC_ENTRY_REPLAY),1)
+ifneq ($(RETAIL_BUILD),0)
+$(error PSP_AVC_ENTRY_REPLAY is a diagnostics-only experiment)
+endif
+ifneq ($(PSP_HARDWARE_AVC),1)
+$(error PSP_AVC_ENTRY_REPLAY requires hardware AVC)
+endif
+OBJS += src/psp_avc_entry_replay.o
+endif
+ifeq ($(PSP_AVC_LOW_DDR),1)
+ifneq ($(RETAIL_BUILD),0)
+$(error PSP_AVC_LOW_DDR is a diagnostics-only experiment)
+endif
+ifneq ($(PSP_HARDWARE_AVC)$(PSP_AVC_BOOT_MODE_BRIDGE),11)
+$(error PSP_AVC_LOW_DDR requires hardware AVC and boot bridge)
+endif
+endif
+ifeq ($(PSP_AVC_PPA_STACK_PRELOADED),1)
+ifneq ($(RETAIL_BUILD),0)
+$(error PSP_AVC_PPA_STACK_PRELOADED is a diagnostics-only experiment)
+endif
+ifneq ($(PSP_HARDWARE_AVC),1)
+$(error PSP_AVC_PPA_STACK_PRELOADED requires PSP_HARDWARE_AVC=1)
+endif
+endif
+ifeq ($(PSP_AVC_BOOT_MODE_BRIDGE),1)
+ifneq ($(PSP_HARDWARE_AVC),1)
+$(error PSP_AVC_BOOT_MODE_BRIDGE requires PSP_HARDWARE_AVC=1)
+endif
+endif
+ifeq ($(PSP_HARDWARE_AVC),1)
+OBJS := moonlight_me_helper/MediaEngine.o src/avc_ku.o $(filter-out moonlight_me_helper/MediaEngine.o,$(OBJS)) src/avc_imports.o \
+        src/avc_packetizer.o src/avc_stream_input.o src/avc_stream_format.o src/avc_sps_fixup.o \
+        src/avc_frame_slots.o src/psp_avc_session.o src/psp_avc_submit.o \
+        src/psp_avc_backend.o src/psp_avc_player.o src/avc_hardware_state.o
+endif
+ifeq ($(PSP_AVC_BOOT_MODE_BRIDGE),1)
+# Keep this user-library stub ahead of the tail sceMpeg imports. PSPSDK's
+# fixup tool requires each imported library's stubs to remain contiguous.
+OBJS := src/avc_boot_bridge_import.o $(OBJS)
+endif
 ifeq ($(RETAIL_BUILD),1)
 BUILD_MODE_DEFINES = -DRETAIL_BUILD
 else
@@ -147,7 +199,14 @@ endif
 
 PSP_TUNE_DEFINES = -DPSP_VIDEO_FEC_PERCENT=$(PSP_VIDEO_FEC_PERCENT) \
                    -DPSP_VIDEO_FEC_MIN_REQUIRED=$(PSP_VIDEO_FEC_MIN_REQUIRED) \
-                   -DPSP_AUDIO_PACKET_DURATION_MS=$(PSP_AUDIO_PACKET_DURATION_MS)
+                   -DPSP_AUDIO_PACKET_DURATION_MS=$(PSP_AUDIO_PACKET_DURATION_MS) \
+                   -DPSP_HARDWARE_AVC=$(PSP_HARDWARE_AVC) \
+                   -DPSP_AVC_SPS_LEVEL_CEILING=$(PSP_AVC_SPS_LEVEL_CEILING) \
+                   -DPSP_AVC_PPA_STACK_PRELOADED=$(PSP_AVC_PPA_STACK_PRELOADED) \
+                   -DPSP_AVC_BOOT_MODE_BRIDGE=$(PSP_AVC_BOOT_MODE_BRIDGE) \
+                   -DPSP_AVC_LOW_DDR=$(PSP_AVC_LOW_DDR) \
+                   -DPSP_AVC_ENTRY_REPLAY=$(PSP_AVC_ENTRY_REPLAY) \
+                   -DPSP_AVC_UNIFIED_MAIN_MODE=$(PSP_AVC_UNIFIED_MAIN_MODE)
 BUILD_DIR = .build
 TUNE_STAMP = $(BUILD_DIR)/tune.stamp
 
@@ -157,7 +216,6 @@ TUNE_STAMP = $(BUILD_DIR)/tune.stamp
 CFLAGS  = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(PSP_TUNE_DEFINES) $(MBEDTLS_CFLAGS) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 CXXFLAGS = -O2 -G0 -Wall -Werror -DPSP $(BUILD_MODE_DEFINES) $(PSP_TUNE_DEFINES) -fno-exceptions -fno-rtti $(MBEDTLS_CFLAGS) \
-           $(OPENH264_INCDIR) \
            -I$(PSPSDK)/include -I$(PSP_PREFIX)/include
 
 CC  = $(PSP_TOOL_BIN)/psp-gcc
@@ -166,8 +224,7 @@ CXX = $(PSP_TOOL_BIN)/psp-g++
 INCDIR  = include $(PSP_PREFIX)/include/oslib/intraFont $(PSP_PREFIX)/include
 LIBDIR  = lib $(PSP_PREFIX)/lib
 
-LIBS = $(OPENH264_LIB) \
-       -lintraFont -lpsprtc -lpspwlan \
+LIBS = -lpspmpeg -lintraFont -lpsprtc -lpspwlan \
        -lpspgum -lpspgu -lpspge -lpsppower \
        -lpspdebug -lpspdisplay -lpspctrl -lpspsdk -lc -lpng -lz -lm \
        -lpspnet -lpspnet_inet -lpspnet_apctl -lpspnet_resolver \
@@ -182,7 +239,7 @@ all: me_helper $(TARGET).prx $(EXTRA_TARGETS)
 
 $(TUNE_STAMP): FORCE_TUNE_STAMP
 	@mkdir -p $(BUILD_DIR)
-	@printf "RETAIL_BUILD=%s\nPSP_VIDEO_FEC_PERCENT=%s\nPSP_VIDEO_FEC_MIN_REQUIRED=%s\nPSP_AUDIO_PACKET_DURATION_MS=%s\n" "$(RETAIL_BUILD)" "$(PSP_VIDEO_FEC_PERCENT)" "$(PSP_VIDEO_FEC_MIN_REQUIRED)" "$(PSP_AUDIO_PACKET_DURATION_MS)" > $@.tmp
+	@printf "RETAIL_BUILD=%s\nPSP_VIDEO_FEC_PERCENT=%s\nPSP_VIDEO_FEC_MIN_REQUIRED=%s\nPSP_AUDIO_PACKET_DURATION_MS=%s\nPSP_HARDWARE_AVC=%s\nPSP_AVC_SPS_LEVEL_CEILING=%s\nPSP_AVC_PPA_STACK_PRELOADED=%s\nPSP_AVC_BOOT_MODE_BRIDGE=%s\nPSP_AVC_LOW_DDR=%s\nPSP_AVC_ENTRY_REPLAY=%s\nPSP_AVC_UNIFIED_MAIN_MODE=%s\n" "$(RETAIL_BUILD)" "$(PSP_VIDEO_FEC_PERCENT)" "$(PSP_VIDEO_FEC_MIN_REQUIRED)" "$(PSP_AUDIO_PACKET_DURATION_MS)" "$(PSP_HARDWARE_AVC)" "$(PSP_AVC_SPS_LEVEL_CEILING)" "$(PSP_AVC_PPA_STACK_PRELOADED)" "$(PSP_AVC_BOOT_MODE_BRIDGE)" "$(PSP_AVC_LOW_DDR)" "$(PSP_AVC_ENTRY_REPLAY)" "$(PSP_AVC_UNIFIED_MAIN_MODE)" > $@.tmp
 	@if test -f $@ && cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 .PHONY: smoke
@@ -206,14 +263,6 @@ src/psp_mbedtls_entropy.o: src/psp_mbedtls_entropy.c $(TUNE_STAMP)
 src/opus_decode_psp.o: src/opus_decode_psp.c $(TUNE_STAMP)
 	$(CC) $(CFLAGS) $(OPUS_CFLAGS) -c -o $@ $<
 
-# OpenH264 decoder wrapper (C++ TU, needs openh264 include paths)
-src/openh264_decode.o: src/openh264_decode.cpp $(OPENH264_LIB) $(CORE_HEADERS) $(TUNE_STAMP)
-	$(CXX) $(CXXFLAGS) $(OPENH264_INCDIR) -Iinclude -I$(PSPSDK)/include -I$(PSP_PREFIX)/include/oslib/intraFont -I$(PSP_PREFIX)/include -c -o $@ $<
-
-# Build OpenH264 PSP static library if not already built
-$(OPENH264_LIB):
-	$(MAKE) -C $(OPENH264_ROOT) -f Makefile.psp
-
 $(OPUS_SRC_OBJS): opus_s_%.o: $(OPUS_ROOT)/src/%.c
 	$(CC) $(CFLAGS) $(OPUS_CFLAGS) -c -o $@ $<
 
@@ -232,8 +281,13 @@ $(OPUS_SILK_FIX_OBJS): opus_f_%.o: $(OPUS_ROOT)/silk/fixed/%.c
 src/%.o: src/%.c $(CORE_HEADERS) $(TUNE_STAMP)
 	$(CC) -std=gnu99 $(CFLAGS) -c -o $@ $<
 
+# This stub's function count changes with PSP_AVC_LOW_DDR.
+src/avc_boot_bridge_import.o: src/avc_boot_bridge_import.S $(TUNE_STAMP)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 include $(PSPSDK)/lib/build.mak
 
+ifeq ($(OS),Windows_NT)
 override CC := $(PSP_TOOL_BIN)/psp-gcc.exe
 override CXX := $(PSP_TOOL_BIN)/psp-g++.exe
 override AS := $(PSP_TOOL_BIN)/psp-gcc.exe
@@ -254,3 +308,4 @@ $(TARGET).elf: $(OBJS) $(EXPORT_OBJ)
 	printf "%s\n" $(OBJS) $(EXPORT_OBJ_RSP) $(LIBS) > _link.rsp
 	$(LINK.c) -B$(PSP_TOOL_BIN)/ @_link.rsp -o $@
 	$(PSP_TOOL_BIN)/psp-fixup-imports.exe $@
+endif

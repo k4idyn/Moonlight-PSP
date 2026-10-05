@@ -11,6 +11,16 @@
 extern "C" {
 #include "ui_manager.h"
 #include "input.h"
+#include "diag_log.h"
+extern volatile unsigned int g_remote_buttons;
+}
+
+/* Use the same one-shot PSPLink buttons as the other UI screens. */
+static void read_mapping_controller(SceCtrlData *pad)
+{
+    sceCtrlPeekBufferPositive(pad, 1);
+    pad->Buttons |= g_remote_buttons;
+    g_remote_buttons = 0;
 }
 
 #define SCREEN_W      480
@@ -86,6 +96,7 @@ static void toggleRightStickSource(void) {
         (s_mapping.right_stick_mode == RIGHT_STICK_MODE_ANALOG_NUB)
             ? RIGHT_STICK_MODE_BUTTONS
             : RIGHT_STICK_MODE_ANALOG_NUB;
+    diag_log_write("MAPUI", "right-stick source=%d", s_mapping.right_stick_mode);
 }
 
 static void setDefaultMapping(void) {
@@ -135,22 +146,21 @@ static uint32_t prompt_mapping(int index) {
 
     /* Wait for release */
     do {
-        sceCtrlPeekBufferPositive(&pad, 1);
+        read_mapping_controller(&pad);
         sceKernelDelayThread(16667);
     } while (pad.Buttons != 0);
 
-    sceCtrlPeekBufferPositive(&pad, 1);
     prev = pad;
 
     while (1) {
-        sceCtrlPeekBufferPositive(&pad, 1);
+        read_mapping_controller(&pad);
         uint32_t pressed = pad.Buttons & ~prev.Buttons;
         if (pressed != 0) {
             /* Find lowest set bit */
             uint32_t mapped = 0;
             for(int i=0; i<32; i++) {
-                if (pressed & (1<<i)) {
-                    mapped = (1<<i);
+                if (pressed & (1u<<i)) {
+                    mapped = (1u<<i);
                     break;
                 }
             }
@@ -184,11 +194,12 @@ extern "C" void button_mapping_ui_run(void)
     s_focus_anim    = 0.0f;
 
     button_mapping_get(&s_mapping);
+    diag_log_write("MAPUI", "entered source=%d", s_mapping.right_stick_mode);
 
     /* Flush stales */
     SceCtrlData pad, prev;
     do {
-        sceCtrlPeekBufferPositive(&pad, 1);
+        read_mapping_controller(&pad);
         sceKernelDelayThread(16667);
     } while (pad.Buttons != 0);
     prev = pad;
@@ -196,7 +207,7 @@ extern "C" void button_mapping_ui_run(void)
     while (1) {
         update_animations();
 
-        sceCtrlPeekBufferPositive(&pad, 1);
+        read_mapping_controller(&pad);
         uint32_t pressed = pad.Buttons & ~prev.Buttons;
         prev = pad;
 
@@ -215,6 +226,8 @@ extern "C" void button_mapping_ui_run(void)
 
         if (pressed & PSP_CTRL_CIRCLE) {
             button_mapping_set(&s_mapping);
+            diag_log_write("MAPUI", "closed source=%d", s_mapping.right_stick_mode);
+            diag_log_flush();
             break; /* Back to settings menu */
         }
 
@@ -244,7 +257,7 @@ extern "C" void button_mapping_ui_run(void)
                 }
                 /* Flush after prompt */
                 do {
-                    sceCtrlPeekBufferPositive(&pad, 1);
+                    read_mapping_controller(&pad);
                     sceKernelDelayThread(16667);
                 } while (pad.Buttons != 0);
                 prev = pad;

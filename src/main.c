@@ -23,7 +23,15 @@
 #include <mbedtls/memory_buffer_alloc.h>
 
 #include "shared.h"
-#include "sw_decode_pipeline.h"
+#include "psp_avc_build.h"
+#if PSP_HARDWARE_AVC
+#include "psp_avc_player.h"
+#if defined(PSP_AVC_ENTRY_REPLAY) && PSP_AVC_ENTRY_REPLAY
+extern int psp_avc_entry_replay(void);
+#endif
+#endif
+#include "decoder_pipeline.h"
+#include "stream_resolution.h"
 #include "pairing_pin_ui.h"
 #include "settings_menu.h"
 #include "config.h"
@@ -44,6 +52,7 @@
 #include "rtp_reassembly.h"
 #include "runtime_telemetry.h"
 #include "network_me_stats.h"
+#include "me.h"
 
 PSP_MODULE_INFO("PSPMoonlight", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
@@ -65,6 +74,20 @@ static volatile int g_exit_callback_thread_stop = 0;
 
 /* Remote input via pspsh pokew — write PSP_CTRL_ bitmask to this address */
 volatile unsigned int g_remote_buttons = 0;
+#ifndef RETAIL_BUILD
+/* Diagnostics can hold stream input until the harness explicitly releases it.
+ * UI readers retain their one-shot behavior. Normal/retail input is unchanged. */
+volatile unsigned int g_remote_buttons_hold = 0;
+#endif
+
+static void consume_stream_remote_buttons(void)
+{
+#ifndef RETAIL_BUILD
+    if (g_remote_buttons_hold)
+        return;
+#endif
+    g_remote_buttons = 0;
+}
 
 /* Remote analog injection for hardware automation. Values are PSP analog
  * coordinates (0..255, center 128). Disabled during normal user control. */
@@ -107,19 +130,23 @@ extern void network_me_init(PacketRingBuffer *rb);
 extern void network_me_shutdown(void);
 extern void network_me_abort(void);
 extern void control_stream_abort(void);
-extern void rtsp_session_close(void);
+extern int rtsp_session_close(void);
 extern void display_init(void);
 extern void display_frame(void *frame_data);
 extern void display_frame_finish(void);
 extern void display_frame_repeat(void);
+extern volatile u32 g_display_gu_submit_sync_us;
 extern void display_clear(unsigned int color);
 extern void display_shutdown(void);
 extern int  sw_decoder_thread_init(FrameRingBuffer *frame_rb);
 extern void sw_decoder_thread_shutdown(void);
 extern void sw_decoder_thread_force_restart(void);
 extern int  decoder_is_cabac_detected(void);
+extern volatile int g_avc_entropy_mode;
 extern volatile int g_cabac_dialog_active;
+#if !PSP_HARDWARE_AVC
 extern void oh264_pipeline_flush_buffers(void);
+#endif
 extern int  safety_buffer_init(void);
 extern void safety_buffer_shutdown(void);
 extern void input_init(int sock);
@@ -135,6 +162,8 @@ extern int  hud_overlay_visible(void);
 /* Watchdog state — file-scope so both frame-display and idle paths can access */
 static int s_watchdog_restarts = 0;
 static int s_mode_b_soft_count = 0;
+static int s_force_restart_no_progress = 0;
+static int s_video_seen_this_session = 0;
 static SceSize s_stream_ram_start_free = 0;
 static SceSize s_stream_ram_start_largest = 0;
 extern void hud_shutdown(void);
@@ -150,9 +179,27 @@ extern volatile u32 g_decode_time_us;
 #include "decode_flags.h"
 
 static int g_gu_active = 0;
+static void *s_entry_display_framebuf = NULL;
+static int s_entry_display_bufferwidth = 0;
+static int s_entry_display_pixelformat = 0;
+static int s_entry_display_valid = 0;
 #define PSP_DISPLAY_HEIGHT_PIXELS 272
 #define PSP_DISPLAY_MAX_STRIDE 512
 #define PSP_DISPLAY_MAX_COPY_BYTES (PSP_DISPLAY_MAX_STRIDE * PSP_DISPLAY_HEIGHT_PIXELS * 4)
+#define PSP_VRAM_UNCACHED_BASE ((u32)0x44000000u)
+#define PSP_VRAM_ADDR_MASK     ((u32)0x001FFFFFu)
+/*
+ * The GU uses two 512-pixel RGBA8888 buffers at offsets 0 and 0x88000 and
+ * the 16-bit depth buffer at 0x110000.  Keep the entry PSPLink image in the
+ * remaining VRAM tail as RGB565 instead of adding a 557 KB RAM BSS object.
+ * The snapshot is only the visible 480-pixel area, so it fits before 2 MB
+ * VRAM ends and is never touched by Moonlight's GU setup.
+ */
+#define PSP_ENTRY_SNAPSHOT_VRAM_OFFSET ((u32)0x00198000u)
+#define PSP_ENTRY_SNAPSHOT_WIDTH       480
+#define PSP_ENTRY_SNAPSHOT_BYTES       (PSP_ENTRY_SNAPSHOT_WIDTH * PSP_DISPLAY_HEIGHT_PIXELS * 2)
+static int s_entry_display_snapshot_bytes = 0;
+static int s_entry_display_snapshot_valid = 0;
 static int cabac_present_pacing_enabled(void)
 {
     return g_psp_config.cabacTestMode &&
@@ -366,6 +413,97 @@ void moonlight_main_mark_exitgame_pending(void);
 int moonlight_main_notify_exit_callback(void);
 static void moonlight_main_shutdown_exit_callback_thread(void);
 
+static int moonlight_main_display_bpp(int pixelformat)
+{
+    if (pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+        return 4;
+    }
+    if (pixelformat >= PSP_DISPLAY_PIXEL_FORMAT_565 &&
+        pixelformat <= PSP_DISPLAY_PIXEL_FORMAT_4444) {
+        return 2;
+    }
+    return 0;
+}
+
+static void *moonlight_main_display_cpu_addr(void *topaddr)
+{
+    u32 addr = (u32)topaddr;
+    return (void *)(PSP_VRAM_UNCACHED_BASE + (addr & PSP_VRAM_ADDR_MASK));
+}
+
+static void *moonlight_main_entry_snapshot_addr(void)
+{
+    return (void *)(PSP_VRAM_UNCACHED_BASE + PSP_ENTRY_SNAPSHOT_VRAM_OFFSET);
+}
+
+static u16 moonlight_main_pack_rgb565(u32 pixel)
+{
+    unsigned int r = pixel & 0xFFu;
+    unsigned int g = (pixel >> 8) & 0xFFu;
+    unsigned int b = (pixel >> 16) & 0xFFu;
+    return (u16)((r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11));
+}
+
+static u32 moonlight_main_unpack_rgb565(u16 pixel)
+{
+    unsigned int r = (pixel & 0x001Fu) << 3;
+    unsigned int g = ((pixel >> 5) & 0x003Fu) << 2;
+    unsigned int b = ((pixel >> 11) & 0x001Fu) << 3;
+    return r | (g << 8) | (b << 16) | 0xFF000000u;
+}
+
+static void moonlight_main_capture_entry_display(void)
+{
+    void *topaddr = NULL;
+    int bufferwidth = 0;
+    int pixelformat = 0;
+    int bpp;
+    int ret;
+    int y;
+
+    ret = sceDisplayGetFrameBuf(&topaddr, &bufferwidth, &pixelformat,
+                                PSP_DISPLAY_SETBUF_IMMEDIATE);
+    bpp = moonlight_main_display_bpp(pixelformat);
+    if (ret == 0 && bufferwidth > 0 &&
+        bufferwidth <= PSP_DISPLAY_MAX_STRIDE && bpp > 0) {
+        s_entry_display_framebuf = topaddr;
+        s_entry_display_bufferwidth = bufferwidth;
+        s_entry_display_pixelformat = pixelformat;
+        s_entry_display_valid = 1;
+
+        {
+            u8 *src = (u8 *)moonlight_main_display_cpu_addr(topaddr);
+            u16 *snapshot = (u16 *)moonlight_main_entry_snapshot_addr();
+            for (y = 0; y < PSP_DISPLAY_HEIGHT_PIXELS; y++) {
+                int x;
+                if (pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+                    u32 *src_row = (u32 *)(src + (size_t)y * (size_t)bufferwidth * 4u);
+                    for (x = 0; x < PSP_ENTRY_SNAPSHOT_WIDTH; x++) {
+                        snapshot[y * PSP_ENTRY_SNAPSHOT_WIDTH + x] =
+                            moonlight_main_pack_rgb565(src_row[x]);
+                    }
+                } else {
+                    u16 *src_row = (u16 *)(src + (size_t)y * (size_t)bufferwidth * 2u);
+                    memcpy(snapshot + y * PSP_ENTRY_SNAPSHOT_WIDTH,
+                           src_row,
+                           PSP_ENTRY_SNAPSHOT_WIDTH * sizeof(u16));
+                }
+            }
+            s_entry_display_snapshot_bytes = PSP_ENTRY_SNAPSHOT_BYTES;
+            s_entry_display_snapshot_valid = 1;
+        }
+    }
+
+    diag_log_write("MAIN", "entry display capture ret=0x%08X valid=%d fb=0x%08X bw=%d fmt=%d snapshot=%d storage=vram565\n",
+                   (unsigned)ret,
+                   s_entry_display_valid,
+                   (unsigned)s_entry_display_framebuf,
+                   s_entry_display_bufferwidth,
+                   s_entry_display_pixelformat,
+                   s_entry_display_snapshot_bytes);
+    diag_log_flush();
+}
+
 void moonlight_main_mark_exitgame_pending(void)
 {
     diag_log_write("MAIN", "process-exit exitgame mark begin\n");
@@ -455,12 +593,58 @@ static void moonlight_main_prepare_psplink_prompt_framebuffer(void)
     sceDisplaySetMode(0, 480, 272);
     pspDebugScreenInit();
     pspDebugScreenSetXY(0, 0);
+    if (s_entry_display_valid && s_entry_display_snapshot_valid) {
+        int ret;
+        u8 *dst = (u8 *)moonlight_main_display_cpu_addr(s_entry_display_framebuf);
+        u16 *snapshot = (u16 *)moonlight_main_entry_snapshot_addr();
+        int y;
+
+        for (y = 0; y < PSP_DISPLAY_HEIGHT_PIXELS; y++) {
+            int x;
+            if (s_entry_display_pixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+                u32 *dst_row = (u32 *)(dst + (size_t)y *
+                                        (size_t)s_entry_display_bufferwidth * 4u);
+                for (x = 0; x < PSP_ENTRY_SNAPSHOT_WIDTH; x++) {
+                    dst_row[x] = moonlight_main_unpack_rgb565(
+                        snapshot[y * PSP_ENTRY_SNAPSHOT_WIDTH + x]);
+                }
+            } else {
+                u16 *dst_row = (u16 *)(dst + (size_t)y *
+                                        (size_t)s_entry_display_bufferwidth * 2u);
+                memcpy(dst_row,
+                       snapshot + y * PSP_ENTRY_SNAPSHOT_WIDTH,
+                       PSP_ENTRY_SNAPSHOT_WIDTH * sizeof(u16));
+            }
+        }
+        sceKernelDcacheWritebackInvalidateAll();
+        diag_log_write("MAIN", "process-exit restored entry framebuffer pixels bytes=%d storage=vram565\n",
+                       s_entry_display_snapshot_bytes);
+        ret = sceDisplaySetFrameBuf(s_entry_display_framebuf,
+                                    s_entry_display_bufferwidth,
+                                    s_entry_display_pixelformat,
+                                    PSP_DISPLAY_SETBUF_IMMEDIATE);
+        diag_log_write("MAIN", "process-exit restored entry framebuffer fb=0x%08X bw=%d fmt=%d ret=0x%08X\n",
+                       (unsigned)s_entry_display_framebuf,
+                       s_entry_display_bufferwidth,
+                       s_entry_display_pixelformat,
+                       (unsigned)ret);
+    } else {
+        diag_log_write("MAIN", "process-exit no entry framebuffer snapshot; leaving display buffer unchanged\n");
+    }
     sceKernelDcacheWritebackInvalidateAll();
     sceDisplayWaitVblankStart();
 
     diag_log_write("MAIN", "process-exit framebuffer handoff complete\n");
     diag_log_flush();
 }
+
+#ifndef RETAIL_BUILD
+/* PSPLink's helper unload bypasses newlib _exit(), which normally releases
+ * the 12 MiB application heap. Only the successful own-exit handoff arms
+ * release; ordinary CRT exit and external module-stop do not arm it. */
+static int s_psplink_heap_release_pending;
+extern void __psp_free_heap(void);
+#endif
 
 static int moonlight_main_exit_to_psplink(const char *reason)
 {
@@ -476,6 +660,39 @@ static int moonlight_main_exit_to_psplink(const char *reason)
         return 0;
     }
 
+#ifndef RETAIL_BUILD
+    /*
+     * Diagnostics builds are loaded as a PRX by PSPLink.  The MediaEngine
+     * helper is a separate module, so ask it to stop/unload Moonlight after
+     * this main thread exits.  Calling the module-manager self-stop APIs from
+     * inside this PRX hangs in the PSPLink modload runtime, while the same
+     * operation succeeds through the external modstun path.  Retail uses the
+     * normal XMB exit path.
+     */
+    {
+        SceUID module_id;
+        int request_ret;
+
+        moonlight_main_shutdown_exit_callback_thread();
+        moonlight_main_prepare_psplink_prompt_framebuffer();
+        module_id = sceKernelGetModuleId();
+        diag_log_write("MAIN", "process exit: requesting helper stop/unload module=0x%08X reason=%s\n",
+                       (unsigned)module_id, why);
+        diag_log_flush();
+        request_ret = RequestModuleUnload(module_id);
+        if (request_ret >= 0) s_psplink_heap_release_pending = 1;
+        diag_log_write("MAIN", "process exit: helper stop/unload request module=0x%08X ret=0x%08X reason=%s\n",
+                       (unsigned)module_id,
+                       (unsigned)request_ret,
+                       why);
+        diag_log_flush();
+        if (request_ret < 0) {
+            return 1;
+        }
+        sceKernelExitDeleteThread(0);
+        return 1;
+    }
+#else
     diag_log_write("MAIN", "top-level sceKernelExitGame handoff reason=%s\n", why);
     diag_log_flush();
     sceKernelDelayThread(50000);
@@ -483,6 +700,7 @@ static int moonlight_main_exit_to_psplink(const char *reason)
     diag_log_write("MAIN", "top-level sceKernelExitGame returned unexpectedly reason=%s\n", why);
     diag_log_flush();
     return 1;
+#endif
 }
 
 void moonlight_main_prepare_for_process_exit(void)
@@ -506,6 +724,7 @@ static void halt_with_error(const char *step_name, int error_code) {
                          (unsigned int)error_code);
 #else
     LOG("\n=== FATAL ERROR ===\nStep : %s\nCode : 0x%08X (%d)\nPress any button to exit...\n", step_name, (unsigned int)error_code, error_code);
+    diag_log_flush();
 #endif
     sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     while (1) { sceCtrlPeekBufferPositive(&pad, 1); if (pad.Buttons != 0) break; sceKernelDelayThread(50 * 1000); }
@@ -514,17 +733,129 @@ static void halt_with_error(const char *step_name, int error_code) {
 
 static void setup_callbacks(void);
 
+#if PSP_HARDWARE_AVC
+/* Use the requested mode for the early warmup, then verify it against the
+ * first in-band SPS/PPS. A mismatch is handed to the UI thread and corrected
+ * before any IDR is submitted to Sony. */
+static int psp_avc_firmware_main_mode(void)
+{
+#if defined(PSP_AVC_UNIFIED_MAIN_MODE) && PSP_AVC_UNIFIED_MAIN_MODE
+    return 1;
+#else
+    return g_psp_config.cabacTestMode ? 1 : 0;
+#endif
+}
+
+static int psp_avc_prepare_before_rtsp(void)
+{
+    unsigned int width = (unsigned int)g_psp_config.width;
+    unsigned int height = (unsigned int)g_psp_config.height;
+    int caller_priority;
+    int changed = 0;
+    int r;
+
+    if (!width || !height || width > 480 || height > 272 ||
+        (width & 1u) || (height & 1u)) {
+        diag_log_write("AVC", "pre-RTSP warmup invalid dimensions=%ux%u",
+                       width, height);
+        return -1;
+    }
+
+    /* Keep AVC setup on the sole UI thread before Wi-Fi and audio workers are
+     * created. Session setup keeps module loading at the normal priority and
+     * lowers only the firmware mode switch to the verified decoder priority. */
+    caller_priority = sceKernelGetThreadCurrentPriority();
+    /* Keep the entry thread at its normal priority for firmware module
+     * import fixup.  The proven codec-stack bootstrap performs this work on
+     * the default user-main thread; priority 33 can leave module-manager
+     * fixup waiting on higher-priority startup work. */
+    diag_log_write("AVC", "pre-RTSP warmup priority=%d changed=%d",
+                   caller_priority, changed);
+    diag_log_flush();
+    psp_avc_player_log_state("pre-RTSP-before-open");
+    r = psp_avc_player_open_profile(width, height, NULL,
+                                    psp_avc_firmware_main_mode());
+    if (changed) sceKernelChangeThreadPriority(0, caller_priority);
+
+    if (r == -1 && psp_avc_player_is_open()) {
+        /* Settings can change the negotiated dimensions between host-menu
+         * visits.  Recycle only the old, idle session in that case. */
+        diag_log_write("AVC", "pre-RTSP warmup replacing session dimensions=%ux%u",
+                       width, height);
+        r = psp_avc_player_close();
+        if (r == 0) {
+            caller_priority = sceKernelGetThreadCurrentPriority();
+            changed = 0;
+            if (caller_priority >= 0 && caller_priority < 33 &&
+                sceKernelChangeThreadPriority(0, 33) >= 0) {
+                changed = 1;
+            }
+            r = psp_avc_player_open_profile(width, height, NULL,
+                                            psp_avc_firmware_main_mode());
+            if (changed) sceKernelChangeThreadPriority(0, caller_priority);
+        }
+    }
+    diag_log_write("AVC", "pre-RTSP warmup result=%d dimensions=%ux%u",
+                   r, width, height);
+    psp_avc_player_log_state("pre-RTSP-after-open");
+    return r;
+}
+
+/* The only reliable ownership window for sceMeBootStart660(4) is the short
+ * entry phase before settings/netconf creates utility and WLAN activity.  The
+ * MPEG session itself is independent of the eventual stream dimensions; the
+ * later prepare call only retargets the backend's SPS contract. */
+static int psp_avc_prime_at_entry(void)
+{
+    int caller_priority;
+    int r;
+
+    caller_priority = sceKernelGetThreadCurrentPriority();
+    /* Load/fix imports on the user-main thread, then boot the requested mode. */
+    diag_log_write("AVC", "entry prime priority=%d firmware_main_mode=%d stream_cabac_request=%d; firmware boot uses 33",
+                   caller_priority, psp_avc_firmware_main_mode(),
+                   g_psp_config.cabacTestMode ? 1 : 0);
+    diag_log_flush();
+    r = psp_avc_player_open_profile(480, 272, NULL,
+                                    psp_avc_firmware_main_mode());
+    psp_avc_player_log_state("entry-prime");
+    diag_log_write("AVC", "entry prime result=%d", r);
+    diag_log_flush();
+    return r;
+}
+#endif
+
 int main(int argc, char *argv[]) {
     int ret; int skip_rescan = 0; char selected_host_ip[16] = {0}; HostPC *selected_host = NULL;
     setup_callbacks();
     diag_log_clear();
+    moonlight_main_capture_entry_display();
+#if PSP_HARDWARE_AVC
+    ret = loadConfig(&g_psp_config);
+    diag_log_write("AVC", "entry config read result=%d cabac=%d firmware_main=%d dimensions=%dx%d",
+                   ret,g_psp_config.cabacTestMode,
+                   psp_avc_firmware_main_mode(),g_psp_config.width,
+                   g_psp_config.height);
+    diag_log_flush();
+    ret = psp_avc_prime_at_entry();
+    if (ret < 0) {
+        diag_log_write("MAIN", "entry AVC prime failed=%d\n", ret);
+        diag_log_flush();
+        moonlight_main_exit_to_psplink("entry AVC prime failed");
+        return ret;
+    }
+#endif
     if (!s_mbedtls_heap_ready) {
         mbedtls_memory_buffer_alloc_init(s_mbedtls_heap, sizeof(s_mbedtls_heap));
         s_mbedtls_heap_ready = 1;
     }
     pspDebugScreenInit();
     ret = scePowerSetClockFrequency(333, 333, 166);
+
     diag_log_write("MAIN", "[REMOTE] g_remote_buttons at 0x%08X\n", (unsigned int)&g_remote_buttons);
+#ifndef RETAIL_BUILD
+    diag_log_write("MAIN", "[REMOTE] g_remote_buttons_hold at 0x%08X\n", (unsigned int)&g_remote_buttons_hold);
+#endif
     diag_log_write("MAIN", "[REMOTE] g_remote_analog_active at 0x%08X\n", (unsigned int)&g_remote_analog_active);
     diag_log_write("MAIN", "[REMOTE] g_remote_analog_lx at 0x%08X\n", (unsigned int)&g_remote_analog_lx);
     diag_log_write("MAIN", "[REMOTE] g_remote_analog_ly at 0x%08X\n", (unsigned int)&g_remote_analog_ly);
@@ -543,6 +874,14 @@ int main(int argc, char *argv[]) {
     ret = client_identity_ensure(NULL);
     if (ret < 0) { halt_with_error("Identity", ret); return ret; }
 
+#if defined(PSP_AVC_ENTRY_REPLAY) && PSP_AVC_ENTRY_REPLAY
+    ret = psp_avc_entry_replay();
+    diag_log_write("AVC","entry replay setup failed result=%08X\n",(unsigned)ret);
+    diag_log_flush();
+    /* Retain ownership on setup failure too; reset is the probe's exit. */
+    if(ret<0) { for(;;) sceKernelDelayThread(100000); }
+#endif
+
     ui_begin_frame(); ui_draw_gradient_bg(UI_COL_BG_TOP, UI_COL_BG_BOT); ui_draw_header("PSP Moonlight");
     ui_draw_text_centered(0.0f, 480.0f, 130.0f, UI_COL_TEXT, "Initialising..."); ui_end_frame();
 
@@ -558,12 +897,33 @@ settings_menu_entry:
     diag_log_write("UI", "TRANSITION settings_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     diag_log_flush();
 
+#if PSP_HARDWARE_AVC
+    /* Retarget the already-owned entry session to the configured stream. */
+    ret = psp_avc_prepare_before_rtsp();
+    if (ret < 0) {
+        diag_log_write("MAIN", "configured AVC session failed=%d\n", ret);
+        diag_log_flush();
+        moonlight_main_exit_to_psplink("configured AVC session failed");
+        return ret;
+    }
+#endif
+
     LOG("[STEP 2] Connecting Wi-Fi...\n");
     diag_log_write("UI", "TRANSITION wifi_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     diag_log_flush();
     { /* Skip netconf dialog if WiFi is already connected (back-navigation) */
         int apctl_state = 0;
-        sceNetApctlGetState(&apctl_state);
+        ret = sceNetApctlGetState(&apctl_state);
+#if PSP_HARDWARE_AVC && !defined(RETAIL_BUILD)
+        {
+            unsigned int stack_pointer;
+            __asm__ volatile("move %0,$sp" : "=r"(stack_pointer));
+            diag_log_write("AVC","pre-WiFi APCTL result=%08X state=%d stack_free=%d sp=%08X thread=%08X\n",
+                (unsigned)ret,apctl_state,sceKernelCheckThreadStack(),
+                stack_pointer,(unsigned)sceKernelGetThreadId());
+            diag_log_flush();
+        }
+#endif
         if (apctl_state != 4) {
             ret = netconf_ui_run();
             diag_log_write("UI", "NETCONF returned %d\n", ret);
@@ -576,8 +936,25 @@ settings_menu_entry:
     }
     diag_log_write("UI", "TRANSITION wifi_done t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     diag_log_flush();
-
 host_select_loop:
+#if PSP_HARDWARE_AVC
+    if (!psp_avc_player_is_ready()) {
+        /* A previous stream closes the session before returning here.  Stop
+         * the WiFi keepalive while recreating the firmware owner, then resume
+         * it for discovery and the next RTSP connection. */
+        diag_log_write("AVC", "reopening session before host discovery\n");
+        diag_log_flush();
+        wifi_keepalive_stop();
+        ret = psp_avc_prepare_before_rtsp();
+        wifi_keepalive_start();
+        if (ret < 0) {
+            diag_log_write("MAIN", "host-loop AVC warmup failed=%d\n", ret);
+            diag_log_flush();
+            moonlight_main_exit_to_psplink("host-loop AVC warmup failed");
+            return ret;
+        }
+    }
+#endif
     diag_log_write("UI", "TRANSITION host_discovery_start t=%u\n", sceKernelGetSystemTimeLow() / 1000);
     diag_log_flush();
     if (!skip_rescan) host_discovery_init();
@@ -604,7 +981,9 @@ host_select_loop:
     /* Trust the server's <PairStatus> from the HTTP probe rather than
      * relying solely on the single paired_host_ip in config.  This lets
      * the PSP work with multiple paired hosts without re-pairing. */
-    if (selected_host->paired) g_is_paired = 1;
+    /* Clear stale saved pairing too: a different PSP/client certificate may
+     * select an unpaired host even when copied config says it was paired. */
+    g_is_paired = selected_host->paired ? 1 : 0;
     diag_log_write("UI", "TRANSITION host_selected ip=%s t=%u\n", selected_host_ip, sceKernelGetSystemTimeLow() / 1000);
     config_add_manual_host(selected_host_ip, selected_host->mac);
 
@@ -652,8 +1031,6 @@ host_select_loop:
         goto host_select_loop;
     }
 
-    extern unsigned char g_remote_input_key[16];
-    stream_crypto_init(g_remote_input_key);
     s_stream_ram_start_free = sceKernelTotalFreeMemSize();
     s_stream_ram_start_largest = sceKernelMaxFreeMemSize();
     diag_log_write("MAIN", "RAM stream-start free=%uK largest=%uK\n",
@@ -662,19 +1039,7 @@ host_select_loop:
 
     extern int g_audio_rtsp_ok;
     if (g_audio_rtsp_ok && g_psp_config.audioEnabled) {
-        int audio_ret;
-        diag_log_write("MAIN", "Initializing audio thread...\n");
-        audio_ret = audio_thread_init(selected_host_ip);
-        if (audio_ret < 0) {
-            diag_log_write("MAIN", "Audio init failed (%d); aborting audio-required stream\n",
-                           audio_ret);
-            diag_log_flush();
-            audio_thread_shutdown();
-            rtsp_session_close();
-            network_connect_clear_retry_app();
-            skip_rescan = 1;
-            goto host_select_loop;
-        }
+        diag_log_write("MAIN", "Audio receiver initialized before RTSP PLAY\n");
     } else if (g_audio_rtsp_ok) {
         diag_log_write("MAIN", "Audio disabled: keeping RTSP ping-only path; skipping RTP drain/decode/playback\n");
     } else {
@@ -685,24 +1050,29 @@ host_select_loop:
                    (unsigned)((sizeof(g_shared) + 1023) / 1024));
     memset(&g_shared, 0, sizeof(g_shared));
 
-    diag_log_write("MAIN", "Initializing network ME (D-UDP)...\n");
-    diag_log_flush();
-    network_me_init(&g_shared.packet_ring);
-    diag_log_write("MAIN", "network_me_init done.\n");
-    diag_log_flush();
-
-    diag_log_write("MAIN", "Initializing SW decoder (CAVLC+VFPU dual-core)...\n");
+    diag_log_write("MAIN", "Initializing video decoder before RTP worker...\n");
     diag_log_flush();
     { g_cabac_detected = 0;
       g_cabac_dialog_active = 0;
     }
     ret = sw_decoder_thread_init(&g_shared.frame_ring);
     if (ret < 0) {
+#if PSP_HARDWARE_AVC
+        diag_log_write("AVC", "Sony AVC decoder init failed: %d\n", ret);
+        halt_with_error("Sony AVC Init", ret); return ret;
+#else
         diag_log_write("MAIN", "SW Decoder Init failed: %d\n", ret);
         halt_with_error("SW Decoder Init", ret); return ret;
+#endif
     }
     me_running = 1;
-    diag_log_write("MAIN", "Threads ready.\n");
+    diag_log_write("MAIN", "Video decoder ready.\n");
+    diag_log_flush();
+
+    diag_log_write("MAIN", "Initializing network ME (D-UDP)...\n");
+    diag_log_flush();
+    network_me_init(&g_shared.packet_ring);
+    diag_log_write("MAIN", "network_me_init done. Threads ready.\n");
     diag_log_flush();
 
     extern int g_decoder_ready;
@@ -720,6 +1090,9 @@ host_select_loop:
     }
 
     diag_log_write("MAIN", "Control stream started. Entering main loop.\n");
+    s_video_seen_this_session = 0;
+    s_mode_b_soft_count = 0;
+    s_force_restart_no_progress = 0;
     diag_log_flush();  /* Flush all handshake/setup logs to disk */
     safety_buffer_init();
     hud_init();
@@ -755,6 +1128,28 @@ host_select_loop:
 
     u32 stream_wait_start = sceKernelGetSystemTimeLow() / 1000;
     while (g_running) {
+        /* A lost host video sender can leave RTP silent while APCTL and the
+         * control socket keep answering. network_me requests an urgent IDR
+         * after 2.5 seconds without media; if that does not restore RTP,
+         * tear down cleanly instead of holding a frozen image indefinitely. */
+        if (me_running && g_stream_ready_flag) {
+            u32 video_idle_ms = network_me_video_idle_ms();
+            if (video_idle_ms >= 10000u) {
+                diag_log_write("MAIN", "video RTP idle %ums after first display and IDR recovery; ending stalled stream\n",
+                               (unsigned)video_idle_ms);
+                diag_log_flush();
+                g_stream_status = 1;
+                me_running = 0;
+            }
+        }
+        if (!me_running && g_stream_status == 1) {
+            diag_log_write("MAIN", "host stream ended; completing teardown and returning to discovery\n");
+            diag_log_flush();
+            abort_stream_to_menu();
+            memset(&g_shared, 0, sizeof(g_shared));
+            skip_rescan = 1;
+            goto host_select_loop;
+        }
         if (!me_running) {
             SceCtrlData disc_pad;
             ui_begin_frame();
@@ -800,6 +1195,7 @@ host_select_loop:
         }
 
         SceCtrlData pad; void *frame = NULL;
+        u32 frame_decode_ts = 0;
         unsigned int remote_buttons_snapshot = g_remote_buttons;
 
         if (g_remote_app_exit_request) {
@@ -832,11 +1228,40 @@ host_select_loop:
             goto host_select_loop;
         }
 
+#if PSP_HARDWARE_AVC
+        if (psp_avc_player_profile_change_ready()) {
+#ifndef RETAIL_BUILD
+            int old_profile = psp_avc_player_current_profile();
+            int new_profile = psp_avc_player_requested_profile();
+#endif
+            ret = psp_avc_player_apply_profile_change();
+            if (ret < 0) {
+#ifndef RETAIL_BUILD
+                diag_log_write("AVC", "UI-thread profile switch failed=%08X old_main=%d requested_main=%d; exiting stream cleanly",
+                               (unsigned)ret,old_profile,new_profile);
+                diag_log_flush();
+#endif
+                g_remote_exit_request = 1;
+            } else {
+#ifndef RETAIL_BUILD
+                diag_log_write("AVC", "UI-thread profile switch complete old_main=%d new_main=%d; requesting fresh IDR before decode",
+                               old_profile,new_profile);
+                diag_log_flush();
+#endif
+                control_stream_request_idr_force();
+            }
+        }
+#endif
+
         /* Race-safe ring buffer drain: rely solely on head != tail.
          * The old 'frame_ready' flag had a TOCTOU race: consumer could
          * clear it to 0 right after producer set it to 1, losing a frame
          * and—if the producer was between IDRs—freezing the display. */
         {
+#if PSP_HARDWARE_AVC
+            unsigned int output_sequence;
+            frame = psp_avc_player_take(&output_sequence, &frame_decode_ts);
+#else
             u32 tail = g_shared.frame_ring.tail;
             u32 head = g_shared.frame_ring.head;
             if (tail != head) {
@@ -849,7 +1274,12 @@ host_select_loop:
                 frame = g_shared.frame_ring.frame_data[tail];
                 g_shared.frame_ring.tail = (tail + 1) % FRAME_RING_SLOTS;
             }
+#endif
         }
+        if (frame && frame_decode_ts == 0) {
+            frame_decode_ts = g_last_frame_decode_us;
+        }
+        if (frame) s_video_seen_this_session = 1;
 
         static int video_started = 0;
         static int s_disp_count = 0;
@@ -859,11 +1289,29 @@ host_select_loop:
         static float s_display_fps = 0.0f;
         static int s_latency_avg_ms = 0;
         int cabac_detected = decoder_is_cabac_detected();
+#if PSP_HARDWARE_AVC
+        int stream_entropy_mode = g_avc_entropy_mode;
+#endif
 
         /* CABAC detection is telemetry-only here. Release readiness must come
          * from making this path playable, not from rejecting it after startup. */
         {
             static int s_cabac_detect_logged = 0;
+            static int s_entropy_mode_logged = -2;
+
+#if PSP_HARDWARE_AVC
+            if (stream_entropy_mode >= 0 &&
+                stream_entropy_mode != s_entropy_mode_logged) {
+                diag_log_write("AVC", "in-band PPS selected %s tuning row; Sony firmware mode=%s; preset=%d %dx%d@%d",
+                               stream_entropy_mode ? "CABAC" : "CAVLC",
+                               psp_avc_player_current_profile() ? "Main" : "Baseline",
+                               g_psp_config.presetIndex,g_psp_config.width,
+                               g_psp_config.height,g_psp_config.fps);
+                s_entropy_mode_logged = stream_entropy_mode;
+            }
+#else
+            (void)s_entropy_mode_logged;
+#endif
 
             if (!cabac_detected) {
                 s_cabac_detect_logged = 0;
@@ -880,7 +1328,8 @@ host_select_loop:
          * Input is sampled and sent at the earliest point in the frame. */
         if (video_started && !hud_is_visible()) input_poll_and_send();
 
-        frame = cabac_pace_present_frame(frame, video_started);
+        if (!PSP_HARDWARE_AVC)
+            frame = cabac_pace_present_frame(frame, video_started);
 
         if (frame) {
             if (!video_started) { g_stream_ready_flag = 1; diag_log_write("MAIN", "First video frame displayed\n"); diag_log_flush(); s_fps_last_us = sceKernelGetSystemTimeLow(); }
@@ -897,7 +1346,8 @@ host_select_loop:
                 int cabac_clocked_present = cabac_present_pacing_enabled();
                 if (decode_ts > 0) {
                     u32 age_us = sceKernelGetSystemTimeLow() - decode_ts;
-                    if (!cabac_clocked_present && age_us < 4000) {
+                    if (!PSP_HARDWARE_AVC && !cabac_clocked_present &&
+                        age_us < 4000) {
                         sceDisplayWaitVblankStart();
                         s_pace_count++;
                         if (s_pace_count <= 3 || (s_pace_count % 500) == 0) {
@@ -908,23 +1358,14 @@ host_select_loop:
                 }
             }
 
+#if PSP_HARDWARE_AVC
+            display_avc_frame(frame);
+#else
             display_frame(frame);
+#endif
             s_disp_count++;
             s_idle_count = 0;  /* Reset idle counter for new decoded content. */
             s_fps_frame_count++;
-            /* Per-frame decode-to-display latency (rolling average) */
-            {
-                u32 disp_us = sceKernelGetSystemTimeLow();
-                if (g_last_frame_decode_us > 0) {
-                    int frame_lat = (int)((disp_us - g_last_frame_decode_us) / 1000);
-                    if (frame_lat >= 0 && frame_lat < 9999) {
-                        /* Exponential moving average: alpha=0.1 (90% history, 10% new) */
-                        static float s_lat_ema = 0.0f;
-                        s_lat_ema = s_lat_ema * 0.9f + (float)frame_lat * 0.1f;
-                        s_latency_avg_ms = (int)(s_lat_ema + 0.5f);
-                    }
-                }
-            }
             if ((s_disp_count % 300) == 0) {
                 diag_log_write("MAIN", "DISP n=%d idle=%d rdy=%u h=%u t=%u",
                                s_disp_count, s_idle_count,
@@ -1000,7 +1441,12 @@ host_select_loop:
                             /* Phase 5: Try pipeline flush before full restart */
                             diag_log_write("MAIN", "[WDG] Mode A flush attempt (hung %u ms, timeout %u ms)",
                                            (unsigned)(elapsed / 1000), (unsigned)(wdg_timeout_us / 1000));
+#if PSP_HARDWARE_AVC
+                            /* Sony's decoder has no in-place flush operation;
+                             * the worker restart below owns its recovery path. */
+#else
                             oh264_pipeline_flush_buffers();
+#endif
                             sceKernelDelayThread(100000); /* 100ms settle */
                             active = g_decode_active_us;
                             if (active != 0) {
@@ -1025,9 +1471,8 @@ host_select_loop:
                 /* Mode B: No frames for ~5s — soft recovery (IDR burst).
                  * Does NOT consume a restart slot.  Repeats every 5s.
                  * After force_restart with no progress, back off to 10s
-                 * to avoid flooding Sunshine when the problem is server-side. */
+                * to avoid flooding Sunshine when the problem is server-side. */
                 {
-                    static int s_force_restart_no_progress = 0;
                     int backoff_interval = (s_force_restart_no_progress > 0) ? 900 : 600;
                     if (s_idle_count > (unsigned)backoff_interval && (s_idle_count % (unsigned)backoff_interval) < 2) {
                     extern volatile int g_decoder_alive_counter;
@@ -1101,6 +1546,18 @@ host_select_loop:
                         }
                     }
                     s_last_alive_count = alive_now;
+                    /* A live stream that has already displayed video but has
+                     * exhausted a full set of IDR recoveries is no longer a
+                     * useful session. This commonly follows a host display or
+                     * encoder re-enumeration that leaves audio alive but stops
+                     * video RTP. Return through the normal teardown path rather
+                     * than holding the last frame indefinitely. */
+                    if (s_video_seen_this_session &&
+                        s_force_restart_no_progress >= 1) {
+                        diag_log_write("MAIN", "WATCHDOG-B: video absent after repeated IDR recovery; requesting clean return to host menu");
+                        diag_log_flush();
+                        g_remote_exit_request = 1;
+                    }
                     }
                 }
 
@@ -1243,6 +1700,7 @@ host_select_loop:
                         u32 d_recovered = 0;
                         u32 d_failed = 0;
                         u32 d_dropped = 0;
+                        u32 d_attempts = 0;
                         u32 loss_x10 = 0;
                         u32 fec_loss_x10 = 0;
                         u32 frame_loss_x10 = 0;
@@ -1258,10 +1716,15 @@ host_select_loop:
                                 d_recovered = vs.packets_recovered - s_prev_vs.packets_recovered;
                                 d_failed = vs.packets_failed - s_prev_vs.packets_failed;
                                 d_dropped = vs.frames_dropped - s_prev_vs.frames_dropped;
+                                d_attempts = vs.recovery_attempts - s_prev_vs.recovery_attempts;
                             }
                         }
                         s_prev_vs = vs;
                         s_prev_vs_valid = 1;
+                        hs.fec_attempts = d_attempts;
+                        hs.fec_recovered_packets = d_recovered;
+                        hs.fec_failed_packets = d_failed;
+                        hs.fec_metric_valid = (d_recovered + d_failed) > 0;
 
                         if (d_recovered + d_failed > 0) {
                             fec_loss_x10 = (d_failed * 1000) / (d_recovered + d_failed);
@@ -1275,33 +1738,37 @@ host_select_loop:
                         if (frame_loss_x10 > loss_x10) loss_x10 = frame_loss_x10;
                         hs.packet_loss_pct = (float)loss_x10 / 10.0f;
 
-                        if (d_recovered + d_failed > 0) {
+                        if (hs.fec_metric_valid) {
                             hs.fec_recovery_pct =
                                 (float)((d_recovered * 100) /
                                         (d_recovered + d_failed));
-                        } else if (d_dropped > 0) {
-                            hs.fec_recovery_pct = 0.0f;
-                        } else {
-                            hs.fec_recovery_pct = 100.0f;
                         }
                     }
 
                     hs.battery_pct = scePowerGetBatteryLifePercent();
-                    if (hs.battery_pct < 0) hs.battery_pct = 0;
-                    hs.host_proc_ms = (int)(g_host_processing_us / 1000);
-
+                    hs.host_proc_us = (int)g_host_processing_us;
+                    hs.host_proc_valid = g_host_processing_valid &&
+                        (u32)(sceKernelGetSystemTimeLow()-g_host_processing_sample_us) < 2000000u;
+                    hs.latency_valid = s_latency_avg_ms > 0;
+                    hs.decode_us = (int)g_decode_time_us;
+                    hs.decode_valid = g_decode_time_us > 0;
+                    hs.gu_submit_sync_us = g_display_gu_submit_sync_us;
+                    hs.gu_frame_valid = g_display_gu_submit_sync_us > 0;
+#if PSP_HARDWARE_AVC
                     {
-                        extern volatile u32 g_decode_time_us;
-                        hs.decode_ms = (int)(g_decode_time_us / 1000);
+                        u32 gu_share_pct = 0;
+                        telemetry_sample(elapsed, NULL, &gu_share_pct, NULL);
+                        hs.gu_share_pct = (int)gu_share_pct;
                     }
-
+#else
                     {
-                        u32 cpu_pct = 0, gpu_pct = 0, me_pct = 0;
-                        telemetry_sample(elapsed, &cpu_pct, &gpu_pct, &me_pct);
+                        u32 cpu_pct = 0, gu_share_pct = 0, me_pct = 0;
+                        telemetry_sample(elapsed,&cpu_pct,&gu_share_pct,&me_pct);
                         hs.cpu_pct = (int)cpu_pct;
-                        hs.gpu_pct = (int)gpu_pct;
+                        hs.gu_share_pct = (int)gu_share_pct;
                         hs.me_pct = (int)me_pct;
                     }
+#endif
 
                     {
                         BandwidthTelemetry bw;
@@ -1313,6 +1780,7 @@ host_select_loop:
                         hs.bw_drop_kbps = (int)bw.video_drop_kbps;
                         hs.bw_usable_pct = (int)bw.usable_rx_pct;
                         hs.bw_video_packets_s = (int)bw.video_packets_s;
+                        hs.fec_active = bw.video_fec_kbps > 0;
                         hud_video_payload_kbps =
                             (int)(bw.video_data_kbps + bw.video_fec_kbps);
                         hud_video_fec_kbps = (int)bw.video_fec_kbps;
@@ -1354,23 +1822,47 @@ host_select_loop:
                         }
                         hs.ram_free_kb = (int)(free_mem / 1024);
                         hs.ram_largest_kb = (int)(largest / 1024);
-                        if (baseline > 0 && free_mem < baseline) {
-                            unsigned long long used =
-                                (unsigned long long)(baseline - free_mem) * 100ULL;
-                            hs.ram_used_pct = (int)(used / baseline);
-                            if (hs.ram_used_pct > 100) hs.ram_used_pct = 100;
-                        }
+                        hs.ram_free_delta_kb = (int)(baseline / 1024) -
+                                               hs.ram_free_kb;
+                    }
+
+                    hs.audio_enabled = g_psp_config.audioEnabled != 0;
+                    hs.audio_active = audio_thread_is_running();
+                    if (hs.audio_enabled && hs.audio_active) {
+                        AudioStats audio_stats;
+                        RtpAudioStats rtp_audio_stats;
+                        memset(&audio_stats,0,sizeof(audio_stats));
+                        memset(&rtp_audio_stats,0,sizeof(rtp_audio_stats));
+                        audio_thread_get_stats(&audio_stats);
+                        rtp_get_audio_stats(&rtp_audio_stats);
+                        hs.audio_frames_played = rtp_audio_stats.frames_played;
+                        hs.audio_empty_holds = audio_stats.empty_holds;
+                        hs.audio_underruns = rtp_audio_stats.underruns;
+                        hs.audio_ring_drops = audio_stats.frames_dropped;
+                        hs.audio_plc = rtp_audio_stats.plc_count;
                     }
 
                     hud_update_stats(&hs);
 #ifndef RETAIL_BUILD
+#if PSP_HARDWARE_AVC
                     diag_log_write("HUD",
-                                   "stats fps=%.1f lat=%d dec=%d loss=%.1f fec=%.1f cpu=%d gpu=%d me=%d ram=%d%% free=%dK largest=%dK bw_rx=%dkbps bw_usable=%dkbps bw_audio=%dkbps bw_drop=%dkbps bw_use=%d%% pkts=%d/s v=%d vfec=%d a=%d afec=%d\n",
-                                   hs.fps, hs.latency_ms, hs.decode_ms,
-                                   hs.packet_loss_pct, hs.fec_recovery_pct,
-                                   hs.cpu_pct, hs.gpu_pct, hs.me_pct,
-                                   hs.ram_used_pct, hs.ram_free_kb,
-                                   hs.ram_largest_kb,
+                                   "stats fps=%.1f d2p_ms=%d d2p_valid=%d avc_us=%d avc_valid=%d gu_sync_us=%u gu_share_pct=%d loss=%.1f fec_active=%d fec_valid=%d fec_attempts=%u fec_recovered=%u fec_failed=%u host_us=%d host_valid=%d ram_free=%dK ram_largest=%dK ram_delta=%dK audio_enabled=%d audio_active=%d audio_played=%u audio_holds=%u audio_underruns=%u audio_plc=%u audio_drops=%u bw_rx=%dkbps bw_usable=%dkbps bw_audio=%dkbps bw_drop=%dkbps bw_use=%d%% pkts=%d/s v=%d vfec=%d a=%d afec=%d\n",
+                                   hs.fps,hs.latency_ms,hs.latency_valid,
+                                   hs.decode_us,hs.decode_valid,
+                                   (unsigned)hs.gu_submit_sync_us,hs.gu_share_pct,
+                                   hs.packet_loss_pct,hs.fec_active,
+                                   hs.fec_metric_valid,(unsigned)hs.fec_attempts,
+                                   (unsigned)hs.fec_recovered_packets,
+                                   (unsigned)hs.fec_failed_packets,
+                                   hs.host_proc_us,hs.host_proc_valid,
+                                   hs.ram_free_kb,hs.ram_largest_kb,
+                                   hs.ram_free_delta_kb,hs.audio_enabled,
+                                   hs.audio_active,
+                                   (unsigned)hs.audio_frames_played,
+                                   (unsigned)hs.audio_empty_holds,
+                                   (unsigned)hs.audio_underruns,
+                                   (unsigned)hs.audio_plc,
+                                   (unsigned)hs.audio_ring_drops,
                                    hs.bw_rx_kbps, hs.bw_usable_kbps,
                                    hs.bw_audio_kbps, hs.bw_drop_kbps,
                                    hs.bw_usable_pct, hs.bw_video_packets_s,
@@ -1378,6 +1870,25 @@ host_select_loop:
                                    hud_video_fec_kbps,
                                    hud_audio_payload_kbps,
                                    hud_audio_fec_kbps);
+#else
+                    diag_log_write("HUD",
+                                   "stats fps=%.1f d2p_ms=%d avc_us=%d loss=%.1f fec_valid=%d fec_pct=%.1f cpu_decode_share=%d gu_share=%d me_share=%d host_us=%d host_valid=%d ram_free=%dK ram_largest=%dK ram_delta=%dK audio_enabled=%d audio_played=%u audio_holds=%u audio_underruns=%u audio_plc=%u audio_drops=%u bw_rx=%dkbps bw_usable=%dkbps bw_audio=%dkbps bw_drop=%dkbps bw_use=%d%% pkts=%d/s\n",
+                                   hs.fps,hs.latency_ms,hs.decode_us,
+                                   hs.packet_loss_pct,hs.fec_metric_valid,
+                                   hs.fec_recovery_pct,hs.cpu_pct,
+                                   hs.gu_share_pct,hs.me_pct,
+                                   hs.host_proc_us,hs.host_proc_valid,
+                                   hs.ram_free_kb,hs.ram_largest_kb,
+                                   hs.ram_free_delta_kb,hs.audio_enabled,
+                                   (unsigned)hs.audio_frames_played,
+                                   (unsigned)hs.audio_empty_holds,
+                                   (unsigned)hs.audio_underruns,
+                                   (unsigned)hs.audio_plc,
+                                   (unsigned)hs.audio_ring_drops,
+                                   hs.bw_rx_kbps,hs.bw_usable_kbps,
+                                   hs.bw_audio_kbps,hs.bw_drop_kbps,
+                                   hs.bw_usable_pct,hs.bw_video_packets_s);
+#endif
 #endif
                 }
             }
@@ -1452,14 +1963,43 @@ host_select_loop:
             }
         }
         /* input_poll_and_send moved to before display (G-1) */
-        g_remote_buttons = 0;  /* clear after all consumers */
+        consume_stream_remote_buttons(); /* after every stream input consumer */
         signal_strength_update();
 
-        /* Periodic log flush — ensures buffered decode timing data reaches disk */
-        { static int flush_ctr = 0; if (++flush_ctr >= 300) { diag_log_flush(); flush_ctr = 0; } }
+        /* Keep maintenance tied to elapsed time as idle polling speeds up. */
+        {
+            static u32 s_last_log_flush_us = 0;
+            u32 log_now_us = sceKernelGetSystemTimeLow();
+            if (!s_last_log_flush_us) {
+                s_last_log_flush_us = log_now_us;
+            } else if ((u32)(log_now_us - s_last_log_flush_us) >= 5000000U) {
+                diag_log_flush();
+                s_last_log_flush_us = log_now_us;
+            }
+        }
 
         if (frame || !video_started) {
             hud_render(); display_frame_finish();
+            /* Include the VBlank-synchronized swap in decode-to-present age. */
+            if (frame && frame_decode_ts != 0) {
+                u32 present_us = sceKernelGetSystemTimeLow();
+                int frame_lat =
+                    (int)((present_us - frame_decode_ts) / 1000);
+                if (frame_lat >= 0 && frame_lat < 9999) {
+                    static float s_lat_ema = 0.0f;
+                    s_lat_ema = s_lat_ema * 0.9f +
+                                (float)frame_lat * 0.1f;
+                    s_latency_avg_ms = (int)(s_lat_ema + 0.5f);
+#ifndef RETAIL_BUILD
+                    if ((s_disp_count % 15) == 0) {
+                        diag_log_write("LATENCY",
+                                       "decode-to-present=%dms frame_ts=%u present_ts=%u",
+                                       frame_lat,(unsigned)frame_decode_ts,
+                                       (unsigned)present_us);
+                    }
+#endif
+                }
+            }
         } else if (hud_overlay_visible()) {
             /* No new frame but HUD is open — re-blit last video frame so
              * the HUD can composite on top without double-buffer flashing. */
@@ -1480,12 +2020,24 @@ host_select_loop:
                 display_frame_repeat(); display_frame_finish();
             }
         } else {
+#if PSP_HARDWARE_AVC
+            /* A decoded picture can arrive while the presenter is idle.
+             * Waiting a whole VBlank here, then another at the swap, adds
+             * a refresh of age and turns arrival jitter into uneven swaps.
+             * The bounded yield below lets audio/AVC run between polls. */
+#ifndef RETAIL_BUILD
+            static int s_hw_idle_poll_logged = 0;
+            if (!s_hw_idle_poll_logged) {
+                diag_log_write("GPU", "hardware idle polls every 1000us; VBlank retained for swaps and HUD");
+                s_hw_idle_poll_logged = 1;
+            }
+#endif
+#else
             sceDisplayWaitVblankStart();
+#endif
         }
-        /* Always yield CPU when no frame is ready.  display_frame_finish()
-         * waits for VBlank (60Hz), so the loop is naturally paced when
-         * displaying.  The idle yield prevents CPU spinning at 100%
-         * between decoded frames. */
+        /* Completed swaps remain synchronized to VBlank. Yield when no frame
+         * is ready, including hardware polling, so decoder/audio can run. */
         if (!frame) {
             sceKernelDelayThread(1000);
         }
@@ -1532,6 +2084,16 @@ int module_stop(SceSize args, void *argp)
         moonlight_main_prepare_psplink_prompt_framebuffer();
         diag_log_write("MAIN", "module_stop cleanup result=%d\n", prepared);
         diag_log_flush();
+#ifndef RETAIL_BUILD
+        if (prepared && s_psplink_heap_release_pending) {
+            /* All workers and the UI main thread have exited. This is the
+             * last operation that can use newlib; do not log or allocate
+             * after releasing its partition block. Clear our flag first
+             * because the SDK hook does not clear its saved block UID. */
+            s_psplink_heap_release_pending = 0;
+            __psp_free_heap();
+        }
+#endif
         return prepared ? 0 : 1;
     }
 }

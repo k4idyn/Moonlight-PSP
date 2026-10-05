@@ -29,7 +29,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "stream_resolution.h"
 #include "shared.h"
 #include "diag_log.h"

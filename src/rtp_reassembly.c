@@ -16,9 +16,10 @@
 #include "rtp_reassembly.h"
 #include "safety_buffer.h"
 #include "diag_log.h"
-#include "sw_decode_pipeline.h"
+#include "decoder_pipeline.h"
 #include "control_stream.h"
 #include "decode_flags.h"
+#include "psp_avc_build.h"
 #include "signal_strength.h"
 #include "settings_menu.h"
 #include "runtime_telemetry.h"
@@ -85,6 +86,7 @@ static u32 s_current_idr_loss_end = 0;
 
 /* External dependencies */
 extern int g_decoder_ready;
+extern volatile int g_avc_entropy_mode;
 extern void rtp_frame_complete_callback(const u8 *nal_data, int nal_len);
 extern volatile unsigned int g_last_good_frame;
 extern PspConfig g_psp_config;
@@ -92,13 +94,22 @@ extern PspConfig g_psp_config;
 
 /* Host processing latency from Sunshine frame headers (microseconds) */
 volatile u32 g_host_processing_us = 0;
+volatile u32 g_host_processing_sample_us = 0;
+volatile int g_host_processing_valid = 0;
 
 static void rtp_start_idr_wait(u32 start_frame, u32 end_frame, u32 current_frame, const char *reason);
 static u32 rtp_frame_span(u32 start_frame, u32 end_frame);
 
+static int rtp_stream_is_cabac(void)
+{
+    int mode=g_avc_entropy_mode;
+    if(mode==0 || mode==1) return mode;
+    return g_psp_config.cabacTestMode!=0;
+}
+
 static int rtp_is_cavlc_performance_mode(void)
 {
-    return !g_psp_config.cabacTestMode &&
+    return !rtp_stream_is_cabac() &&
            g_psp_config.fps >= 30 &&
            g_psp_config.width <= 320 &&
            g_psp_config.height <= 180;
@@ -106,7 +117,7 @@ static int rtp_is_cavlc_performance_mode(void)
 
 static int rtp_is_cabac_mode(void)
 {
-    return g_psp_config.cabacTestMode != 0;
+    return rtp_stream_is_cabac();
 }
 
 static int rtp_is_cabac_performance_mode(void)
@@ -125,7 +136,7 @@ static int rtp_is_cabac_quality_audio_mode(void)
            g_psp_config.width == 480 &&
            g_psp_config.height == 272 &&
            g_psp_config.fps > 0 &&
-           g_psp_config.fps <= 10;
+           g_psp_config.fps <= 15;
 }
 
 static void rtp_request_idr_force_for_mode(void)
@@ -140,7 +151,7 @@ static void rtp_request_idr_force_for_mode(void)
 static const char *rtp_recovery_label(void) __attribute__((unused));
 static const char *rtp_recovery_label(void)
 {
-    if (g_psp_config.cabacTestMode) {
+    if (rtp_is_cabac_mode()) {
         return "CABAC";
     }
     if (rtp_is_cavlc_performance_mode()) {
@@ -250,7 +261,13 @@ static int rtp_wait_elapsed(u32 start_us, u32 min_us)
 
 static void rtp_advance_decoded_frame(u32 frame_id)
 {
+#if PSP_HARDWARE_AVC
+    /* Sony may buffer the picture after successfully consuming its AU.
+     * Track accepted input for transport recovery, not the delayed output. */
+    if (g_avc_last_input_accepted && g_idr_fully_decoded &&
+#else
     if (g_last_decode_output_ok && g_idr_fully_decoded &&
+#endif
         !g_current_frame_is_corrupt &&
         (g_last_good_frame == 0 || (s32)(frame_id - g_last_good_frame) > 0)) {
         g_last_good_frame = frame_id;
@@ -604,6 +621,8 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
                                 | ((u32)payload[6] << 16)
                                 | ((u32)payload[7] << 24);
                     g_host_processing_us = host_us;
+                    g_host_processing_sample_us = sceKernelGetSystemTimeLow();
+                    g_host_processing_valid = 1;
                     {
                         static int hpl_log = 0;
                         if (hpl_log < 5 || (hpl_log % 1000) == 0) {
@@ -1009,6 +1028,9 @@ void rtp_reassembly_process_packet(u8 *packet, int packet_len) {
 }
 
 void rtp_reassembly_reset(void) {
+    g_host_processing_us = 0;
+    g_host_processing_sample_us = 0;
+    g_host_processing_valid = 0;
     assembly_pos = 0;
     current_frame_id = 0xFFFFFFFF;
     s_last_seen_frame_id = 0xFFFFFFFF;

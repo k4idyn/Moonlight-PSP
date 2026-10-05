@@ -1,6 +1,6 @@
 # UI Flow Reference
 
-This document describes the implemented UI flow of PSP Moonlight v1.4.0.
+This document describes the UI flow of PSP Moonlight v1.5.0.
 
 All screen coordinates are in native PSP resolution: 480x272.
 
@@ -100,23 +100,23 @@ A vertical list of configurable settings. D-pad Up/Down navigates rows. D-pad Le
 
 | Setting | Options | Default |
 |---|---|---|
-| Preset | Performance, Balanced, Quality, Custom | Performance |
-| Resolution | 300x170, 360x204, 480x272, Custom | 300x170 |
-| FPS | 10, 15, 20, 30, 60, Custom | 30 |
-| Audio | Enabled, Disabled | Disabled in Performance |
+| Preset | Quality, Balanced, Performance, Custom | Balanced |
+| Resolution | 480x272, 360x204, 300x170, Custom | 360x204 |
+| FPS | 10, 15, 20, 30, 60, Custom | 20 |
+| Audio | Enabled, Disabled | Enabled |
 | Control Mode | Xbox, Browser | Xbox |
 | Button Map | Opens mapper | Default v2 map |
 | Theme | 10 built-in themes | Ocean Depths |
-| Bitrate | 192-2560 kbps presets | 384 kbps |
-| Packet Size | 512-1392 byte presets | 1056 bytes |
+| Bitrate | 192-2560 kbps presets | 480 kbps |
+| Packet Size | 512-1392 byte presets | 1200 bytes |
 
 ### Presets
 
 | Preset | Stream | Bitrate | Packet Size | Audio |
 |---|---|---:|---:|---|
 | Performance | 300x170 @ 30 fps | 384 kbps | 1056 | Disabled |
-| Balanced | 360x204 @ 20 fps | 480 kbps | 1200 | Enabled |
-| Quality | 480x272 @ 10 fps | 576 kbps | 1200 | Enabled |
+| Balanced (default) | 360x204 @ 20 fps | 480 kbps | 1200 | Enabled |
+| Quality | 480x272 @ 15 fps | 576 kbps | 1200 | Enabled |
 
 The Preset row applies the matching resolution, FPS, bitrate, packet size, and audio default. The Resolution row can then be changed independently without reapplying the preset ladder. Built-in sizes use the PSP LCD aspect ratio so the renderer fills 480x272 without fixed black bars.
 
@@ -142,7 +142,9 @@ If a phase fails, the connecting screen exits with an error modal and returns to
 
 The active stream fills the 480x272 display with the decoded RGBA frame. The HUD is hidden by default.
 
-The HUD shows stream timing, FPS, loss/FEC, CPU/GPU/ME/RAM telemetry, bandwidth, host, and battery information. Telemetry is updated once per second in diagnostics builds.
+The HUD shows measured FPS and decode-to-present timing, loss/FEC status, memory, bandwidth, video drops/packet rate, audio play/hold/underrun/PLC/drop counters, Sunshine frame-header processing time, and battery status. The HUD reports Sony AVC call time and GU submit/sync time. FEC idle means FEC is active but no repair outcome occurred in the sample. Battery N/A means the PSP battery API did not return an available percentage.
+
+In v1.5 hardware mode, the in-band PPS selects the Sony CAVLC or CABAC firmware mode before the first IDR. The HUD reports decoder timing, rendering time, bandwidth, memory, and audio status.
 
 When the HUD is not visible, stream input is forwarded to the host. App-owned combos such as HUD toggle and stream exit are consumed locally and are not sent as host input.
 

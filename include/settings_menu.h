@@ -4,7 +4,7 @@
  * Provides a menu interface for configuring streaming settings:
  * - Preset tier (Quality native, Balanced, Performance, or custom)
  * - Resolution dimensions, independently adjustable after preset selection
- * - FPS (10/15/20/30/60/custom; 20fps is a gate, not a ceiling)
+ * - FPS (10/15/20/30/60/custom)
  * - Audio enable, bitrate, packet size, theme, and controls
  * - Control Mode (Digital/Analog)
  *
@@ -32,7 +32,7 @@ extern "C" {
 
 /* Resolution presets — PSP-1000 hardware-tuned
  *
- *   [0] Quality      480x272 native resolution, 10fps tier
+ *   [0] Quality      480x272 native resolution, 15fps tier
  *   [1] Balanced     360x204 exact PSP-panel aspect, 20fps tier
  *   [2] Performance  300x170 lowest even PSP-panel aspect above host floor, 30fps tier, audio off
  *   [3] Custom       user-defined via OSK (defaults to 480x272)
@@ -148,13 +148,13 @@ typedef struct {
  * @config: Pointer to PspConfig to initialize with defaults
  *
  * Sets default values:
- * - Preset: Performance
- * - Resolution: 300x170
- * - FPS: 30
- * - Audio: Disabled
+ * - Preset: Balanced
+ * - Resolution: 360x204
+ * - FPS: 20
+ * - Audio: Enabled
  * - Control Mode: Xbox
- * - Bitrate: 384 kbps
- * - Packet size: 1056 bytes
+ * - Bitrate: 480 kbps
+ * - Packet size: 1200 bytes
  */
 void settings_menu_init(PspConfig *config);
 

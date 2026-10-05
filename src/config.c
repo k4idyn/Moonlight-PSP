@@ -151,13 +151,13 @@ static int clamp_config_int(int value, int min_value, int max_value)
  *--------------------------------------------------------------------------*/
 void configSetDefaults(PspConfig *config)
 {
-    /* Practical exact-aspect Performance default for PSP-1000 low-work mode. */
+    /* Balanced visual default; preserve the tuned preset ladder. */
     /* Stream settings */
-    config->width = DEFAULT_WIDTH;           /* 300 — lowest exact PSP aspect */
-    config->height = DEFAULT_HEIGHT;         /* 170 — no black bars */
-    config->fps = DEFAULT_FPS;               /* 30 FPS practical anchor */
-    config->bitrate = DEFAULT_BITRATE;       /* 384 kbps practical anchor */
-    config->packetSize = DEFAULT_PACKET_SIZE;/* 1056-byte Performance packet anchor */
+    config->width = DEFAULT_WIDTH;
+    config->height = DEFAULT_HEIGHT;
+    config->fps = DEFAULT_FPS;
+    config->bitrate = DEFAULT_BITRATE;
+    config->packetSize = DEFAULT_PACKET_SIZE;
     config->streamingRemotely = 2;           /* STREAM_CFG_AUTO */
     config->audioConfiguration = PSP_AUDIO_CONFIGURATION_MONO; /* Mono host stream */
     config->supportedVideoFormats = 0x0001;  /* H.264 */
@@ -172,11 +172,11 @@ void configSetDefaults(PspConfig *config)
 
     /* PSP-specific settings */
     config->controlMode = DEFAULT_CONTROL_MODE;
-    config->presetIndex = 2;                 /* Performance step-ladder preset */
-    config->resolutionIndex = 2;             /* 300x170 resolution row */
-    config->fpsIndex = 3;                    /* 30 FPS */
-    config->audioEnabled = 0;                /* Performance default: audio ping-only, no local drain/decode */
-    config->cabacTestMode = 0;               /* Release default: CAVLC; CABAC is test-only */
+    config->presetIndex = DEFAULT_PRESET_INDEX;
+    config->resolutionIndex = DEFAULT_PRESET_INDEX;
+    config->fpsIndex = DEFAULT_FPS_INDEX;
+    config->audioEnabled = DEFAULT_AUDIO_ENABLED;
+    config->cabacTestMode = 0;               /* Use the host's configured entropy coder. */
     config->disableEncryption = 1;           /* No AV encryption; RTSP/control stay compatible */
 
     /* Pairing persistence */
@@ -420,11 +420,11 @@ int loadConfig(PspConfig *config)
     }
 
     /* Clamp presetIndex and resolutionIndex independently. Invalid configs
-     * fall back to the low-work Performance preset/resolution. */
+     * fall back to the recommended Balanced preset/resolution. */
     if (config->presetIndex < 0 || config->presetIndex >= RESOLUTION_COUNT)
-        config->presetIndex = 2;
+        config->presetIndex = DEFAULT_PRESET_INDEX;
     if (config->resolutionIndex < 0 || config->resolutionIndex >= RESOLUTION_COUNT)
-        config->resolutionIndex = 2;
+        config->resolutionIndex = DEFAULT_PRESET_INDEX;
     /* Normalize dimensions to the selected mode so runtime launch/display
      * paths never receive unsupported sizes from a hand-edited config.
      * This does not apply step-ladder defaults; presetIndex owns those. */

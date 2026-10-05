@@ -19,6 +19,7 @@
 #include "safety_buffer.h"
 #include "ui_manager.h"
 #include "diag_log.h"
+#include "psp_avc_build.h"
 
 /*============================================================================
  * Constants
@@ -37,16 +38,12 @@ static u32 __attribute__((aligned(16))) hud_display_list[96 * 1024 / 4];
 #define HUD_BORDER_COLOR    UI_COL_BORDER
 
 /* HUD dimensions and positioning */
-#define HUD_WIDTH           238
+#define HUD_WIDTH           250
 #define HUD_X               (FRAME_WIDTH - HUD_WIDTH - 10)  /* Top-right */
 #define HUD_Y               10
 #define HUD_PADDING         8
 #define HUD_LINE_HEIGHT     16
-#ifdef RETAIL_BUILD
-#define HUD_STAT_LINES      4
-#else
 #define HUD_STAT_LINES      8
-#endif
 
 /* Menu item indices */
 #define MENU_ITEM_PAUSE     0
@@ -77,6 +74,8 @@ typedef struct {
 static HudStats g_stats = { 0 };             /* Current statistics (latency, fps) */
 static int g_hud_visible = 0;               /* HUD visibility flag */
 static int g_hud_cooldown = 0;              /* Frames to suppress input after toggle */
+/* A local close press remains local for its entire physical hold. */
+static u32 g_hud_consumed_buttons = 0;
 static int g_selected_item = 0;             /* Currently selected menu item */
 static int g_initialized = 0;               /* Initialization flag */
 
@@ -126,6 +125,7 @@ void hud_init(void)
     g_selected_item = 0;
     g_initialized = 1;
     g_prev_buttons = 0;
+    g_hud_consumed_buttons = 0;
 
     memset(&g_stats, 0, sizeof(g_stats));
 }
@@ -182,28 +182,68 @@ void hud_render(void)
     y_offset = HUD_Y + HUD_PADDING;
 
     /* Stats using UIManager intraFont text */
-    snprintf(buf, sizeof(buf), "Lat:%dms  Dec:%dms",
-             g_stats.latency_ms, g_stats.decode_ms);
+    if (g_stats.latency_valid)
+        snprintf(buf, sizeof(buf), "FPS: %.1f D2P:%dms",
+                 g_stats.fps,g_stats.latency_ms);
+    else
+        snprintf(buf, sizeof(buf), "FPS: %.1f D2P:unavailable",g_stats.fps);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 4;
 
-    snprintf(buf, sizeof(buf), "FPS: %.1f", g_stats.fps);
+    if (g_stats.fec_metric_valid) {
+        snprintf(buf, sizeof(buf), "Loss: %.1f%% FEC: %.1f%% R:%u F:%u",
+                 g_stats.packet_loss_pct,g_stats.fec_recovery_pct,
+                 (unsigned)g_stats.fec_recovered_packets,
+                 (unsigned)g_stats.fec_failed_packets);
+    } else if (g_stats.fec_attempts) {
+        snprintf(buf, sizeof(buf), "Loss: %.1f%% FEC tried:%u no outcome",
+                 g_stats.packet_loss_pct,(unsigned)g_stats.fec_attempts);
+    } else if (g_stats.fec_active) {
+        snprintf(buf, sizeof(buf), "Loss: %.1f%% FEC: idle",
+                 g_stats.packet_loss_pct);
+    } else {
+        snprintf(buf, sizeof(buf), "Loss: %.1f%% FEC: inactive",
+                 g_stats.packet_loss_pct);
+    }
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-    snprintf(buf, sizeof(buf), "Loss: %.1f%%  FEC: %.1f%%",
-             g_stats.packet_loss_pct, g_stats.fec_recovery_pct);
+#if PSP_HARDWARE_AVC || defined(RETAIL_BUILD)
+    if (g_stats.decode_valid && g_stats.gu_frame_valid) {
+        int avc_tenths=(g_stats.decode_us+50)/100;
+        int gu_tenths=(int)(g_stats.gu_submit_sync_us+50u)/100;
+#if PSP_HARDWARE_AVC
+        snprintf(buf, sizeof(buf), "AVC:%d.%dms GU:%d.%dms",
+                 avc_tenths/10,avc_tenths%10,gu_tenths/10,gu_tenths%10);
+#else
+        snprintf(buf, sizeof(buf), "Decode:%d.%dms GU:%d.%dms",
+                 avc_tenths/10,avc_tenths%10,gu_tenths/10,gu_tenths%10);
+#endif
+    } else if (g_stats.decode_valid) {
+        int avc_tenths=(g_stats.decode_us+50)/100;
+#if PSP_HARDWARE_AVC
+        snprintf(buf, sizeof(buf), "AVC:%d.%dms GU:no sample",
+                 avc_tenths/10,avc_tenths%10);
+#else
+        snprintf(buf, sizeof(buf), "Decode:%d.%dms GU:no sample",
+                 avc_tenths/10,avc_tenths%10);
+#endif
+    } else {
+#if PSP_HARDWARE_AVC
+        snprintf(buf, sizeof(buf), "AVC/GU: no timing sample");
+#else
+        snprintf(buf, sizeof(buf), "Decoder/GU: no timing sample");
+#endif
+    }
+#else
+    snprintf(buf, sizeof(buf), "Decode CPU:%d%% GU time:%d%% ME work:%d%%",
+             g_stats.cpu_pct,g_stats.gu_share_pct,g_stats.me_pct);
+#endif
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
-#ifndef RETAIL_BUILD
-    snprintf(buf, sizeof(buf), "CPU:%d%% GPU:%d%% ME:%d%%",
-             g_stats.cpu_pct, g_stats.gpu_pct, g_stats.me_pct);
-    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
-    y_offset += HUD_LINE_HEIGHT + 2;
-
-    snprintf(buf, sizeof(buf), "RAM:%d%% %dK/%dK",
-             g_stats.ram_used_pct, g_stats.ram_free_kb, g_stats.ram_largest_kb);
+    snprintf(buf, sizeof(buf), "RAM: free %dK  largest block %dK",
+             g_stats.ram_free_kb,g_stats.ram_largest_kb);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
 
@@ -217,10 +257,36 @@ void hud_render(void)
              g_stats.bw_video_packets_s);
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
-#endif
 
-    snprintf(buf, sizeof(buf), "Host:%dms Bat:%d%%",
-             g_stats.host_proc_ms, g_stats.battery_pct);
+    if (g_stats.audio_enabled && g_stats.audio_active) {
+        snprintf(buf, sizeof(buf), "Aud P:%u H:%u U:%u PLC:%u D:%u",
+                 (unsigned)g_stats.audio_frames_played,
+                 (unsigned)g_stats.audio_empty_holds,
+                 (unsigned)g_stats.audio_underruns,
+                 (unsigned)g_stats.audio_plc,
+                 (unsigned)g_stats.audio_ring_drops);
+    } else if (g_stats.audio_enabled) {
+        snprintf(buf, sizeof(buf), "Audio enabled; receiver inactive");
+    } else {
+        snprintf(buf, sizeof(buf), "Audio: disabled by stream preset");
+    }
+    draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
+    y_offset += HUD_LINE_HEIGHT + 2;
+
+    if (g_stats.host_proc_valid) {
+        int host_tenths=(g_stats.host_proc_us+50)/100;
+        if (g_stats.battery_pct >= 0)
+            snprintf(buf,sizeof(buf),"Host:%d.%dms Batt:%d%%",
+                     host_tenths/10,host_tenths%10,g_stats.battery_pct);
+        else
+            snprintf(buf,sizeof(buf),"Host:%d.%dms Batt:N/A",
+                     host_tenths/10,host_tenths%10);
+    } else if (g_stats.battery_pct >= 0) {
+        snprintf(buf,sizeof(buf),"Host:N/A Batt:%d%%",
+                 g_stats.battery_pct);
+    } else {
+        snprintf(buf,sizeof(buf),"Host:N/A Batt:N/A");
+    }
     draw_text(HUD_X + HUD_PADDING, y_offset, HUD_TEXT_COLOR, buf);
     y_offset += HUD_LINE_HEIGHT + 2;
     y_offset += 6;
@@ -269,10 +335,17 @@ int hud_handle_input(u32 buttons)
     if (!g_initialized)
         return 0;
 
+    g_hud_consumed_buttons &= buttons;
+
     /* Cooldown: suppress all input for a few frames after toggle to prevent
      * the R+Up combo from leaking as an Up D-pad press to Sunshine. */
     if (g_hud_cooldown > 0) {
         g_hud_cooldown--;
+        g_prev_buttons = buttons;
+        return 0;
+    }
+
+    if (g_hud_consumed_buttons) {
         g_prev_buttons = buttons;
         return 0;
     }
@@ -295,6 +368,7 @@ int hud_handle_input(u32 buttons)
                 g_selected_item = 0;  /* Reset selection when opening */
             } else {
                 quit_selected = 3;    /* Closed overlay, no stream action */
+                g_hud_consumed_buttons = buttons;
             }
         }
     }
@@ -331,6 +405,7 @@ int hud_handle_input(u32 buttons)
         /* Close HUD with Circle button */
         if (button_pressed(buttons, PSP_CTRL_CIRCLE)) {
             g_hud_visible = 0;
+            g_hud_consumed_buttons = buttons;
             quit_selected = 3;        /* Closed overlay, no stream action */
             diag_log_write("HUD", "Close (Circle)\n");
         }
@@ -346,7 +421,7 @@ int hud_is_visible(void)
 {
     /* Also report visible during cooldown so main.c suppresses
      * input_poll_and_send — prevents R+Up leak to Sunshine. */
-    return g_hud_visible || (g_hud_cooldown > 0);
+    return g_hud_visible || (g_hud_cooldown > 0) || g_hud_consumed_buttons;
 }
 
 int hud_overlay_visible(void)
