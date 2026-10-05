@@ -17,13 +17,6 @@ Moonlight PSP is a Moonlight-compatible game-streaming client for Sony PSP syste
 
 v1.5 adds Sony hardware H.264 decoding for CAVLC and CABAC streams. Balanced is the recommended default for visual detail, smoothness and audio.
 
-## New in v1.4
-
-- **H.264 CABAC support**: The OpenH264 software path supports CABAC; the Media Engine accelerates color conversion.
-- **3-Slot Decoder Buffer Ring**: Prevents frame pointer contention and stalls between the OpenH264/Media Engine threads and the presenter.
-- **Tighter Teardown & Safe Process Exit**: Gracefully cleans up lingering thread contexts, exit callback structures, and Wi-Fi networks before PRX self-unloads.
-- **Integrated DNS Resolution**: Uses PSP net resolver to resolve DDNS/hostnames via `gethostbyname()` with IP fallback, fixing remote/external connectivity (Issue #8).
-
 ## New in v1.5
 
 - **Sony hardware H.264 decoding**: Decode CAVLC and CABAC streams through the PSP's AVC hardware, with the decoder mode selected from the stream.
